@@ -1,13 +1,10 @@
 name: CI
 
-# Manual only while the repository is private (Actions minutes are billed).
-# Once it's public (Actions is free there), enable automatic runs by
-# uncommenting `push` and `pull_request`.
 on:
+  push:
+    branches: [main]
+  pull_request:
   workflow_dispatch:
-  # push:
-  #   branches: [main]
-  # pull_request:
 
 jobs:
   test:

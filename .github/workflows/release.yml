@@ -1,16 +1,14 @@
 name: Release
 
-# Manual only while the repository is private (macOS runners bill heavily).
-# Once it's public, enable tag-triggered releases by uncommenting `push`,
-# then publish with: git tag v0.1.0 && git push origin v0.1.0
+# Publish a release: git tag v0.1.0 && git push origin v0.1.0
 on:
+  push:
+    tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
         description: "Tag to publish (e.g. v0.1.0); created if it doesn't exist"
         required: true
-  # push:
-  #   tags: ["v*"]
 
 permissions:
   contents: write
@@ -24,7 +22,7 @@ jobs:
       matrix:
         include:
           - { os: macos-latest, target: aarch64-apple-darwin }
-          - { os: macos-13, target: x86_64-apple-darwin }
+          - { os: macos-15-intel, target: x86_64-apple-darwin }
           - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
           - { os: windows-latest, target: x86_64-pc-windows-msvc }
