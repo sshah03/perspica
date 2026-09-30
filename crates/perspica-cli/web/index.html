@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>perspica</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/style.css">
+    <script>
+        // Apply the saved theme before first paint (no flash).
+        try { const t = localStorage.getItem('perspica-theme'); if (t) document.documentElement.setAttribute('data-theme', t); } catch {}
+    </script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/highlight.min.js" defer></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/languages/typescript.min.js" defer></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/languages/python.min.js" defer></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/languages/rust.min.js" defer></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/languages/go.min.js" defer></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/languages/java.min.js" defer></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/languages/c.min.js" defer></script>
+</head>
+<body>
+    <header id="header">
+        <div class="header-left">
+            <button id="sidebar-toggle" class="icon-btn" title="Toggle sidebar (b)" aria-label="Toggle sidebar">☰</button>
+            <div class="logo" role="img" aria-label="perspica" title="perspica">
+                <svg class="logo-icon" viewBox="0 0 32 32" width="26" height="26" fill="none" stroke-linecap="round" aria-hidden="true">
+                    <g transform="translate(1.4 -1)">
+                        <path stroke="currentColor" stroke-width="2.8" d="M7.6 13.8V28.4"/>
+                        <circle stroke="currentColor" stroke-width="2.8" cx="15.2" cy="13.8" r="7.6"/>
+                        <path class="logo-signal" stroke-width="3" d="M11.3 13.8h7.8"/>
+                    </g>
+                </svg>
+            </div>
+            <div id="source-title" class="source-title"></div>
+        </div>
+        <div class="header-right">
+            <span id="review-progress" class="review-progress" title="Files marked as viewed"></span>
+            <div class="pill-group" id="mode-toggle" role="group" aria-label="Order">
+                <button class="pill-btn active" data-mode="files" title="Order by file (f)">By file</button>
+                <button class="pill-btn" data-mode="intent" title="Order by intent (i)">By intent</button>
+                <button class="pill-btn" data-mode="flow" title="Read in call order: entry points first, then what they call (r)">Reading order</button>
+            </div>
+            <div class="menu-wrap">
+                <button class="ghost-btn" id="view-btn" aria-haspopup="menu" aria-expanded="false" title="Layout and display options">View <svg class="caret" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+                <div class="menu hidden" id="view-menu" role="menu" aria-label="View options">
+                    <div class="menu-row">
+                        <span class="menu-label">Layout</span>
+                        <div class="pill-group" id="view-toggle" role="group" aria-label="Diff layout">
+                            <button class="pill-btn active" data-view="unified" title="Unified (u)">Unified</button>
+                            <button class="pill-btn" data-view="split" title="Split (s)">Split</button>
+                        </div>
+                        <span class="kbd-pair"><span class="kbd">u</span><span class="kbd">s</span></span>
+                    </div>
+                    <label class="menu-check"><input type="checkbox" id="noise-toggle" checked><span>Collapse mechanical changes</span><span class="kbd">m</span></label>
+                    <label class="menu-check"><input type="checkbox" id="wrap-toggle"><span>Wrap long lines</span><span class="kbd">w</span></label>
+                    <div class="menu-sep"></div>
+                    <button class="menu-item" id="theme-toggle" role="menuitem"><span>Light / dark theme</span><span class="kbd">t</span></button>
+                </div>
+            </div>
+            <button id="analyze-btn" class="accent-btn hidden"></button>
+            <button class="icon-btn help-btn" id="help-btn" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">?</button>
+        </div>
+    </header>
+
+    <div id="app">
+        <aside id="sidebar" aria-label="Navigation">
+            <div id="sidebar-tabs" role="tablist">
+                <button class="sidebar-tab active" data-tab="outline" role="tab" title="A map of the current review order (chosen in the header)">Outline</button>
+                <button class="sidebar-tab" data-tab="changes" role="tab" title="Every classified change, by kind">Changes</button>
+            </div>
+            <div id="toc-filter-wrap">
+                <input type="search" id="toc-filter" placeholder="Filter files and changes  ( / )" spellcheck="false" autocomplete="off" aria-label="Filter">
+                <button id="unviewed-toggle" class="filter-chip" aria-pressed="false" title="Show only what you haven't marked as viewed">Unviewed</button>
+            </div>
+            <div id="toc-content"></div>
+            <div id="sidebar-resize" title="Drag to resize"></div>
+        </aside>
+        <div id="sidebar-scrim"></div>
+
+        <main id="diff-panel">
+            <div id="nav-bar">
+                <button class="nav-btn" id="prev-change" title="Previous change (k)">▲</button>
+                <button class="nav-btn" id="next-change" title="Next change (j)">▼</button>
+                <span id="nav-counter" aria-live="polite"></span>
+                <span class="nav-spacer"></span>
+                <span id="nav-location" class="nav-location"></span>
+            </div>
+            <section id="overview"></section>
+            <div id="diff-scroll"></div>
+        </main>
+    </div>
+
+    <div id="toast-area" aria-live="assertive"></div>
+
+    <div id="dialog" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="dialog-title">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content">
+            <div class="modal-header" id="dialog-title"></div>
+            <div class="modal-body" id="dialog-body"></div>
+            <div class="modal-actions" id="dialog-actions"></div>
+        </div>
+    </div>
+
+    <div id="shortcut-modal" class="modal hidden" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content">
+            <div class="modal-header">Keyboard shortcuts</div>
+            <div class="modal-body shortcuts">
+                <div class="shortcut-row"><span><span class="kbd">j</span> <span class="kbd">k</span></span><span>Next / previous change</span></div>
+                <div class="shortcut-row"><span><span class="kbd">n</span> <span class="kbd">p</span></span><span>Next / previous file or group</span></div>
+                <div class="shortcut-row"><span><span class="kbd">v</span></span><span>Mark viewed and go to the next unviewed file or section</span></div>
+                <div class="shortcut-row"><span><span class="kbd">f</span> <span class="kbd">i</span> <span class="kbd">r</span></span><span>By file / by category or intent / reading order</span></div>
+                <div class="shortcut-row"><span><span class="kbd">u</span> <span class="kbd">s</span></span><span>Unified / split view</span></div>
+                <div class="shortcut-row"><span><span class="kbd">m</span></span><span>Show / hide mechanical changes</span></div>
+                <div class="shortcut-row"><span><span class="kbd">w</span></span><span>Wrap long lines</span></div>
+                <div class="shortcut-row"><span><span class="kbd">b</span></span><span>Toggle sidebar</span></div>
+                <div class="shortcut-row"><span><span class="kbd">/</span></span><span>Filter</span></div>
+                <div class="shortcut-row"><span><span class="kbd">t</span></span><span>Toggle theme</span></div>
+                <div class="shortcut-row"><span><span class="kbd">Esc</span></span><span>Close / unfocus</span></div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/app.js"></script>
+</body>
+</html>

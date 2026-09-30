@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <style>
+    /* The base colors read on light and dark tabs alike (Safari ignores the media queries). */
+    .ink { stroke: #57606a } .signal { stroke: #2f81f7 }
+    @media (prefers-color-scheme: light) { .ink { stroke: #1f2328 } .signal { stroke: #0969da } }
+    @media (prefers-color-scheme: dark) { .ink { stroke: #e6edf3 } .signal { stroke: #58a6ff } }
+  </style>
+  <g fill="none" stroke-linecap="round" transform="translate(1.4 -1)">
+    <path class="ink" stroke-width="2.8" d="M7.6 13.8V28.4"/>
+    <circle class="ink" stroke-width="2.8" cx="15.2" cy="13.8" r="7.6"/>
+    <path class="signal" stroke-width="3" d="M11.3 13.8h7.8"/>
+  </g>
+</svg>
