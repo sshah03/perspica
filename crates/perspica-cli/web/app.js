@@ -687,6 +687,18 @@ function renderFileTree() {
     return walk(root, 0) || '<div class="toc-empty">No files</div>';
 }
 
+/** An entry's text with its owner type shrinking first: `Reader.readInt: body modified` keeps the method. */
+function entryLabel(e) {
+    const text = String(e.text);
+    if (e.kind === 'dependency') return esc(text);
+    const colon = text.indexOf(': ');
+    const name = colon > 0 ? text.slice(0, colon) : text;
+    const i = Math.max(name.lastIndexOf('.'), name.lastIndexOf('::'));
+    if (i <= 0) return esc(text);
+    const sep = name[i] === ':' ? '::' : '.';
+    return `<span class="owner">${esc(name.slice(0, i))}${sep}</span><span class="rest">${esc(text.slice(i + sep.length))}</span>`;
+}
+
 /** `Owner.method` with the owner shrinking first, so long class names don't hide the method. */
 function flowLabel(label) {
     const i = Math.max(label.lastIndexOf('.'), label.lastIndexOf('::'));
@@ -722,7 +734,7 @@ function renderGroupEntries(g) {
         if (!e) return '';
         const target = entryHunks.has(id) || e.fi >= 0;
         return `<div class="toc-row entry${target ? '' : ' no-target'}" data-entry="${id}" data-filter="${esc((e.text + ' ' + (e.path || '')).toLowerCase())}" title="${esc(e.text)}${e.path ? '\n' + esc(e.path) : ''}">
-            <span class="ic k-${e.kind}">${KIND[e.kind].ic}</span><span class="txt">${esc(e.text)}</span>${e.path ? `<span class="loc">${esc(baseName(e.path))}</span>` : ''}</div>`;
+            <span class="ic k-${e.kind}">${KIND[e.kind].ic}</span><span class="txt">${entryLabel(e)}</span>${e.path ? `<span class="loc">${esc(baseName(e.path))}</span>` : ''}</div>`;
     };
     if (g.subs && g.subs.length > 1) {
         return g.subs.map(sg => `<div class="toc-sub">${esc(sg.label)}</div>${sg.entry_ids.map(row).join('')}`).join('');
