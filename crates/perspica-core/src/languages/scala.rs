@@ -138,7 +138,9 @@ fn extract_class(node: &tree_sitter::Node, source: &str) -> Option<SemanticItem>
                 "class_definition" | "object_definition" | "trait_definition" | "enum_definition" | "type_definition" => {
                     if let Some(n) = child.child_by_field_name("name") {
                         let kind = child.kind().trim_end_matches("_definition");
-                        fields.push(Field { name: node_text(&n, source), type_annotation: Some(kind.to_string()) });
+                        // A companion object shares its class's name: keep the two apart.
+                        let name = if kind == "object" { format!("object {}", node_text(&n, source)) } else { node_text(&n, source) };
+                        fields.push(Field { name, type_annotation: Some(kind.to_string()) });
                     }
                 }
                 "enum_case_definitions" => {

@@ -453,8 +453,11 @@ pub fn looks_like_definition(line: &str, name: &str) -> bool {
     let Some(at) = find_identifier(t, name) else { return false };
     let before = t[..at].trim_end();
     let rest = t[at + name.len()..].trim_start();
-    if !rest.starts_with('(') { return false; }
     let last_word = before.rsplit(|c: char| !(c.is_alphanumeric() || c == '_')).next().unwrap_or("");
+    // A type or a binding of that name: `class Opt(`, `object Opt {`, `struct Opt`, `val Opt =`.
+    if matches!(last_word, "class" | "object" | "trait" | "struct" | "enum" | "interface" | "type" | "typedef" | "impl" | "record"
+        | "val" | "var" | "let" | "const" | "static" | "lazy") { return true; }
+    if !rest.starts_with('(') { return false; }
     if matches!(last_word, "fn" | "function" | "def" | "func" | "sub" | "proc") { return true; }
     if before.starts_with("func (") && before.ends_with(')') { return true; }
     let qualified = before.ends_with('.') || before.ends_with("::");

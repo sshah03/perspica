@@ -841,6 +841,11 @@ mod tests {
         assert!(def("    def flush(self):", "flush"));
         assert!(def("  public long getCharacterOffset() {", "getCharacterOffset"));
         assert!(def("  flush() {", "flush"));
+        assert!(def("  case class Opt(group: Seq[String])", "Opt"));
+        assert!(def("  object Opt {", "Opt"));
+        assert!(def("pub struct Opt;", "Opt"));
+        assert!(def("const Opt = 3;", "Opt"));
+        assert!(!def("    val x = Opt(Seq())", "Opt"));
         assert!(!def("    err = tmpl.Flush()", "Flush"));
         assert!(!def("    if flush() {", "flush"));
         assert!(!def("    x := flush(a)", "flush"));
@@ -858,7 +863,7 @@ mod tests {
         assert!(matches!(import, parser::SemanticItem::Import { symbols, .. } if symbols == &["Map", "ListBuffer"]), "{import:?}");
         let fields = |i: usize| match &tree.items[i] { parser::SemanticItem::Class { fields, .. } => fields.iter().map(|f| f.name.clone()).collect::<Vec<_>>(), _ => vec![] };
         assert_eq!(fields(2), ["id", "name"]);
-        assert_eq!(fields(4), ["Created", "Flushed"]);
+        assert_eq!(fields(4), ["Created", "object Flushed"]);
         assert_eq!(fields(5), ["Red", "Green"]);
         let methods = match &tree.items[6] { parser::SemanticItem::Class { methods, .. } => methods, _ => panic!() };
         let m: Vec<(&str, Vec<bool>)> = methods.iter().map(|m| match m { parser::SemanticItem::Function { name, params, .. } => (name.as_str(), params.iter().map(|p| p.optional).collect()), _ => panic!() }).collect();
