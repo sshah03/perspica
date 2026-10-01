@@ -23,6 +23,7 @@ pub enum Language {
     Go,
     Java,
     C,
+    Scala,
     /// Not parsed: shown as a plain diff with no classification.
     Unknown,
 }
@@ -37,6 +38,7 @@ impl Language {
             "go" => Language::Go,
             "java" => Language::Java,
             "c" | "h" => Language::C,
+            "scala" | "sc" => Language::Scala,
             _ => Language::Unknown,
         }
     }
@@ -843,6 +845,25 @@ mod tests {
         assert!(!def("    if flush() {", "flush"));
         assert!(!def("    x := flush(a)", "flush"));
         assert!(!def("// flush() writes everything", "flush"));
+    }
+
+    #[test]
+    fn test_scala_items() {
+        let src = "package a.b\n\nimport scala.collection.mutable.{Map, ListBuffer}\nimport cats.syntax.all._\n\ncase class User(id: Long, name: String)\n\nsealed trait Event\nobject Event {\n  final case class Created(user: User) extends Event\n  case object Flushed extends Event\n}\n\nenum Color:\n  case Red, Green\n\nobject Svc {\n  val Limit: Int = 100\n  type Id = Long\n  def normalize(name: String, strict: Boolean = false): String = name.trim\n  given Show[User] = Show.show(_.name)\n  extension (u: User)\n    def display: String = u.name\n}\n";
+        let lang = languages::get_language_support(Language::Scala);
+        let tree = parser::parse(src, &*lang).unwrap();
+        let names: Vec<String> = tree.items.iter().filter_map(|i| i.name().map(str::to_string)).collect();
+        assert_eq!(names, ["scala.collection.mutable", "cats.syntax.all", "User", "Event", "Event", "Color", "Svc"], "{names:?}");
+        let import = &tree.items[0];
+        assert!(matches!(import, parser::SemanticItem::Import { symbols, .. } if symbols == &["Map", "ListBuffer"]), "{import:?}");
+        let fields = |i: usize| match &tree.items[i] { parser::SemanticItem::Class { fields, .. } => fields.iter().map(|f| f.name.clone()).collect::<Vec<_>>(), _ => vec![] };
+        assert_eq!(fields(2), ["id", "name"]);
+        assert_eq!(fields(4), ["Created", "Flushed"]);
+        assert_eq!(fields(5), ["Red", "Green"]);
+        let methods = match &tree.items[6] { parser::SemanticItem::Class { methods, .. } => methods, _ => panic!() };
+        let m: Vec<(&str, Vec<bool>)> = methods.iter().map(|m| match m { parser::SemanticItem::Function { name, params, .. } => (name.as_str(), params.iter().map(|p| p.optional).collect()), _ => panic!() }).collect();
+        assert_eq!(m, [("normalize", vec![false, true]), ("given Show[User]", vec![])]);
+        assert_eq!(fields(6), ["Limit", "Id"]);
     }
 
     #[test]

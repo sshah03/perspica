@@ -101,6 +101,7 @@ pub fn is_test_path(path: &str) -> bool {
         || (file.ends_with(".py") && (stem.starts_with("test_") || stem.ends_with("_test") || stem == "conftest"))
         || [".test.", ".spec.", "_spec."].iter().any(|m| file.contains(m))
         || (file.ends_with(".java") || file.ends_with(".kt")) && (stem.ends_with("Test") || stem.ends_with("Tests") || stem.ends_with("IT"))
+        || file.ends_with(".scala") && (stem.ends_with("Test") || stem.ends_with("Tests") || stem.ends_with("Spec") || stem.ends_with("Suite"))
         || path.contains("src/test/")
 }
 
@@ -116,7 +117,7 @@ pub fn is_docs_path(path: &str) -> bool {
 }
 
 fn is_code_ext(file: &str) -> bool {
-    [".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".java", ".c", ".h", ".kt", ".swift", ".rb"].iter().any(|e| file.ends_with(e))
+    [".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".java", ".c", ".h", ".kt", ".swift", ".rb", ".scala"].iter().any(|e| file.ends_with(e))
 }
 
 #[cfg(test)]
@@ -132,6 +133,8 @@ mod tests {
             ("app/test_models.py", FileRole::Test),
             ("web/src/Button.test.tsx", FileRole::Test),
             ("src/test/java/com/x/FooTest.java", FileRole::Test),
+            ("core/src/main/scala/x/FooSpec.scala", FileRole::Test),
+            ("core/src/main/scala/x/Foo.scala", FileRole::Source),
             ("README.md", FileRole::Docs),
             ("docs/guide/setup.md", FileRole::Docs),
             ("docs/conf.py", FileRole::Source),

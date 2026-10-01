@@ -122,6 +122,27 @@ fn test_add_dependency_py() {
 }
 
 #[test]
+fn test_rename_detection_scala() {
+    let v = json("rename_simple_scala", "scala");
+    let renames = manifest(&v)["renames"].as_array().unwrap();
+    assert_eq!(renames.len(), 1, "{renames:?}");
+    assert_eq!(renames[0]["new_name"], "Text.normalizeInput");
+}
+
+#[test]
+fn test_signature_change_scala() {
+    let v = json("signature_change_scala", "scala");
+    assert!(!manifest(&v)["signature_changes"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn test_add_dependency_scala() {
+    let v = json("add_dependency_scala", "scala");
+    let deps = manifest(&v)["dependency_changes"].as_array().unwrap();
+    assert!(deps.iter().any(|d| d["change_type"] == "added" && d["name"] == "java.time"), "{deps:?}");
+}
+
+#[test]
 fn test_hunks_are_linked_to_manifest() {
     let v = json("mixed_changes", "ts");
     let hunks = v["results"][0]["hunks"].as_array().unwrap();

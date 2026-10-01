@@ -4,6 +4,7 @@ pub mod rust_lang;
 pub mod go;
 pub mod java;
 pub mod c_lang;
+pub mod scala;
 
 use crate::parser::SemanticTree;
 use crate::Language;
@@ -29,6 +30,7 @@ pub fn get_language_support(language: Language) -> Box<dyn LanguageSupport> {
         Language::Go => Box::new(go::GoSupport),
         Language::Java => Box::new(java::JavaSupport),
         Language::C => Box::new(c_lang::CSupport),
+        Language::Scala => Box::new(scala::ScalaSupport),
         Language::Unknown => Box::new(typescript::TypeScriptSupport { tsx: false }), // unused: Unknown is never parsed
     }
 }

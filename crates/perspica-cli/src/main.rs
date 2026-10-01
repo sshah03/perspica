@@ -191,6 +191,7 @@ fn parse_language(lang_str: &str) -> Language {
         "go" => Language::Go,
         "java" => Language::Java,
         "c" => Language::C,
+        "scala" => Language::Scala,
         _ => Language::Unknown,
     }
 }
