@@ -196,7 +196,9 @@ fn render_reading_order(multi: &MultiFileResult) {
     let any_tests = multi.results.iter().any(|r| r.review.test_lines > 0);
     println!("  {} {}", "◆".blue().bold(), "Reading Order".bold());
     println!("  {}", DIVIDER.dimmed());
-    let types: Vec<&str> = steps.iter().filter(|s| s.kind == StepKind::Type).map(|s| s.name.as_str()).collect();
+    // A class and its companion object share a name: list it once.
+    let mut types: Vec<&str> = steps.iter().filter(|s| s.kind == StepKind::Type).map(|s| s.name.as_str()).collect();
+    types.dedup();
     if !types.is_empty() {
         println!("    {} {}", "types:".dimmed(), types.join(", "));
     }

@@ -687,6 +687,14 @@ function renderFileTree() {
     return walk(root, 0) || '<div class="toc-empty">No files</div>';
 }
 
+/** `Owner.method` with the owner shrinking first, so long class names don't hide the method. */
+function flowLabel(label) {
+    const i = Math.max(label.lastIndexOf('.'), label.lastIndexOf('::'));
+    if (i <= 0) return esc(label);
+    const sep = label[i] === ':' ? '::' : '.';
+    return `<span class="flow-owner">${esc(label.slice(0, i))}${sep}</span><span class="flow-method">${esc(label.slice(i + sep.length))}</span>`;
+}
+
 function renderGroupList() {
     let html = '';
     groups.forEach((g, gi) => {
@@ -698,7 +706,7 @@ function renderGroupList() {
         html += `<div class="toc-group${reviewed ? ' reviewed' : ''}${folded ? ' collapsed' : ''}" data-gi="${gi}">
             <div class="toc-head" data-jump-group="${gi}" title="Go to this group">
                 <span class="chev" data-group-toggle title="Show entries">▼</span><span class="num">${gi + 1}</span>
-                <span class="title${g.flow ? ' flow-title' : ''}"${g.flow ? ` style="padding-left:${Math.min(g.flow.depth, 6) * 10}px" title="${esc(g.label)} · ${esc(g.flow.file)}"` : ''}>${g.flow ? `<span class="flow-name">${g.flow.depth ? '<span class="flow-depth">└ </span>' : ''}${esc(g.label)}</span><span class="flow-file">${esc(baseName(g.flow.file))}</span>` : esc(g.label)}${g.note && !g.flow ? `<span class="note" title="${esc(g.note)}">${richText(g.note, false)}</span>` : ''}</span>
+                <span class="title${g.flow ? ' flow-title' : ''}"${g.flow ? ` style="padding-left:${Math.min(g.flow.depth, 6) * 10}px" title="${esc(g.label)} · ${esc(g.flow.file)}"` : ''}>${g.flow ? `<span class="flow-name">${g.flow.depth ? '<span class="flow-depth">└ </span>' : ''}${flowLabel(g.label)}</span><span class="flow-file">${esc(baseName(g.flow.file))}</span>` : esc(g.label)}${g.note && !g.flow ? `<span class="note" title="${esc(g.note)}">${richText(g.note, false)}</span>` : ''}</span>
                 ${riskHtml(g.risk)}${g.origin === 'autonomous' ? originChip(g) : ''}
                 <span class="n" title="${hunks} hunk${pl(hunks)}">${g.ids.length || hunks}</span>
             </div>

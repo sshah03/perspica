@@ -299,7 +299,10 @@ body.sidebar-collapsed #sidebar { display: none; }
 .flow-depth { color: var(--text-3); font-family: var(--font-mono); white-space: pre; }
 /* Reading-order rows stay on one line: name, then its file, both truncating. */
 .toc-head .flow-title { display: flex; align-items: baseline; gap: 6px; min-width: 0; white-space: nowrap; }
-.toc-head .flow-name { overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 0 1 auto; }
+.toc-head .flow-name { display: flex; min-width: 0; flex: 0 1 auto; }
+.toc-head .flow-owner { overflow: hidden; text-overflow: ellipsis; min-width: 3ch; flex: 0 1 auto; color: var(--text-2); font-weight: 500; }
+.toc-head .flow-method { flex: 0 0 auto; }
+.toc-head .flow-depth { flex: 0 0 auto; }
 .toc-head .flow-title .flow-file { overflow: hidden; text-overflow: ellipsis; flex: 0 10 auto; min-width: 0; font-weight: 400; }
 .flow-file { color: var(--text-3); font-size: var(--font-size-xs); font-family: var(--font-mono); }
 .reach { font-size: var(--font-size-xs); padding: 1px 6px; border-radius: 10px; border: 1px solid var(--border); color: var(--text-2); white-space: nowrap; }
