@@ -222,9 +222,10 @@ fn extract_impl(node: &tree_sitter::Node, source: &str) -> Vec<SemanticItem> {
                     children,
                 }) = extract_function(&child, source)
                 {
+                    // `impl<'a> IgnoreMatch<'a>` names the type `IgnoreMatch`.
                     let impl_type = node
                         .child_by_field_name("type")
-                        .map(|n| node_text(&n, source));
+                        .map(|n| node_text(&n, source).split('<').next().unwrap_or_default().trim().to_string());
                     let qualified_name = if let Some(ref ty) = impl_type {
                         format!("{ty}::{name}")
                     } else {

@@ -2,7 +2,7 @@ use crate::languages::LanguageSupport;
 use crate::Error;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 /// Language-agnostic code structure extracted from tree-sitter CST.
@@ -33,6 +33,15 @@ pub struct ItemMeta {
     pub tokens: Vec<u32>,
     /// Hashes of identifiers referenced anywhere in the item.
     pub refs: HashSet<u64>,
+    /// Names the item calls, with what qualifies each call (`x.name(`, `Type::name(`, `name(`).
+    pub calls: HashSet<CallRef>,
+    /// Local names bound to a type by an obvious initializer: `let b = Builder::new(…)`,
+    /// `x := T{…}`, `const c = new C(…)`, `val v: V = …`, `Foo f = …`. Variable hash → type hash.
+    pub binds: HashMap<u64, u64>,
+    /// Local names bound to what a call returns: `ctx = self.request_context(…)`. Variable hash → the call.
+    pub returns: HashMap<u64, CallRef>,
+    /// The bindings that come from a declared type (`x: T`, `var x T`), not a guess from an initializer.
+    pub declared: HashSet<u64>,
     /// Visible outside the file (export / pub / capitalized / non-static …).
     pub exported: bool,
     /// The item is a comment (dropped from the tree after parsing).
@@ -42,6 +51,13 @@ pub struct ItemMeta {
     pub is_test: bool,
     /// For classes: identifiers referenced by each method, parallel to `methods`.
     pub method_refs: Vec<HashSet<u64>>,
+    /// Per method, parallel to `methods`: what each one calls.
+    pub method_calls: Vec<HashSet<CallRef>>,
+    pub method_binds: Vec<HashMap<u64, u64>>,
+    pub method_returns: Vec<HashMap<u64, CallRef>>,
+    pub method_declared: Vec<HashSet<u64>>,
+    /// Per method: fields of `self` assigned from a call (`self.p = Parser(…)`). Field hash → the call.
+    pub method_self_fields: Vec<HashMap<u64, CallRef>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,11 +207,330 @@ fn find_node<'t>(root: tree_sitter::Node<'t>, span: &crate::manifest::Span) -> O
 
 /// Walk a subtree collecting a structural hash, a name-masked hash, token hashes and
 /// referenced identifiers. Comments are skipped entirely.
+/// What stands before a called name: nothing (`name(`), the receiver's own type
+/// (`self.name(`, `this.name(`), a named thing (`x.name(`, `Type::name(`), or an
+/// expression (`a.b().name(`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Qualifier {
+    None,
+    SelfType,
+    /// `x.name(`: a receiver (a variable or a type).
+    Named(u64),
+    /// `a::name(`: a path (a type or a module), never a variable.
+    Path(u64),
+    /// `self.f.name(`: a field of the receiver's own type.
+    Field(u64),
+    /// `a.f.name(`: field f of variable a.
+    Member(u64, u64),
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CallRef {
+    pub qualifier: Qualifier,
+    pub name: u64,
+    /// Followed by an argument list; otherwise a member access (`x.name`).
+    pub parens: bool,
+}
+
 struct TokenWalk {
     norm: DefaultHasher,
     shape: DefaultHasher,
     tokens: Vec<u32>,
     refs: HashSet<u64>,
+    calls: HashSet<CallRef>,
+    binds: HashMap<u64, u64>,
+    returns: HashMap<u64, CallRef>,
+    declared: HashSet<u64>,
+    self_fields: HashMap<u64, CallRef>,
+}
+
+/// Spots calls in the token stream as it goes by, with no tree lookups: a name
+/// followed by an argument list is a call (`name(`, `name::<T>(`), the separator
+/// before the name says what qualifies it (`x.name(`, `Type::name(`, `self.name(`,
+/// `f().name(`), and a qualified name with no arguments is a member access, which
+/// Scala uses for parameterless calls.
+#[derive(Default)]
+struct CallSpotter {
+    /// The last identifier seen, with its qualifier, until the next token says what it was.
+    pending: Option<CallRef>,
+    /// The identifier before a `.` / `::`, if any, for the next name's qualifier.
+    before_sep: Option<Qualifier>,
+    /// Inside `<…>` type arguments (`foo::<T>(`), which don't end a pending call.
+    type_args: usize,
+    /// The name a separator just turned into a qualifier: still the callee if `::<T>(` follows.
+    sep_from: Option<CallRef>,
+    /// A variable just assigned (`x =`, `x :=`, `x:`), waiting for the type on the right.
+    assign_lhs: Option<u64>,
+    /// The right side has started: a second unqualified name there begins a new expression.
+    rhs_started: bool,
+    returns: HashMap<u64, CallRef>,
+    /// The left side was declared with a type (`x: T`, `var x T`) rather than initialized.
+    assign_declared: bool,
+    /// Just after Go's `var`: the next name is being declared.
+    var_decl: bool,
+    declared: HashSet<u64>,
+    /// The left side is a field of `self` / `this`.
+    assign_field: bool,
+    self_fields: HashMap<u64, CallRef>,
+    /// The previous leaf, if it was a capitalized identifier (`Foo x` declares x as a Foo).
+    prev_type: Option<u64>,
+    binds: HashMap<u64, u64>,
+    /// `b.go().again()`: a fluent chain keeps its root's qualifier; one slot per argument nesting.
+    chains: Vec<Option<Qualifier>>,
+    /// The binding just made and the nesting it was made at, while its right side lasts.
+    fresh_bind: Option<(u64, usize)>,
+    /// `x = T::new().build()`: the chain went on past `T`'s call, so `x` may not be a `T`.
+    chain_check: Option<u64>,
+    /// Per named node being walked: is it a place a function can be passed as a value?
+    in_args: Vec<u8>,
+    /// Just after `(` or `,` in an argument list: a lone name here may be a function passed as a value.
+    arg_slot: bool,
+    /// The bare name that started an argument, until `)` or `,` shows it stood alone.
+    bare_arg: Option<u64>,
+    /// Inside a parameter list or pattern: the names there are locals, not functions.
+    pattern_depth: usize,
+    locals: HashSet<u64>,
+    /// The name before each open `[`, and after a `]` the one it closed: `f[T](` calls f (Go generics).
+    brackets: Vec<Option<CallRef>>,
+    bracketed: Option<CallRef>,
+}
+
+/// Calls that keep their receiver's type for the purposes of a binding (`T::new(…).unwrap()`).
+const PASSTHROUGH: &[&str] = &["unwrap", "expect", "unwrap_or_default", "unwrap_or_else", "unwrap_or", "clone", "to_owned"];
+
+const ARGUMENT_LISTS: &[&str] = &["arguments", "argument_list", "arguments_list"];
+
+/// Where a lone name is a value handed on: `f(g)`, `{ onError: g }`, `onClick={g}`.
+const SLOT_NONE: u8 = 0;
+const SLOT_ARGS: u8 = 1;
+const SLOT_PAIR: u8 = 2;
+const SLOT_JSX: u8 = 3;
+
+/// Where names are introduced rather than used: parameters, closure parameters, destructuring.
+const PATTERNS: &[&str] = &["parameters", "formal_parameters", "parameter_list", "class_parameters", "closure_parameters",
+    "lambda_parameters", "tuple_struct_pattern", "tuple_pattern", "struct_pattern", "slice_pattern", "pattern_list",
+    "object_pattern", "array_pattern", "required_parameter", "optional_parameter"];
+
+fn capitalized(text: &str) -> bool {
+    text.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+}
+
+impl CallSpotter {
+    fn leaf(&mut self, kind: &str, text: &str, out: &mut HashSet<CallRef>) {
+        if self.type_args > 0 { return; }
+        // Only an argument list right after `f[T]` makes f the callee.
+        let bracketed = self.bracketed.take();
+        // Python's `self` and `cls`, and Rust's `Self`, are plain identifiers, not keywords.
+        if kind.contains("identifier") && !matches!(text, "self" | "cls" | "Self") {
+            self.flush_member(out);
+            self.sep_from = None;
+            let qualifier = self.before_sep.take().unwrap_or(Qualifier::None);
+            let h = ident_hash(text);
+            if kind == "shorthand_property_identifier" { out.insert(CallRef { qualifier: Qualifier::None, name: h, parens: false }); }
+            let slot = std::mem::take(&mut self.arg_slot);
+            // `var wg sync.WaitGroup`: wg is declared with the type that follows.
+            if std::mem::take(&mut self.var_decl) && qualifier == Qualifier::None {
+                self.assign_lhs = Some(h); self.assign_declared = true; self.rhs_started = false;
+                self.pending = Some(CallRef { qualifier, name: h, parens: false });
+                return;
+            }
+            if qualifier == Qualifier::None && self.assign_lhs.is_some() {
+                if self.rhs_started { self.assign_lhs = None; } else { self.rhs_started = true; }
+            }
+            self.bare_arg = (slot && qualifier == Qualifier::None).then_some(h);
+            if self.pattern_depth > 0 { self.locals.insert(h); }
+            if let Some(lhs) = self.chain_check.take() {
+                if PASSTHROUGH.contains(&text) { self.chain_check = None; } else { self.binds.remove(&lhs); self.returns.remove(&lhs); self.self_fields.remove(&lhs); self.fresh_bind = None; }
+            } else if qualifier == Qualifier::None {
+                self.fresh_bind = None;
+            }
+            // Bindings: `x = Foo…` / `x: Foo` (the type on the right), or `Foo x` (the type on the left).
+            if capitalized(text) {
+                // `x = T(` / `x = a::T::new(` / `x = new pkg.T(`: the type is the capitalized name.
+                // Kept for a call that follows: `x := NewServer(…)` binds x to what NewServer returns.
+                if let Some(lhs) = self.assign_lhs.filter(|_| !self.assign_field) {
+                    // The first type named wins: `k = Kind::Literal(…)` is a Kind.
+                    // A declared type stands: `var s Service` then `s = &NoOp{}` is still a Service.
+                    if self.fresh_bind.map(|(l, _)| l) != Some(lhs) && (self.assign_declared || !self.declared.contains(&lhs)) {
+                        self.binds.insert(lhs, h);
+                        if self.assign_declared { self.declared.insert(lhs); }
+                        self.fresh_bind = Some((lhs, self.depth()));
+                    }
+                }
+                self.prev_type = if qualifier == Qualifier::None { Some(h) } else { None };
+            } else {
+                if let (Some(ty), Qualifier::None) = (self.prev_type, qualifier) { self.binds.insert(h, ty); }
+                self.prev_type = None;
+            }
+            self.pending = Some(CallRef { qualifier, name: h, parens: false });
+        } else if text == ":" && self.slot() == SLOT_PAIR {
+            // `{ onError: handleError }`: the key isn't a variable; the value may be a function.
+            self.pending = None; self.before_sep = None; self.assign_lhs = None;
+            self.arg_slot = true;
+        } else if matches!(text, "=" | ":=" | ":") {
+            // `x =` / `x :=` / `x:`: the type may follow.
+            self.assign_field = false;
+            self.assign_lhs = match self.pending.take() {
+                Some(c) if c.qualifier == Qualifier::None && c.name != 0 => Some(c.name),
+                // `self.x = Foo(…)`: the field's type, when the class doesn't declare it.
+                Some(c) if c.qualifier == Qualifier::SelfType && c.name != 0 && text == "=" => { self.assign_field = true; Some(c.name) }
+                _ => None,
+            };
+            if let Some(lhs) = self.assign_lhs { if !self.assign_field { self.locals.insert(lhs); } }
+            self.rhs_started = false;
+            self.assign_declared = text == ":";
+            self.before_sep = None;
+            self.prev_type = None;
+            self.fresh_bind = None;
+            self.arg_slot = false;
+        } else if text == "var" && self.slot() != SLOT_ARGS {
+            self.var_decl = true;
+        } else if matches!(text, "new" | "mut" | "&" | "*" | "await" | "const") {
+            // Between a binding's `=` and its type.
+            self.flush_member(out);
+            self.pending = None;
+            self.arg_slot = false;
+            if text == "await" { self.chain_check = None; }
+        } else if text == "[" {
+            let c = self.pending.take();
+            if let Some(m) = c { if m.qualifier != Qualifier::None && m.name != 0 { out.insert(m); } }
+            self.brackets.push(c);
+            self.before_sep = None; self.assign_lhs = None; self.prev_type = None; self.arg_slot = false;
+        } else if text == "]" {
+            self.bracketed = self.brackets.pop().flatten();
+            self.pending = None; self.before_sep = None;
+        } else if text == "(" {
+            // A bare `(` after a name: a call inside a macro body or a grammar without an arguments node.
+            if let Some(mut c) = self.pending.take().or(bracketed) {
+                if c.name != 0 { c.parens = true; self.start_chain(&c); self.note_returns(&c); out.insert(c); }
+            }
+            self.before_sep = None;
+            self.arg_slot = self.slot() == SLOT_ARGS;
+        } else if text == "." || text == "::" || text == "->" {
+            // The identifier before the separator qualifies the next one.
+            let path = text == "::";
+            let named = |h: u64| if path { Qualifier::Path(h) } else { Qualifier::Named(h) };
+            self.before_sep = Some(match self.pending.take() {
+                // `self.` / `this.`: the marker left by the keyword.
+                Some(c) if c.name == 0 => Qualifier::SelfType,
+                Some(c) if matches!(c.qualifier, Qualifier::None) => { self.sep_from = Some(c); named(c.name) }
+                // `a.b.c`: `b` was a member access; `c` is qualified by `b`.
+                Some(c) => {
+                    out.insert(c);
+                    match c.qualifier {
+                        Qualifier::SelfType if !path => Qualifier::Field(c.name),
+                        Qualifier::Named(a) if !path => Qualifier::Member(a, c.name),
+                        _ => named(c.name),
+                    }
+                }
+                // `f().g(`: the chain's root, if there is one at this nesting.
+                None => {
+                    if let Some((lhs, depth)) = self.fresh_bind { if depth == self.depth() { self.chain_check = Some(lhs); } }
+                    self.chains.last().copied().flatten().unwrap_or(Qualifier::Unknown)
+                }
+            });
+        } else if matches!(text, "self" | "this" | "Self" | "cls" | "super") {
+            if self.assign_lhs.is_some() {
+                if self.rhs_started { self.assign_lhs = None; } else { self.rhs_started = true; }
+            }
+            self.flush_member(out);
+            self.pending = Some(CallRef { qualifier: Qualifier::SelfType, name: 0, parens: false });
+        } else {
+            // `f(g)` / `f(a, g)`: a lone name as an argument, which may be a function passed as a value.
+            if (matches!(text, ")" | ",") && self.slot() == SLOT_ARGS) || (text == "}" && self.slot() == SLOT_JSX) {
+                if let (Some(h), Some(c)) = (self.bare_arg, self.pending) {
+                    if c.name == h && c.qualifier == Qualifier::None { out.insert(c); }
+                }
+            }
+            // `for x in`: x is a local.
+            if text == "in" { if let Some(c) = self.pending { if c.qualifier == Qualifier::None { self.locals.insert(c.name); } } }
+            self.bare_arg = None;
+            self.flush_member(out);
+            self.pending = None;
+            self.before_sep = None;
+            self.assign_lhs = None;
+            self.prev_type = None;
+            self.arg_slot = (text == "," && self.slot() == SLOT_ARGS) || (text == "{" && self.slot() == SLOT_JSX);
+            if text != ")" {
+                self.fresh_bind = None;
+                if let Some(slot) = self.chains.last_mut() { *slot = None; }
+            }
+        }
+    }
+
+    /// `x = f(…)` / `x = a.f(…)`: x is whatever f returns (unless the chain goes on).
+    fn note_returns(&mut self, c: &CallRef) {
+        if let Some(lhs) = self.assign_lhs.take() {
+            if std::mem::take(&mut self.assign_field) {
+                self.self_fields.insert(lhs, *c);
+                self.fresh_bind = Some((lhs, self.depth()));
+                return;
+            }
+            if self.declared.contains(&lhs) { return; }
+            self.returns.insert(lhs, *c);
+            if self.fresh_bind.map(|(l, _)| l) != Some(lhs) { self.fresh_bind = Some((lhs, self.depth())); }
+        }
+    }
+
+    fn slot(&self) -> u8 {
+        self.in_args.last().copied().unwrap_or(SLOT_NONE)
+    }
+
+    /// The argument nesting, the same before a chain's first call and after it.
+    fn depth(&self) -> usize { self.chains.len().max(1) }
+
+    fn start_chain(&mut self, c: &CallRef) {
+        if self.chains.is_empty() { self.chains.push(None); }
+        if !matches!(c.qualifier, Qualifier::None | Qualifier::Unknown) { *self.chains.last_mut().unwrap() = Some(c.qualifier); }
+    }
+
+    /// A qualified name that wasn't called: a member access (a Scala parameterless call).
+    fn flush_member(&mut self, out: &mut HashSet<CallRef>) {
+        if let Some(c) = self.pending.take() {
+            if c.qualifier != Qualifier::None && c.name != 0 { out.insert(c); }
+        }
+    }
+
+    fn enter(&mut self, kind: &str, out: &mut HashSet<CallRef>) {
+        self.in_args.push(if ARGUMENT_LISTS.contains(&kind) { SLOT_ARGS } else if kind == "pair" { SLOT_PAIR } else if kind == "jsx_expression" { SLOT_JSX } else { SLOT_NONE });
+        if PATTERNS.contains(&kind) { self.pattern_depth += 1; }
+        if kind == "type_arguments" {
+            // `name::<T>(`: the name before the `::` is still the callee.
+            if let Some(c) = self.sep_from.take() { self.pending = Some(c); self.before_sep = None; }
+            self.type_args += 1;
+            return;
+        }
+        // A parameter list follows a definition's name, not a call.
+        if matches!(kind, "parameters" | "formal_parameters" | "parameter_list" | "class_parameters" | "type_parameters") {
+            self.pending = None; self.before_sep = None; return;
+        }
+        if matches!(kind, "arguments" | "argument_list" | "arguments_list") {
+            if let Some(mut c) = self.pending.take().or(self.bracketed.take()) {
+                if c.name != 0 { c.parens = true; self.start_chain(&c); self.note_returns(&c); out.insert(c); }
+            }
+            self.before_sep = None;
+            if self.chains.is_empty() { self.chains.push(None); }
+            self.chains.push(None);
+        }
+    }
+
+    fn leave(&mut self, kind: &str, out: &mut HashSet<CallRef>) {
+        // `{ key: g }`: the pair ends right after its value.
+        if kind == "pair" {
+            if let (Some(h), Some(c)) = (self.bare_arg.take(), self.pending) {
+                if c.name == h && c.qualifier == Qualifier::None { out.insert(c); }
+            }
+        }
+        self.in_args.pop();
+        if PATTERNS.contains(&kind) { self.pattern_depth = self.pattern_depth.saturating_sub(1); }
+        if kind == "type_arguments" { self.type_args -= 1; }
+        if matches!(kind, "arguments" | "argument_list" | "arguments_list") {
+            self.chains.pop();
+            // Back at the chain's level: whatever the arguments did is forgotten.
+            self.pending = None; self.before_sep = None; self.assign_lhs = None; self.prev_type = None;
+        }
+    }
 }
 
 /// Marker hashed when leaving a named node, so the hash captures nesting
@@ -209,8 +544,14 @@ fn walk_tokens(node: tree_sitter::Node, source: &str, mask: Option<&str>, skip: 
         shape: DefaultHasher::new(),
         tokens: Vec::new(),
         refs: HashSet::new(),
+        calls: HashSet::new(),
+        binds: HashMap::new(),
+        returns: HashMap::new(),
+        declared: HashSet::new(),
+        self_fields: HashMap::new(),
     };
     let mut cursor = node.walk();
+    let mut spotter = CallSpotter::default();
     'outer: loop {
         let n = cursor.node();
         let kind = n.kind();
@@ -224,9 +565,11 @@ fn walk_tokens(node: tree_sitter::Node, source: &str, mask: Option<&str>, skip: 
                 if kind.contains("identifier") {
                     w.refs.insert(ident_hash(text));
                 }
+                spotter.leaf(kind, text, &mut w.calls);
             } else if n.is_named() {
                 n.kind_id().hash(&mut w.norm);
                 n.kind_id().hash(&mut w.shape);
+                spotter.enter(kind, &mut w.calls);
             }
             if cursor.goto_first_child() {
                 continue;
@@ -246,9 +589,18 @@ fn walk_tokens(node: tree_sitter::Node, source: &str, mask: Option<&str>, skip: 
             if cursor.node().is_named() {
                 SUBTREE_END.hash(&mut w.norm);
                 SUBTREE_END.hash(&mut w.shape);
+                spotter.leave(cursor.node().kind(), &mut w.calls);
             }
         }
     }
+    spotter.flush_member(&mut w.calls);
+    // A lone argument that is a parameter or local is a value, not a function.
+    let locals = std::mem::take(&mut spotter.locals);
+    w.calls.retain(|c| c.parens || c.qualifier != Qualifier::None || !locals.contains(&c.name));
+    w.binds = spotter.binds;
+    w.returns = spotter.returns;
+    w.declared = spotter.declared;
+    w.self_fields = spotter.self_fields;
     w
 }
 
@@ -342,6 +694,7 @@ fn fingerprint(sem: &mut SemanticTree, tree: &tree_sitter::Tree, source: &str, l
                 h.hash(&mut w.shape);
                 w.tokens.extend(aw.tokens);
                 w.refs.extend(aw.refs);
+                w.calls.extend(aw.calls);
             }
             meta.is_test = is_test_node(node, source);
             meta.norm_hash = w.norm.finish();
@@ -349,6 +702,10 @@ fn fingerprint(sem: &mut SemanticTree, tree: &tree_sitter::Tree, source: &str, l
             meta.tokens = w.tokens;
             meta.tokens.sort_unstable();
             meta.refs = w.refs;
+            meta.calls = w.calls;
+            meta.binds = w.binds;
+            meta.returns = w.returns;
+            meta.declared = w.declared;
             if let Some(name) = item.name() {
                 meta.exported = bare_name(name) == "main" || lang.is_exported(&node, name, source);
             }
@@ -363,9 +720,20 @@ fn fingerprint(sem: &mut SemanticTree, tree: &tree_sitter::Tree, source: &str, l
                         let span = m.span().clone();
                         let Some(mn) = find_node(root, &span) else {
                             meta.method_refs.push(HashSet::new());
+                            meta.method_calls.push(HashSet::new());
+                            meta.method_binds.push(HashMap::new());
+                            meta.method_returns.push(HashMap::new());
+                            meta.method_declared.push(HashSet::new());
+                            meta.method_self_fields.push(HashMap::new());
                             continue;
                         };
-                        meta.method_refs.push(walk_tokens(mn, source, None, None).refs);
+                        let mw = walk_tokens(mn, source, None, None);
+                        meta.method_refs.push(mw.refs);
+                        meta.method_calls.push(mw.calls);
+                        meta.method_binds.push(mw.binds);
+                        meta.method_returns.push(mw.returns);
+                        meta.method_declared.push(mw.declared);
+                        meta.method_self_fields.push(mw.self_fields);
                         let m_attrs = leading_attributes(mn);
                         if let SemanticItem::Function { body_hash, decl_hash, .. } = m {
                             if let Some(h) = body_token_hash(mn, source) { *body_hash = h; }

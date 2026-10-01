@@ -178,13 +178,14 @@ pub fn analyze_multi(files: &[cross_file::FileChange]) -> Result<cross_file::Mul
         mark_tests(&mut a.result, &test_spans[fi]);
     }
     let graph = flow::Graph::build(&analyses);
+    let graph_debug = std::env::var_os("PERSPICA_GRAPH_DEBUG").map(|_| graph.debug(&analyses));
     let reading_order = graph.reading_order(&analyses);
     let test_reach = graph.test_reach(&analyses);
     drop(graph);
 
     Ok(cross_file::MultiDiffResult {
         file_results: analyses.into_iter().map(|a| (a.path, a.result)).collect(),
-        cross_file: cross_file::CrossFileManifest { moves, broken_references, signature_impacts, vanished, reading_order, test_reach },
+        cross_file: cross_file::CrossFileManifest { moves, broken_references, signature_impacts, vanished, reading_order, test_reach, graph_debug },
     })
 }
 
@@ -869,6 +870,163 @@ mod tests {
         let m: Vec<(&str, Vec<bool>)> = methods.iter().map(|m| match m { parser::SemanticItem::Function { name, params, .. } => (name.as_str(), params.iter().map(|p| p.optional).collect()), _ => panic!() }).collect();
         assert_eq!(m, [("normalize", vec![false, true]), ("given Show[User]", vec![])]);
         assert_eq!(fields(6), ["Limit", "Id"]);
+    }
+
+    #[test]
+    fn test_calls_are_spotted_with_their_qualifier() {
+        use parser::{CallRef, Qualifier};
+        let src = "struct A;\nimpl A {\n    fn run(&self, b: &B) -> u32 {\n        self.step();\n        B::make(1);\n        helper::<u32>(2);\n        b.go();\n        f().twice();\n        b.go(x.y()).again();\n        assert_eq!(check(3), 4);\n        let total = self.count;\n        total\n    }\n}\n";
+        let lang = languages::get_language_support(Language::Rust);
+        let tree = parser::parse(src, &*lang).unwrap();
+        let run = tree.items.iter().position(|i| i.name() == Some("A::run")).expect("A::run item");
+        let calls = &tree.meta[run].calls;
+        let has = |q: Qualifier, name: &str, parens: bool| calls.contains(&CallRef { qualifier: q, name: parser::ident_hash(name), parens });
+        assert!(has(Qualifier::SelfType, "step", true), "{calls:?}");
+        assert!(has(Qualifier::Path(parser::ident_hash("B")), "make", true));
+        assert!(has(Qualifier::None, "helper", true), "turbofish");
+        assert!(has(Qualifier::Named(parser::ident_hash("b")), "go", true));
+        assert!(has(Qualifier::Unknown, "twice", true), "after a call result");
+        assert!(has(Qualifier::Named(parser::ident_hash("b")), "again", true), "a chain keeps its root: {calls:?}");
+        assert!(has(Qualifier::None, "check", true), "inside a macro");
+        // A field read and the definition's own name are not calls.
+        assert!(!calls.iter().any(|c| c.name == parser::ident_hash("count") && c.parens));
+        assert!(!calls.iter().any(|c| c.name == parser::ident_hash("run")));
+        // `b: &B` binds b to B; so does `let w = a::Widget::new(…)`.
+        let src2 = "fn f(b: &B) {\n    let w = a::Widget::new(1);\n    let n: u32 = 2;\n    w.go(b, n);\n}\n";
+        let tree2 = parser::parse(src2, &*lang).unwrap();
+        let binds = &tree2.meta[0].binds;
+        assert_eq!(binds.get(&parser::ident_hash("w")), Some(&parser::ident_hash("Widget")), "{binds:?}");
+        assert!(!binds.contains_key(&parser::ident_hash("n")), "primitives don't bind");
+        // `T::new(…).unwrap()` is still a T; `T::new().build()` may not be.
+        let src3 = "fn f() {\n    let m = Matcher::new(1).unwrap();\n    let p = Builder::new().build(2);\n}\n";
+        let tree3 = parser::parse(src3, &*lang).unwrap();
+        let binds = &tree3.meta[0].binds;
+        assert_eq!(binds.get(&parser::ident_hash("m")), Some(&parser::ident_hash("Matcher")), "{binds:?}");
+        assert!(!binds.contains_key(&parser::ident_hash("p")), "{binds:?}");
+    }
+
+    #[test]
+    fn test_calls_resolve_through_their_qualifier() {
+        let new = "struct Set;\nimpl Set {\n    fn add(&self) {}\n}\nstruct Other;\nimpl Other {\n    fn add(&self) {}\n}\n\
+            struct A {\n    s: Set,\n}\nimpl A {\n    fn run(&self, xs: Vec<u32>) {\n        self.s.add();\n        self.b();\n        xs.iter().for_each(helper);\n    }\n    fn b(&self) {}\n}\nfn helper(x: &u32) {}\n";
+        let files = vec![cross_file::FileChange::new("a.rs", "", new, Language::Rust)];
+        let result = analyze_multi(&files).unwrap();
+        let callers = |name: &str| -> Vec<String> {
+            result.cross_file.reading_order.iter().find(|s| s.name == name).map(|s| s.called_by.clone()).unwrap_or_default()
+        };
+        // `self.s.add()` is Set's add (the field's type), not Other's.
+        assert_eq!(callers("Set::add"), vec!["A::run"], "{:?}", result.cross_file.reading_order);
+        assert!(callers("Other::add").is_empty());
+        // A short name, settled by `self.`; a function passed by name.
+        assert_eq!(callers("A::b"), vec!["A::run"]);
+        assert_eq!(callers("helper"), vec!["A::run"]);
+    }
+
+    #[test]
+    fn test_go_struct_fields_are_extracted() {
+        let tree = parser::parse("package a\n\ntype Opts struct {\n\tName string\n\tA, B int\n\t*Base\n}\n", &*languages::get_language_support(Language::Go)).unwrap();
+        let Some(parser::SemanticItem::Class { fields, .. }) = tree.items.iter().find(|i| i.name() == Some("Opts")) else { panic!("{:?}", tree.items) };
+        let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["Name", "A", "B", "Base"]);
+        assert_eq!(fields[1].type_annotation.as_deref(), Some("int"));
+    }
+
+    #[test]
+    fn test_receivers_take_the_type_a_call_returns() {
+        let new = "class Ctx:\n    def pop(self):\n        pass\n\nclass Globals:\n    def pop(self):\n        pass\n\n\
+            class App:\n    def ctx(self) -> Ctx:\n        return Ctx()\n\n    def run(self):\n        c = self.ctx()\n        c.pop()\n        d = {}\n        d.pop()\n";
+        // Every method changes (each `pass` was `return 1`), so each is a step of its own.
+        let old = new.replace("        pass\n", "        return 1\n").replace("        d.pop()\n", "");
+        let files = vec![cross_file::FileChange::new("app.py", &old, new, Language::Python)];
+        let result = analyze_multi(&files).unwrap();
+        let callers = |name: &str| -> Vec<String> {
+            result.cross_file.reading_order.iter().find(|s| s.name == name).map(|s| s.called_by.clone()).unwrap_or_default()
+        };
+        // `c = self.ctx()` makes c a Ctx; `d.pop()` on a dict is nobody's pop.
+        assert_eq!(callers("Ctx.pop"), vec!["App.run"], "{:?}", result.cross_file.reading_order);
+        assert!(callers("Globals.pop").is_empty(), "{:?}", result.cross_file.reading_order);
+    }
+
+    #[test]
+    fn test_fields_take_the_type_they_are_assigned() {
+        let new = "class Parser:\n    def wait_ready(self):\n        pass\n\nclass ReadAhead:\n    def wait_ready(self):\n        pass\n\n\
+            class Conn:\n    def __init__(self):\n        self._parser = Parser()\n\n    def handle(self):\n        self._parser.wait_ready()\n";
+        let old = new.replace("        pass\n", "        return 1\n").replace("        self._parser.wait_ready()\n", "        return 2\n");
+        let files = vec![cross_file::FileChange::new("conn.py", &old, new, Language::Python)];
+        let result = analyze_multi(&files).unwrap();
+        let callers = |name: &str| -> Vec<String> {
+            result.cross_file.reading_order.iter().find(|s| s.name == name).map(|s| s.called_by.clone()).unwrap_or_default()
+        };
+        // Two unrelated classes have `wait_ready`; `self._parser = Parser()` says which.
+        assert_eq!(callers("Parser.wait_ready"), vec!["Conn.handle"], "{:?}", result.cross_file.reading_order);
+        assert!(callers("ReadAhead.wait_ready").is_empty());
+    }
+
+    #[test]
+    fn test_functions_handed_on_as_values_in_js() {
+        let new = "export function handleClick() {\n  return 2;\n}\n\nexport function handleError() {\n  return 2;\n}\n\nexport function handleSubmit() {\n  return 2;\n}\n\n\
+            export function App(props) {\n  const local = 1;\n  render({ onError: handleError, handleSubmit, local });\n  return <button onClick={handleClick} />;\n}\n";
+        let old = new.replace("return 2", "return 1").replace("  render({ onError: handleError, handleSubmit, local });\n", "").replace(" onClick={handleClick}", "");
+        let files = vec![cross_file::FileChange::new("app.tsx", &old, new, Language::Tsx)];
+        let result = analyze_multi(&files).unwrap();
+        let callers = |name: &str| -> Vec<String> {
+            result.cross_file.reading_order.iter().find(|s| s.name == name).map(|s| s.called_by.clone()).unwrap_or_default()
+        };
+        // `onClick={handleClick}`, `{ onError: handleError }` and `{ handleSubmit }` all hand a function on.
+        for f in ["handleClick", "handleError", "handleSubmit"] {
+            assert_eq!(callers(f), vec!["App"], "{f}: {:?}", result.cross_file.reading_order);
+        }
+    }
+
+    #[test]
+    fn test_aliases_resolve_to_their_target() {
+        let new = "export type AnyApi = Api<any>;\n\nexport class Api<T> {\n  make() {\n    return 2;\n  }\n}\n\nexport class Other {\n  make() {\n    return 2;\n  }\n}\n\nexport function f(a: AnyApi) {\n  a.make();\n}\n";
+        let old = new.replace("return 2", "return 1").replace("  a.make();\n", "");
+        let files = vec![cross_file::FileChange::new("api.ts", &old, new, Language::TypeScript)];
+        let result = analyze_multi(&files).unwrap();
+        let callers = |name: &str| -> Vec<String> {
+            result.cross_file.reading_order.iter().find(|s| s.name == name).map(|s| s.called_by.clone()).unwrap_or_default()
+        };
+        // `a: AnyApi` is an Api through the alias the change defines.
+        assert_eq!(callers("Api.make"), vec!["f"], "{:?}", result.cross_file.reading_order);
+        assert!(callers("Other.make").is_empty());
+    }
+
+    #[test]
+    fn test_rust_self_path_is_the_receivers_type() {
+        use parser::{CallRef, Qualifier};
+        let src = "struct A;\nimpl A {\n    fn run() {\n        Self::step(1);\n    }\n}\n";
+        let tree = parser::parse(src, &*languages::get_language_support(Language::Rust)).unwrap();
+        let run = tree.items.iter().position(|i| i.name() == Some("A::run")).expect("A::run item");
+        let calls = &tree.meta[run].calls;
+        assert!(calls.contains(&CallRef { qualifier: Qualifier::SelfType, name: parser::ident_hash("step"), parens: true }), "{calls:?}");
+    }
+
+    #[test]
+    fn test_python_self_is_the_receivers_type() {
+        use parser::{CallRef, Qualifier};
+        let src = "class A:\n    def run(self):\n        self.step()\n        cls.make()\n";
+        let lang = languages::get_language_support(Language::Python);
+        let tree = parser::parse(src, &*lang).unwrap();
+        let calls: std::collections::HashSet<CallRef> = tree.meta.iter().flat_map(|m| m.method_calls.iter().flatten().copied()).collect();
+        let has = |name: &str| calls.contains(&CallRef { qualifier: Qualifier::SelfType, name: parser::ident_hash(name), parens: true });
+        assert!(has("step") && has("make"), "{calls:?}");
+    }
+
+    #[test]
+    fn test_functions_passed_as_values_are_spotted() {
+        use parser::{CallRef, Qualifier};
+        let src = "fn f(qs: Vec<Q>, limit: usize) {\n    qs.iter().any(Q::is_and);\n    let (or, and) = (Q::or, Q::and);\n    x.or_else(fallback);\n    take(limit, other);\n    if let Some(found) = y { use_it(found); }\n}\n";
+        let lang = languages::get_language_support(Language::Rust);
+        let tree = parser::parse(src, &*lang).unwrap();
+        let calls = &tree.meta[0].calls;
+        let has = |q: Qualifier, name: &str| calls.contains(&CallRef { qualifier: q, name: parser::ident_hash(name), parens: false });
+        let q = Qualifier::Path(parser::ident_hash("Q"));
+        assert!(has(q, "is_and") && has(q, "or") && has(q, "and"), "{calls:?}");
+        assert!(has(Qualifier::None, "fallback"), "a lone argument");
+        assert!(has(Qualifier::None, "other"));
+        // Parameters and pattern bindings passed along are values, not functions.
+        assert!(!has(Qualifier::None, "limit") && !has(Qualifier::None, "found"), "{calls:?}");
     }
 
     #[test]

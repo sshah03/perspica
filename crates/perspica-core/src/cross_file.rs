@@ -20,6 +20,9 @@ pub struct CrossFileManifest {
     /// Changed code in the order to read it: entry points first, then what they call.
     #[serde(default)]
     pub reading_order: Vec<crate::flow::ReadingStep>,
+    /// Only with `PERSPICA_GRAPH_DEBUG=1`: the call graph itself, for evaluation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_debug: Option<crate::flow::GraphDebug>,
     /// For each changed function, whether (and how) the changed tests reach it.
     #[serde(default)]
     pub test_reach: Vec<crate::flow::TestReach>,

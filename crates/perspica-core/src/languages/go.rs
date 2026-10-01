@@ -201,21 +201,28 @@ fn extract_type_declaration(node: &tree_sitter::Node, source: &str) -> Option<Se
                 if tn.kind() == "struct_type" {
                     // Extract struct fields
                     let mut fields = Vec::new();
-                    if let Some(field_list) = tn.child_by_field_name("body") {
+                    // The field list is an unnamed child: `struct { … }`.
+                    let mut tc = tn.walk();
+                    let field_list = tn.children(&mut tc).find(|c| c.kind() == "field_declaration_list");
+                    if let Some(field_list) = field_list {
                         let mut fc = field_list.walk();
                         for field in field_list.children(&mut fc) {
                             if field.kind() == "field_declaration" {
-                                let fname = field
-                                    .child_by_field_name("name")
-                                    .map(|n| node_text(&n, source))
-                                    .unwrap_or_default();
                                 let ftype = field
                                     .child_by_field_name("type")
                                     .map(|n| node_text(&n, source));
-                                fields.push(Field {
-                                    name: fname,
-                                    type_annotation: ftype,
-                                });
+                                // `a, b int` declares two fields; an embedded `*Base` is named by its type.
+                                let mut nc = field.walk();
+                                let names: Vec<String> = field.children_by_field_name("name", &mut nc).map(|n| node_text(&n, source)).collect();
+                                let names = if names.is_empty() {
+                                    vec![ftype.as_deref().unwrap_or("").trim_start_matches('*').rsplit('.').next().unwrap_or("").to_string()]
+                                } else { names };
+                                for fname in names {
+                                    fields.push(Field {
+                                        name: fname,
+                                        type_annotation: ftype.clone(),
+                                    });
+                                }
                             }
                         }
                     }

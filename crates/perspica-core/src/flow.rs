@@ -9,7 +9,7 @@
 
 use crate::cross_file::InternalAnalysis;
 use crate::manifest::{Location, ManifestEntryId, Side};
-use crate::parser::{bare_name, ident_hash, SemanticItem};
+use crate::parser::{bare_name, ident_hash, CallRef, Qualifier, SemanticItem};
 use crate::roles::FileRole;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -17,9 +17,33 @@ use std::collections::{HashMap, HashSet, VecDeque};
 /// Paths through unchanged code are followed this far when linking changed items.
 const MAX_HOPS: usize = 3;
 /// Test reach is followed this far from a test.
-const MAX_TEST_DEPTH: usize = 6;
-/// Shorter names aren't linked at all.
+const MAX_TEST_DEPTH: usize = 8;
+/// Shorter names are linked only when the qualifier names their type (`self.b(`).
 const MIN_NAME_LEN: usize = 3;
+/// Methods of the built-in containers, strings and promises in Python and JavaScript. On a
+/// receiver of unknown type (`d.get(`, `xs.map(`) they are far likelier the built-in than a
+/// same-named method in the change.
+const BUILTIN_METHODS: &[&str] = &[
+    "get", "pop", "popitem", "setdefault", "update", "copy", "clear", "keys", "values", "items", "append", "extend",
+    "insert", "remove", "index", "count", "sort", "reverse", "add", "discard", "union", "intersection", "difference",
+    "join", "split", "rsplit", "splitlines", "strip", "lstrip", "rstrip", "replace", "format", "startswith", "endswith",
+    "lower", "upper", "encode", "decode", "find", "read", "write", "readline", "flush", "seek",
+    "push", "shift", "unshift", "map", "filter", "forEach", "reduce", "some", "every", "findIndex", "includes", "indexOf",
+    "slice", "splice", "concat", "entries", "set", "has", "delete", "then", "catch", "finally", "toString", "trim",
+    "startsWith", "endsWith", "match", "test", "apply", "call", "bind",
+];
+/// Methods of the standard interfaces and traits in Go, Rust and Java (`String()`, `Error()`,
+/// `fmt`, `clone`, `next`, `toString`…). Nearly every type has them, so on a receiver of unknown
+/// type one changed type defining it says nothing about which runs.
+const INTERFACE_METHODS: &[&str] = &[
+    "String", "Error", "ServeHTTP", "Read", "Write", "Close", "Len", "Less", "Swap", "Unwrap", "Format",
+    "MarshalJSON", "UnmarshalJSON", "MarshalText", "UnmarshalText", "Is", "As", "Seek", "Flush", "Lock", "Unlock",
+    "Wait", "Done", "Err", "Value", "Deadline",
+    "fmt", "clone", "eq", "ne", "cmp", "partial_cmp", "hash", "from", "into", "try_from", "try_into", "default", "drop",
+    "next", "deref", "deref_mut", "as_ref", "as_mut", "borrow", "borrow_mut", "to_string", "to_owned", "write", "read",
+    "flush", "len", "is_empty", "iter", "into_iter",
+    "toString", "equals", "hashCode", "compareTo", "close",
+];
 /// Names defined in more places than this are too ambiguous to link by name.
 const MAX_DEFS_PER_NAME: usize = 4;
 
@@ -78,6 +102,15 @@ struct Node<'a> {
     kind: StepKind,
     span: (usize, usize),
     refs: &'a HashSet<u64>,
+    calls: &'a HashSet<CallRef>,
+    /// Receiver variable → its type, from parameter annotations and obvious initializers.
+    binds: HashMap<u64, u64>,
+    /// Receiver variable → the call it was assigned from (`ctx = self.request_context(…)`).
+    returns: HashMap<u64, CallRef>,
+    /// The bindings that come from a declared type rather than a guess from an initializer.
+    declared: HashSet<u64>,
+    /// The type a function declares it returns, unwrapped (`-> Result<Foo>` is a Foo).
+    ret_type: Option<u64>,
     is_test: bool,
     /// Top-level unnamed statement (e.g. a `describe(...)` block in a test file).
     unnamed: bool,
@@ -92,7 +125,34 @@ pub(crate) struct Graph<'a> {
     entries: Vec<Vec<ManifestEntryId>>,
 }
 
+/// The graph as built, for measuring it against a compiler's answer (`PERSPICA_GRAPH_DEBUG=1`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphDebug {
+    pub nodes: Vec<DebugNode>,
+    /// (caller, callee) indexes into `nodes`.
+    pub edges: Vec<(usize, usize)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DebugNode {
+    pub file: String,
+    pub name: String,
+    pub kind: StepKind,
+    pub start: usize,
+    pub end: usize,
+    pub is_test: bool,
+}
+
 impl<'a> Graph<'a> {
+    pub(crate) fn debug(&self, analyses: &[InternalAnalysis]) -> GraphDebug {
+        GraphDebug {
+            nodes: self.nodes.iter().map(|n| DebugNode {
+                file: analyses[n.file].path.clone(), name: n.name.clone(), kind: n.kind, start: n.span.0, end: n.span.1, is_test: n.is_test,
+            }).collect(),
+            edges: self.out.iter().enumerate().flat_map(|(i, ts)| ts.iter().map(move |&t| (i, t))).collect(),
+        }
+    }
+
     pub(crate) fn build(analyses: &'a [InternalAnalysis]) -> Graph<'a> {
         let mut nodes = Vec::new();
         for (fi, a) in analyses.iter().enumerate() {
@@ -106,9 +166,19 @@ impl<'a> Graph<'a> {
                 match item {
                     SemanticItem::Import { .. } => {}
                     SemanticItem::Class { name, methods, span, .. } => {
-                        nodes.push(Node { file: fi, name: name.clone(), kind: StepKind::Type, span: (span.start_line, span.end_line), refs: &meta.refs, is_test, unnamed: false, source_text: text });
+                        // The type's body holds its methods' calls, so it takes their receiver bindings too.
+                        let mut binds = HashMap::new();
+                        let mut returns = HashMap::new();
+                        let mut declared = HashSet::new();
                         for (k, m) in methods.iter().enumerate() {
-                            let (Some(mname), Some(refs)) = (m.name(), meta.method_refs.get(k)) else { continue };
+                            binds.extend(param_binds(m, meta.method_binds.get(k)));
+                            declared.extend(declared_of(m, meta.method_declared.get(k)));
+                            if let Some(r) = meta.method_returns.get(k) { returns.extend(r.iter().map(|(v, c)| (*v, *c))); }
+                        }
+                        nodes.push(Node { file: fi, name: name.clone(), kind: StepKind::Type, span: (span.start_line, span.end_line), refs: &meta.refs, calls: &meta.calls, binds, returns, declared, ret_type: None, is_test, unnamed: false, source_text: text });
+                        for (k, m) in methods.iter().enumerate() {
+                            let (Some(mname), Some(refs), Some(calls)) = (m.name(), meta.method_refs.get(k), meta.method_calls.get(k)) else { continue };
+                            let binds = param_binds(m, meta.method_binds.get(k));
                             let s = m.span();
                             nodes.push(Node {
                                 file: fi,
@@ -116,6 +186,12 @@ impl<'a> Graph<'a> {
                                 kind: StepKind::Function,
                                 span: (s.start_line, s.end_line),
                                 refs,
+                                calls,
+                                binds,
+                                returns: meta.method_returns.get(k).cloned().unwrap_or_default(),
+                                declared: declared_of(m, meta.method_declared.get(k)),
+                                // `-> Self` is the method's own type.
+                                ret_type: returned_type(m).map(|t| if t == ident_hash("Self") { ident_hash(bare_name(name)) } else { t }),
                                 is_test,
                                 unnamed: false,
                                 source_text: span_text(&a.new_source, s.start_line, s.end_line),
@@ -124,6 +200,11 @@ impl<'a> Graph<'a> {
                     }
                     other => {
                         let s = other.span();
+                        let mut binds = param_binds(other, Some(&meta.binds));
+                        // Go's receiver (`func (p *Program) flush()`) is the method's own type, like `self`.
+                        if let (Some(owner), Some(recv)) = (other.name().and_then(crate::cross_file::owner_of), go_receiver(text)) {
+                            if a.path.ends_with(".go") { binds.insert(ident_hash(recv), ident_hash(owner)); }
+                        }
                         nodes.push(Node {
                             file: fi,
                             name: other.name().map(str::to_string).unwrap_or_default(),
@@ -134,6 +215,11 @@ impl<'a> Graph<'a> {
                             },
                             span: (s.start_line, s.end_line),
                             refs: &meta.refs,
+                            calls: &meta.calls,
+                            binds,
+                            returns: meta.returns.clone(),
+                            declared: declared_of(other, Some(&meta.declared)),
+                            ret_type: returned_type(other),
                             is_test,
                             unnamed: other.name().is_none(),
                             source_text: text,
@@ -146,7 +232,7 @@ impl<'a> Graph<'a> {
         let mut by_name: HashMap<u64, Vec<usize>> = HashMap::new();
         for (i, n) in nodes.iter().enumerate() {
             // One- and two-letter names (`p`, `ok`) collide with locals everywhere.
-            if !n.unnamed && !n.is_test && bare_name(&n.name).chars().count() >= MIN_NAME_LEN {
+            if !n.unnamed && !n.is_test {
                 by_name.entry(ident_hash(bare_name(&n.name))).or_default().push(i);
             }
         }
@@ -159,30 +245,200 @@ impl<'a> Graph<'a> {
                 !m.is_empty() && crate::classify::contains_identifier(&analyses[caller].new_source, m)
             }
         };
+        // Naming the callee's type (`ignore::WalkBuilder`) is as good as naming its module.
+        // Once per file and type: the scan reads the caller's whole source.
+        let named_types: std::cell::RefCell<HashMap<(usize, &str), bool>> = Default::default();
+        let sees_type = |caller: usize, callee: usize| -> bool {
+            crate::cross_file::owner_of(&nodes[callee].name).is_some_and(|o| {
+                *named_types.borrow_mut().entry((caller, o)).or_insert_with(|| crate::classify::contains_identifier(&analyses[caller].new_source, o))
+            })
+        };
         // The directory a file is in, for telling same-named methods apart.
         let dir_of = |file: usize| analyses[file].path.rsplit('/').nth(1).unwrap_or("");
-        let out: Vec<Vec<usize>> = nodes.iter().enumerate().map(|(i, n)| {
-            let mut targets: Vec<usize> = n.refs.iter()
-                .filter_map(|h| by_name.get(h))
-                .filter(|defs| defs.len() <= MAX_DEFS_PER_NAME)
-                .flat_map(|defs| {
-                    // The same name on several types (`JsonReader.read`, `JsonTreeReader.read`):
-                    // keep the ones whose type the caller names, then the ones in its directory.
-                    let mut cands: Vec<usize> = defs.clone();
-                    if cands.len() > 1 {
-                        let owned: Vec<usize> = cands.iter().copied()
-                            .filter(|&d| crate::cross_file::owner_of(&nodes[d].name).is_some_and(|o| n.refs.contains(&ident_hash(o))))
-                            .collect();
-                        if !owned.is_empty() && owned.len() < cands.len() { cands = owned; }
+        let owner_hash = |d: usize| crate::cross_file::owner_of(&nodes[d].name).map(ident_hash);
+        let module_hash: Vec<u64> = module_of.iter().map(|m| ident_hash(m)).collect();
+        // Field types per type, from every type definition in the change: (type, field) → field's type,
+        // or None when same-named types disagree.
+        let mut field_types: HashMap<(u64, u64), Option<u64>> = HashMap::new();
+        for a in analyses.iter().filter(|a| a.result.review.parsed) {
+            for item in &a.new_tree.items {
+                if let SemanticItem::Class { name, fields, .. } = item {
+                    for f in fields {
+                        if let Some(t) = f.type_annotation.as_deref().and_then(type_name) {
+                            let slot = field_types.entry((ident_hash(bare_name(name)), ident_hash(&f.name))).or_insert(Some(t));
+                            if *slot != Some(t) { *slot = None; }
+                        }
                     }
-                    if cands.len() > 1 {
-                        let near: Vec<usize> = cands.iter().copied().filter(|&d| dir_of(nodes[d].file) == dir_of(n.file)).collect();
-                        if !near.is_empty() && near.len() < cands.len() { cands = near; }
-                    }
-                    prefer_local(&cands, &nodes, n.file)
+                }
+            }
+        }
+        // Each type's parents, as its header names them: `class A(B):`, `class A extends B`, `impl T for A`.
+        let mut parents: HashMap<u64, HashSet<u64>> = HashMap::new();
+        for n in nodes.iter().filter(|n| n.kind == StepKind::Type) {
+            let own = bare_name(&n.name);
+            let header = n.source_text.lines().next().unwrap_or("");
+            let named = header.split(|c: char| !(c.is_alphanumeric() || c == '_')).filter(|w| capitalized_word(w) && *w != own);
+            parents.entry(ident_hash(own)).or_default().extend(named.map(ident_hash));
+        }
+        // Whether `t` is `root` or descends from it.
+        let descends = |t: u64, root: u64| -> bool {
+            let (mut stack, mut seen) = (vec![t], HashSet::new());
+            while let Some(x) = stack.pop() {
+                if x == root { return true; }
+                if seen.insert(x) { if let Some(ps) = parents.get(&x) { stack.extend(ps.iter().copied()); } }
+            }
+            false
+        };
+        let builtin: HashSet<u64> = BUILTIN_METHODS.iter().map(|m| ident_hash(m)).collect();
+        let interface_methods: HashSet<u64> = INTERFACE_METHODS.iter().map(|m| ident_hash(m)).collect();
+        let short = |d: usize| bare_name(&nodes[d].name).chars().count() < MIN_NAME_LEN;
+        let known_owners: HashSet<u64> = (0..nodes.len()).filter_map(owner_hash).collect();
+        // Among same-named candidates: the ones whose type the caller names, then the
+        // ones in its directory, then its own file.
+        let narrow = |n: &Node, cands: Vec<usize>| -> Vec<usize> {
+            let mut cands = cands;
+            if cands.len() > 1 {
+                let owned: Vec<usize> = cands.iter().copied().filter(|&d| owner_hash(d).is_some_and(|o| n.refs.contains(&o))).collect();
+                if !owned.is_empty() && owned.len() < cands.len() { cands = owned; }
+            }
+            if cands.len() > 1 {
+                let near: Vec<usize> = cands.iter().copied().filter(|&d| dir_of(nodes[d].file) == dir_of(n.file)).collect();
+                if !near.is_empty() && near.len() < cands.len() { cands = near; }
+            }
+            prefer_local(&cands, &nodes, n.file)
+        };
+        // The one type the functions a call can mean all return, if the graph knows it.
+        let returned_by = |binds: &HashMap<u64, u64>, my_owner: Option<u64>, rc: &CallRef| -> Option<u64> {
+            let defs = by_name.get(&rc.name)?;
+            let receiver = |q: u64| binds.get(&q).copied().filter(|t| known_owners.contains(t)).unwrap_or(q);
+            let types: HashSet<u64> = defs.iter().copied()
+                .filter(|&d| nodes[d].kind == StepKind::Function)
+                .filter(|&d| match rc.qualifier {
+                    Qualifier::SelfType => owner_hash(d).is_some() && owner_hash(d) == my_owner,
+                    Qualifier::Named(q) | Qualifier::Path(q) => owner_hash(d) == Some(receiver(q)) || (owner_hash(d).is_none() && module_hash[nodes[d].file] == q),
+                    Qualifier::None => owner_hash(d).is_none(),
+                    _ => false,
                 })
-                .filter(|&t| t != i && !contains(&nodes[i], &nodes[t]) && sees(n.file, nodes[t].file))
+                .filter_map(|d| nodes[d].ret_type)
                 .collect();
+            if types.len() != 1 { return None; }
+            types.into_iter().next().filter(|t| known_owners.contains(t))
+        };
+        // `self.p = Parser(…)` / `self.p = self.make()`: a field the class doesn't declare
+        // takes the type it's assigned; assignments that disagree cancel out.
+        let type_names: HashSet<u64> = nodes.iter().filter(|n| n.kind == StepKind::Type).map(|n| ident_hash(bare_name(&n.name))).collect();
+        // Aliases the change defines: `type AnyApi = Api<any>` (TS, Rust, Scala, Go `type A = B`).
+        let aliases: HashMap<u64, u64> = nodes.iter().filter(|n| n.kind == StepKind::Type)
+            .filter_map(|n| alias_target(n.source_text).map(|t| (ident_hash(bare_name(&n.name)), t)))
+            .filter(|(a, t)| a != t)
+            .collect();
+        let unalias = |t: u64| -> u64 { let mut t = t; for _ in 0..3 { match aliases.get(&t) { Some(&u) => t = u, None => break } } t };
+        let no_binds = HashMap::new();
+        let mut assigned: HashMap<(u64, u64), Option<u64>> = HashMap::new();
+        for a in analyses.iter().filter(|a| a.result.review.parsed) {
+            for (item, meta) in a.new_tree.items.iter().zip(&a.new_tree.meta) {
+                let SemanticItem::Class { name, .. } = item else { continue };
+                let owner = ident_hash(bare_name(name));
+                for (&f, rc) in meta.method_self_fields.iter().flatten() {
+                    let constructed = rc.qualifier == Qualifier::None && type_names.contains(&rc.name);
+                    let Some(t) = (if constructed { Some(rc.name) } else { returned_by(&no_binds, Some(owner), rc) }) else { continue };
+                    let slot = assigned.entry((owner, f)).or_insert(Some(t));
+                    if *slot != Some(t) { *slot = None; }
+                }
+            }
+        }
+        for (k, v) in assigned { field_types.entry(k).or_insert(v); }
+        let typed_fields: HashSet<u64> = field_types.keys().map(|&(t, _)| t).collect();
+        let out: Vec<Vec<usize>> = nodes.iter().enumerate().map(|(i, n)| {
+            // A type's own body (`self.` in a class) belongs to the type itself.
+            let my_owner = if n.kind == StepKind::Type { Some(ident_hash(bare_name(&n.name))) } else { crate::cross_file::owner_of(&n.name).map(ident_hash) };
+            let mut targets: Vec<usize> = Vec::new();
+            // Calls resolve to functions. A qualifier that names the callee's type (or the
+            // caller's own type via `self`) settles it outright, however common the name.
+            // Scala calls parameterless methods without parentheses (`x.size`).
+            let member_calls = analyses[n.file].path.ends_with(".scala");
+            // Rust and Go can't call a method without a receiver: a bare `name(` is a free function.
+            let bare_is_free = analyses[n.file].path.ends_with(".rs") || analyses[n.file].path.ends_with(".go");
+            // Where a field can't share a method's name, `self.name` with no call is the method itself.
+            let dynamic = [".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts"].iter().any(|e| analyses[n.file].path.ends_with(e));
+            let self_values = dynamic;
+            for call in n.calls {
+                // Without arguments, only a function passed as a value: `f(g)`, `Type::name`, `self.name`.
+                let value = !call.parens && !member_calls;
+                if value && !matches!(call.qualifier, Qualifier::None | Qualifier::Path(_)) && !(self_values && call.qualifier == Qualifier::SelfType) { continue; }
+                let Some(defs) = by_name.get(&call.name) else { continue };
+                let funcs: Vec<usize> = defs.iter().copied().filter(|&d| nodes[d].kind == StepKind::Function).collect();
+                if funcs.is_empty() { continue; }
+                let mut bound = false;
+                let exact: Vec<usize> = match call.qualifier {
+                    Qualifier::SelfType => funcs.iter().copied().filter(|&d| owner_hash(d).is_some() && owner_hash(d) == my_owner).collect(),
+                    Qualifier::Named(q) | Qualifier::Path(q) | Qualifier::Field(q) | Qualifier::Member(_, q) => {
+                        // `b.go(` where `b` is known to be a B is `B.go(`: from `b: B`, `b = B::new()`, or
+                        // `b = make_b()` where make_b returns a B. `self.f.go(` and `a.f.go(` go through
+                        // f's declared type. A declared type the change doesn't define means the call
+                        // leaves the change: nothing here is its target.
+                        let known = |t: u64| known_owners.contains(&t);
+                        // A struct the change declares, with or without methods, has known fields;
+                        // an alias the change declares stands for its target.
+                        let base = |a: u64| n.binds.get(&a).map(|&t| unalias(t)).filter(|&t| known(t) || typed_fields.contains(&t));
+                        let declared_type: Option<Option<u64>> = match call.qualifier {
+                            Qualifier::Field(f) => my_owner.and_then(|o| field_types.get(&(o, f)).copied()),
+                            Qualifier::Member(a, f) => base(a).and_then(|o| field_types.get(&(o, f)).copied()),
+                            Qualifier::Named(_) if n.declared.contains(&q) => Some(n.binds.get(&q).copied()),
+                            _ => None,
+                        }.map(|t| t.map(unalias));
+                        // A declared type with no methods here (outside the change, or an interface the
+                        // change declares) puts the call outside what the change shows.
+                        if matches!(declared_type, Some(Some(t)) if !known(t)) { continue; }
+                        let ty = match call.qualifier {
+                            Qualifier::Field(_) | Qualifier::Member(..) => declared_type.flatten(),
+                            Qualifier::Named(_) => base(q).or_else(|| n.returns.get(&q).and_then(|rc| returned_by(&n.binds, my_owner, rc))),
+                            _ => n.binds.get(&q).copied(),
+                        };
+                        let q = match ty { Some(t) if known_owners.contains(&t) => { bound = true; t } _ => q };
+                        let by_owner: Vec<usize> = funcs.iter().copied().filter(|&d| owner_hash(d) == Some(q)).collect();
+                        if by_owner.is_empty() { funcs.iter().copied().filter(|&d| owner_hash(d).is_none() && module_hash[nodes[d].file] == q).collect() } else { by_owner }
+                    }
+                    // Unqualified: a free function, a method of the caller's own type, or a constructor (`new Foo(`).
+                    Qualifier::None if value => funcs.iter().copied().filter(|&d| owner_hash(d).is_none()).collect(),
+                    Qualifier::None => funcs.iter().copied().filter(|&d| owner_hash(d).is_none() || (!bare_is_free && owner_hash(d) == my_owner)
+                        || crate::cross_file::owner_of(&nodes[d].name) == Some(bare_name(&nodes[d].name))).collect(),
+                    Qualifier::Unknown => vec![],
+                };
+                // Only a qualifier that names the type settles a call beyond the import gate.
+                let named = !matches!(call.qualifier, Qualifier::None | Qualifier::Unknown);
+                // A receiver of unknown type calling a built-in container method: the built-in.
+                let untyped = exact.is_empty() && !bound && matches!(call.qualifier, Qualifier::Named(_) | Qualifier::Field(_) | Qualifier::Member(..) | Qualifier::Unknown);
+                if untyped && (if dynamic { builtin.contains(&call.name) } else { interface_methods.contains(&call.name) }) { continue; }
+                // A path, or a receiver whose type is known, that resolves to nothing stays unresolved.
+                // An unknown receiver may still be any same-named method, but never a free function.
+                // A call on a result (`f().g(`) can only be a method; `x.g(` may also be a namespaced free function.
+                let (cands, settled) = if !exact.is_empty() { (exact, named) }
+                    else if bound || matches!(call.qualifier, Qualifier::None | Qualifier::Path(_)) { (vec![], false) }
+                    else if matches!(call.qualifier, Qualifier::Unknown) { (funcs.into_iter().filter(|&d| owner_hash(d).is_some()).collect(), false) }
+                    else { (funcs, false) };
+                if cands.is_empty() || (!settled && (cands.len() > MAX_DEFS_PER_NAME || short(cands[0]))) { continue; }
+                let picked: Vec<usize> = narrow(n, cands).into_iter().filter(|&t| settled || sees(n.file, nodes[t].file) || sees_type(n.file, t)).collect();
+                // A receiver of unknown type with same-named methods left on unrelated types is a
+                // guess either way. On one hierarchy (`param.get_default(` on Parameter and its
+                // subclass Option) it is whichever override runs.
+                let guessed = !settled && matches!(call.qualifier, Qualifier::Named(_) | Qualifier::Field(_) | Qualifier::Member(..) | Qualifier::Unknown);
+                if guessed {
+                    let owners: Vec<Option<u64>> = picked.iter().map(|&t| owner_hash(t)).collect::<HashSet<_>>().into_iter().collect();
+                    let one_hierarchy = owners.iter().all(Option::is_some)
+                        && owners.iter().flatten().any(|&root| owners.iter().flatten().all(|&o| descends(o, root)));
+                    if owners.len() > 1 && !one_hierarchy { continue; }
+                }
+                targets.extend(picked);
+            }
+            // Types and values are reached by any mention of their name.
+            for h in n.refs {
+                let Some(defs) = by_name.get(h) else { continue };
+                let others: Vec<usize> = defs.iter().copied().filter(|&d| nodes[d].kind != StepKind::Function && !short(d)).collect();
+                if others.is_empty() || others.len() > MAX_DEFS_PER_NAME { continue; }
+                targets.extend(narrow(n, others).into_iter().filter(|&t| sees(n.file, nodes[t].file)));
+            }
+            targets.retain(|&t| t != i && !contains(&nodes[i], &nodes[t]));
             targets.sort_unstable();
             targets.dedup();
             targets
@@ -404,6 +660,70 @@ impl<'a> Graph<'a> {
 
 /// The name other files use for this one: its stem, or the directory for
 /// `index` / `mod` / `__init__` / `lib` files.
+/// The type a parameter annotation names: `&mut B` → B, `Option<Box<B>>` → Option (harmless),
+/// `ignore::WalkBuilder` → WalkBuilder, `*pkg.T` → T. Primitives (lowercase) don't count.
+fn type_name(annotation: &str) -> Option<u64> {
+    let t = annotation.trim().trim_start_matches(['&', '*']).trim_start();
+    let t = ["mut ", "dyn ", "impl ", "final "].iter().fold(t, |t, kw| t.strip_prefix(kw).unwrap_or(t));
+    let head = t.split(['<', '[', '(', ' ', ',']).next().unwrap_or("");
+    let last = head.rsplit("::").next().unwrap_or(head).rsplit('.').next().unwrap_or(head);
+    last.chars().next().is_some_and(|c| c.is_ascii_uppercase()).then(|| ident_hash(last))
+}
+
+/// What a function says it returns, through the wrappers that don't change what's inside:
+/// `Result<Foo, E>`, `Option<Foo>`, `Optional[Foo]`, `Foo | None`, `Promise<Foo>`, `(*Foo, error)`.
+fn returned_type(item: &SemanticItem) -> Option<u64> {
+    let SemanticItem::Function { return_type: Some(rt), .. } = item else { return None };
+    let mut t = rt.trim().trim_start_matches("->").trim().trim_matches('"').trim_start_matches('(').trim();
+    t = t.split('|').map(str::trim).find(|p| !matches!(*p, "None" | "null" | "undefined")).unwrap_or(t);
+    for _ in 0..3 {
+        let head = t.split(['<', '[']).next().unwrap_or("").trim();
+        let head = head.rsplit("::").next().unwrap_or(head).rsplit('.').next().unwrap_or(head);
+        if !matches!(head, "Result" | "Option" | "Optional" | "Box" | "Rc" | "Arc" | "Promise" | "Awaitable" | "Ref" | "RefMut") { break; }
+        let Some(open) = t.find(['<', '[']) else { break };
+        t = t[open + 1..].trim();
+    }
+    type_name(t)
+}
+
+/// What a type alias stands for: `type AnyApi = Api<any, any>` → `Api`.
+fn alias_target(text: &str) -> Option<u64> {
+    let header = text.lines().next()?.trim();
+    let rest = header.strip_prefix("export ").unwrap_or(header).trim_start_matches("pub ").trim_start_matches("pub(crate) ");
+    let rest = rest.strip_prefix("type ")?;
+    let (_, rhs) = rest.split_once('=')?;
+    type_name(rhs.trim().trim_end_matches(';'))
+}
+
+/// The receiver variable of a Go method: `func (p *Program) flush()` → `p`.
+fn go_receiver(text: &str) -> Option<&str> {
+    let rest = text.trim_start().strip_prefix("func")?.trim_start().strip_prefix('(')?;
+    let mut words = rest.split(')').next()?.split_whitespace();
+    let name = words.next()?;
+    words.next().map(|_| name)
+}
+
+/// Which of a function's bindings come from a declared type: its typed parameters and its
+/// declared locals.
+fn declared_of(item: &SemanticItem, local: Option<&HashSet<u64>>) -> HashSet<u64> {
+    let mut declared = local.cloned().unwrap_or_default();
+    if let SemanticItem::Function { params, .. } = item {
+        declared.extend(params.iter().filter(|p| p.type_annotation.as_deref().and_then(type_name).is_some()).map(|p| ident_hash(&p.name)));
+    }
+    declared
+}
+
+/// A function's receiver bindings: its typed parameters plus its local initializers.
+fn param_binds(item: &SemanticItem, local: Option<&HashMap<u64, u64>>) -> HashMap<u64, u64> {
+    let mut binds = local.cloned().unwrap_or_default();
+    if let SemanticItem::Function { params, .. } = item {
+        for p in params {
+            if let Some(t) = p.type_annotation.as_deref().and_then(type_name) { binds.insert(ident_hash(&p.name), t); }
+        }
+    }
+    binds
+}
+
 fn module_name(path: &str) -> String {
     let mut parts = path.rsplit('/');
     let file = parts.next().unwrap_or("");
@@ -416,6 +736,10 @@ fn module_name(path: &str) -> String {
 }
 
 /// Prefer definitions in the caller's own file when a name is defined in several.
+fn capitalized_word(w: &str) -> bool {
+    w.chars().next().is_some_and(|c| c.is_uppercase())
+}
+
 fn prefer_local(defs: &[usize], nodes: &[Node], file: usize) -> Vec<usize> {
     let local: Vec<usize> = defs.iter().copied().filter(|&d| nodes[d].file == file).collect();
     if local.is_empty() { defs.to_vec() } else { local }
