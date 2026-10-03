@@ -432,9 +432,12 @@ fn enrich_with_repo_references(multi: &mut MultiFileResult, target: &git::Target
     let vanished: Vec<perspica_core::cross_file::Vanished> = multi.cross_file.vanished.iter()
         .map(|v| (v.name.clone(), v.renamed_to.clone(), v.origin.clone(), v.owner.clone()))
         .collect();
+    // Exported functions, and private ones in languages where they reach the rest of a package.
+    let reaches_out = |s: &perspica_core::cross_file::SignatureImpactEntry| s.exported
+        || s.definition.file.as_deref().is_some_and(|f| f.ends_with(".go") || f.ends_with(".rs") || f.ends_with(".py") || f.ends_with(".c"));
     let sig_names: Vec<String> = multi.cross_file.signature_impacts.iter()
-        .filter(|s| s.exported)
-        .map(|s| perspica_core::parser::bare_name(&s.name).to_string())
+        .filter(|s| reaches_out(s))
+        .map(|s| perspica_core::cross_file::call_name(&s.name).to_string())
         .filter(|n| n.len() >= 3)
         .collect();
     let mut names: Vec<&str> = vanished.iter().map(|v| v.0.as_str()).chain(sig_names.iter().map(String::as_str)).collect();
@@ -455,22 +458,31 @@ fn enrich_with_repo_references(multi: &mut MultiFileResult, target: &git::Target
     multi.cross_file.vanished.retain(|v| !ambiguous.contains(v.name.as_str()));
     let mut next_id = max_id(multi) + 1;
     let mut per_symbol: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut sources: std::collections::HashMap<String, Option<String>> = std::collections::HashMap::new();
     for (name, path, line, text) in &hits {
         if in_diff.contains(path.as_str()) || ambiguous.contains(name.as_str()) {
             continue; // already scanned precisely by the core, or not a stale name after all
         }
-        // Mentions in docs, config or other non-code files aren't references.
-        if Language::from_path(path) == Language::Unknown || perspica_core::roles::is_docs_path(path) {
+        // Mentions in docs, config or other non-code files aren't references, and vendored or
+        // generated code (`.yarn/releases/…cjs`, `vendor/`, `dist/`) isn't the project's to update.
+        if Language::from_path(path) == Language::Unknown || perspica_core::roles::is_docs_path(path)
+            || perspica_core::roles::is_vendored_path(path) || perspica_core::roles::is_generated_path(path) {
             continue;
         }
-        let count = per_symbol.entry(name.as_str()).or_default();
-        if *count >= MAX_PER_SYMBOL {
+        // The cap counts what's reported, not what's looked at (imports and other types' names don't use it up).
+        if per_symbol.get(name.as_str()).copied().unwrap_or(0) >= MAX_PER_SYMBOL {
             continue;
         }
-        *count += 1;
         if let Some((_, renamed_to, origin, owner)) = vanished.iter().find(|v| &v.0 == name) {
             // Same rule as the core: a method's name only counts on its own type.
-            if perspica_core::cross_file::scan_references(text, name, owner.as_deref()).is_empty() {
+            if perspica_core::cross_file::scan_references_in(text, name, owner.as_deref(), origin, path).is_empty() {
+                continue;
+            }
+            // A file that declares the name itself (a variable, parameter, field) is using its own.
+            let source = sources.entry(path.clone()).or_insert_with(|| git::read_new(target, path));
+            if source.as_deref().is_some_and(|src| ((perspica_core::cross_file::declares_name(src, name) || perspica_core::cross_file::imports_name_from_elsewhere(src, path, name, origin))
+                    && !perspica_core::cross_file::qualified_mention(text, name))
+                || (path.ends_with(".go") && perspica_core::cross_file::go_package_named(src, name) && perspica_core::cross_file::go_package_mention(text, name))) {
                 continue;
             }
             multi.cross_file.broken_references.push(BrokenReferenceEntry {
@@ -484,17 +496,50 @@ fn enrich_with_repo_references(multi: &mut MultiFileResult, target: &git::Target
                 in_diff: false,
             });
             next_id += 1;
+            *per_symbol.entry(name.as_str()).or_default() += 1;
         }
-        for impact in multi.cross_file.signature_impacts.iter_mut().filter(|s| s.exported) {
+        for impact in multi.cross_file.signature_impacts.iter_mut() {
             let def = impact.definition.file.clone().unwrap_or_default();
-            let accept = |q: Option<&str>| perspica_core::cross_file::call_qualifier_ok(q, &def, &impact.name);
-            if perspica_core::parser::bare_name(&impact.name) == name
-                && !perspica_core::cross_file::scan_calls(text, name, &accept).is_empty()
-            {
-                impact.call_sites.push(CallSite { file: path.clone(), line: *line, text: text.clone(), updated: false, in_diff: false });
+            if !impact.exported && !perspica_core::cross_file::private_reaches(&def, path) && !includes_c_file(target, path, &def, 2) {
+                continue;
             }
+            let callee = perspica_core::cross_file::call_name(&impact.name);
+            let callee_sig = if callee != perspica_core::parser::bare_name(&impact.name) { callee.to_string() } else { impact.name.clone() };
+            let accept = |q: Option<&str>| perspica_core::cross_file::call_qualifier_ok_from(q, &def, &callee_sig, path);
+            if callee != name { continue; }
+            // A file that imports this name from another module calls a different function.
+            if perspica_core::cross_file::unqualified_call(text, name) {
+                let source = sources.entry(path.clone()).or_insert_with(|| git::read_new(target, path));
+                if source.as_deref().is_some_and(|src| perspica_core::cross_file::imports_it_elsewhere(src, path, &def, name)) { continue; }
+            }
+            let masked = perspica_core::cross_file::code_only(text);
+            let Some((_, _, open)) = perspica_core::cross_file::scan_calls_at(text, &masked, name, &accept).into_iter().next() else { continue };
+            // A call on one line that still fits the new signature has nothing to update.
+            let fits = match (&impact.params, perspica_core::cross_file::call_arguments(&masked[open..], path)) {
+                (Some((old, new)), Some(args)) => perspica_core::cross_file::still_fits(old, new, &args, perspica_core::cross_file::named_args(&def), &def),
+                _ => false,
+            };
+            impact.call_sites.push(CallSite { file: path.clone(), line: *line, text: text.clone(), updated: fits, in_diff: false });
+            *per_symbol.entry(name.as_str()).or_default() += 1;
         }
     }
+}
+
+/// Whether the C file at `path` compiles in `def` (a `.c` file), directly or through a header of
+/// the repo (`#include "common.h"` → `#include "../cJSON.c"`): then it sees `def`'s static functions.
+fn includes_c_file(target: &git::Target, path: &str, def: &str, depth: usize) -> bool {
+    if !def.ends_with(".c") { return false; }
+    let Some(source) = git::read_new(target, path) else { return false };
+    if perspica_core::cross_file::includes_file(&source, def) { return true; }
+    if depth == 0 { return false; }
+    let dir = path.rsplit_once('/').map_or("", |(d, _)| d);
+    source.lines().filter_map(|l| l.trim_start().strip_prefix("#include")).filter_map(|r| r.trim().strip_prefix('"')?.split('"').next())
+        .filter(|h| h.ends_with(".h"))
+        .any(|h| {
+            let mut parts: Vec<&str> = if dir.is_empty() { vec![] } else { dir.split('/').collect() };
+            for seg in h.split('/') { match seg { ".." => { parts.pop(); } "." => {} s => parts.push(s) } }
+            includes_c_file(target, &parts.join("/"), def, depth - 1)
+        })
 }
 
 /// "3 minutes ago", "2 days ago".

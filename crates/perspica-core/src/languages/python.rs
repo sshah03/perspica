@@ -215,6 +215,14 @@ fn extract_class(node: &tree_sitter::Node, source: &str) -> Option<SemanticItem>
                         methods.push(item);
                     }
                 }
+                // `@staticmethod`, `@property`, `@cached_property`…: the method is the definition inside.
+                "decorated_definition" => {
+                    let mut inner = child.walk();
+                    let def = child.children(&mut inner).find(|c| c.kind() == "function_definition");
+                    if let Some(item) = def.and_then(|d| extract_function(&d, source)) {
+                        methods.push(item);
+                    }
+                }
                 "expression_statement" => {
                     // Class-level assignments as fields
                     let mut inner = child.walk();

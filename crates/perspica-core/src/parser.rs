@@ -222,6 +222,10 @@ pub enum Qualifier {
     Field(u64),
     /// `a.f.name(`: field f of variable a.
     Member(u64, u64),
+    /// `Foo(…).name(` / `new Foo().name(` / `x.Foo(…).name(`: whatever constructing Foo gives (a Foo,
+    /// if Foo is a type), or, when Foo isn't a type (`canvas.Compose(c)`, a Go method), what the
+    /// chain's receiver (`canvas`, 0 for none) would.
+    Constructed(u64, u64),
     Unknown,
 }
 
@@ -272,6 +276,13 @@ struct CallSpotter {
     declared: HashSet<u64>,
     /// The left side is a field of `self` / `this`.
     assign_field: bool,
+    /// The last name seen was capitalized: if it's called, it's probably a constructor.
+    callee_capitalized: bool,
+    /// The last call and the nesting it was at, and the call a Python `with … as name` binds.
+    last_call: Option<(CallRef, usize)>,
+    as_from: Option<CallRef>,
+    /// Just bound a `with … as name`: the `:` that follows ends the header, it isn't an annotation.
+    after_as: bool,
     self_fields: HashMap<u64, CallRef>,
     /// The previous leaf, if it was a capitalized identifier (`Foo x` declares x as a Foo).
     prev_type: Option<u64>,
@@ -327,6 +338,11 @@ impl CallSpotter {
             self.sep_from = None;
             let qualifier = self.before_sep.take().unwrap_or(Qualifier::None);
             let h = ident_hash(text);
+            // `with open(p) as f`: f is what the call returns.
+            self.after_as = false;
+            if let Some(c) = self.as_from.take() {
+                if qualifier == Qualifier::None && !capitalized(text) { self.returns.insert(h, c); self.locals.insert(h); self.after_as = true; }
+            }
             if kind == "shorthand_property_identifier" { out.insert(CallRef { qualifier: Qualifier::None, name: h, parens: false }); }
             let slot = std::mem::take(&mut self.arg_slot);
             // `var wg sync.WaitGroup`: wg is declared with the type that follows.
@@ -364,6 +380,9 @@ impl CallSpotter {
                 self.prev_type = None;
             }
             self.pending = Some(CallRef { qualifier, name: h, parens: false });
+            self.callee_capitalized = capitalized(text);
+        } else if text == ":" && std::mem::take(&mut self.after_as) {
+            self.pending = None; self.before_sep = None; self.assign_lhs = None;
         } else if text == ":" && self.slot() == SLOT_PAIR {
             // `{ onError: handleError }`: the key isn't a variable; the value may be a function.
             self.pending = None; self.before_sep = None; self.assign_lhs = None;
@@ -384,6 +403,11 @@ impl CallSpotter {
             self.prev_type = None;
             self.fresh_bind = None;
             self.arg_slot = false;
+        } else if text == "as" {
+            self.flush_member(out);
+            let depth = self.depth();
+            self.as_from = self.last_call.filter(|&(_, d)| d == depth).map(|(c, _)| c);
+            self.pending = None; self.before_sep = None;
         } else if text == "var" && self.slot() != SLOT_ARGS {
             self.var_decl = true;
         } else if matches!(text, "new" | "mut" | "&" | "*" | "await" | "const") {
@@ -403,7 +427,7 @@ impl CallSpotter {
         } else if text == "(" {
             // A bare `(` after a name: a call inside a macro body or a grammar without an arguments node.
             if let Some(mut c) = self.pending.take().or(bracketed) {
-                if c.name != 0 { c.parens = true; self.start_chain(&c); self.note_returns(&c); out.insert(c); }
+                if c.name != 0 { c.parens = true; self.start_chain(&c); self.note_returns(&c); self.last_call = Some((c, self.depth())); out.insert(c); }
             }
             self.before_sep = None;
             self.arg_slot = self.slot() == SLOT_ARGS;
@@ -446,6 +470,7 @@ impl CallSpotter {
             // `for x in`: x is a local.
             if text == "in" { if let Some(c) = self.pending { if c.qualifier == Qualifier::None { self.locals.insert(c.name); } } }
             self.bare_arg = None;
+            self.after_as = false;
             self.flush_member(out);
             self.pending = None;
             self.before_sep = None;
@@ -482,7 +507,11 @@ impl CallSpotter {
 
     fn start_chain(&mut self, c: &CallRef) {
         if self.chains.is_empty() { self.chains.push(None); }
-        if !matches!(c.qualifier, Qualifier::None | Qualifier::Unknown) { *self.chains.last_mut().unwrap() = Some(c.qualifier); }
+        let constructor = self.callee_capitalized && matches!(c.qualifier, Qualifier::None | Qualifier::Named(_));
+        let slot = self.chains.last_mut().unwrap();
+        // `Foo(…).go(` / `pkg.Foo(…).go(`: a capitalized callee is likely a constructor.
+        if constructor { *slot = Some(Qualifier::Constructed(c.name, if let Qualifier::Named(q) = c.qualifier { q } else { 0 })); }
+        else if !matches!(c.qualifier, Qualifier::None | Qualifier::Unknown) { *slot = Some(c.qualifier); }
     }
 
     /// A qualified name that wasn't called: a member access (a Scala parameterless call).
@@ -507,7 +536,7 @@ impl CallSpotter {
         }
         if matches!(kind, "arguments" | "argument_list" | "arguments_list") {
             if let Some(mut c) = self.pending.take().or(self.bracketed.take()) {
-                if c.name != 0 { c.parens = true; self.start_chain(&c); self.note_returns(&c); out.insert(c); }
+                if c.name != 0 { c.parens = true; self.start_chain(&c); self.note_returns(&c); self.last_call = Some((c, self.depth())); out.insert(c); }
             }
             self.before_sep = None;
             if self.chains.is_empty() { self.chains.push(None); }

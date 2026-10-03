@@ -412,17 +412,22 @@ fn detect_dead_code(
         if bare.len() < 2 || bare != name || new_tree.meta[ni].exported || modified_new.contains(&ni) {
             continue;
         }
-        let h = ident_hash(bare);
-        let referenced = new_tree.meta.iter().enumerate().any(|(i, m)| i != ni && m.refs.contains(&h));
-        // Also honor textual mentions outside the item (HTML handlers in template
-        // strings, reflection, string-based registration), so err on the side of silence.
+        // `const { a, b: c } = require(…)` binds a and c: it's used if either is.
+        let bound = bound_names(bare);
         let span = item.span();
-        let mentioned = new_lines.iter().enumerate()
-            .filter(|(i, _)| *i + 1 < span.start_line || *i + 1 > span.end_line)
-            .any(|(_, l)| contains_identifier(l, bare));
-        if referenced || mentioned {
+        let used = |name: &str| {
+            let h = ident_hash(name);
+            new_tree.meta.iter().enumerate().any(|(i, m)| i != ni && m.refs.contains(&h))
+                // Also honor textual mentions outside the item (HTML handlers in template
+                // strings, reflection, string-based registration), so err on the side of silence.
+                || new_lines.iter().enumerate()
+                    .filter(|(i, _)| *i + 1 < span.start_line || *i + 1 > span.end_line)
+                    .any(|(_, l)| contains_identifier(l, name))
+        };
+        if bound.iter().any(|n| used(n)) {
             continue;
         }
+        let h = ident_hash(bare);
         let is_new = added.contains(&ni);
         let lost_callers = !is_new && touched_old.iter().any(|&oi| {
             old_tree.items[oi].name().map(bare_name) != Some(bare) && old_tree.meta[oi].refs.contains(&h)
@@ -441,6 +446,35 @@ fn detect_dead_code(
             });
         }
     }
+}
+
+/// A parameter that takes what's left over, by the language's syntax: Some(true) for extra keyword
+/// arguments (Python's `**kwargs`), Some(false) for extra positional ones (`*args`, `...rest`, Go's
+/// `args ...T`, C's and Java's `...`). In C, Rust and Go a leading `*` is a pointer, not this.
+pub fn catch_all(p: &Param, path: &str) -> Option<bool> {
+    let ext = path.rsplit('.').next().unwrap_or("");
+    let ty = p.type_annotation.as_deref().unwrap_or("").trim_start();
+    match ext {
+        "py" if p.name.starts_with("**") => Some(true),
+        "py" if p.name.starts_with('*') => Some(false),
+        "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "mts" | "cts" if p.name.starts_with("...") => Some(false),
+        "go" if ty.starts_with("...") => Some(false),
+        "c" | "h" | "java" | "scala" if p.name == "..." || ty.ends_with("...") || ty.ends_with('*') && ty.trim_end_matches('*').ends_with(':') => Some(false),
+        _ => None,
+    }
+}
+
+/// The names a declaration binds: `x` → [x]; `{ a, b: c, ...d }` / `[a, b]` → [a, c, d].
+pub(crate) fn bound_names(name: &str) -> Vec<&str> {
+    let t = name.trim();
+    if !(t.starts_with('{') || t.starts_with('[') || t.starts_with('(')) { return vec![t]; }
+    t.trim_matches(|c| matches!(c, '{' | '}' | '[' | ']' | '(' | ')'))
+        .split(',')
+        .filter_map(|part| {
+            let local = part.rsplit(':').next().unwrap_or(part).split('=').next().unwrap_or("").trim().trim_start_matches("...");
+            (!local.is_empty()).then_some(local)
+        })
+        .collect()
 }
 
 /// Check if `source` contains `name` as a standalone identifier (word boundary match).
@@ -539,7 +573,16 @@ fn pattern_fields(pattern: &str) -> Option<Vec<String>> {
 /// reordered or newly required one. A changed parameter *type* is reported as a
 /// signature change but doesn't by itself mean callers must change (widening
 /// `NoUndefined<T>` to `T` breaks nobody), so it raises no call sites.
-pub(crate) fn breaks_callers(old: &[Param], new: &[Param]) -> bool {
+pub(crate) fn breaks_callers(old: &[Param], new: &[Param], path: &str) -> bool {
+    // `*args`, `**kwargs`, `...rest` take what's left over: where they sit doesn't matter, only
+    // whether they're still there (dropping one breaks the callers that relied on it).
+    let is_rest = |p: &&Param| catch_all(p, path).is_some();
+    let kinds = |ps: &[Param]| (ps.iter().any(|p| catch_all(p, path) == Some(true)), ps.iter().any(|p| catch_all(p, path) == Some(false)));
+    let ((old_kw, old_pos), (new_kw, new_pos)) = (kinds(old), kinds(new));
+    if (old_kw && !new_kw) || (old_pos && !new_pos) { return true; }
+    let old: Vec<Param> = old.iter().filter(|p| !is_rest(p)).cloned().collect();
+    let new: Vec<Param> = new.iter().filter(|p| !is_rest(p)).cloned().collect();
+    let (old, new) = (old.as_slice(), new.as_slice());
     for (i, p) in new.iter().enumerate() {
         match old.iter().position(|o| o.name == p.name) {
             None => {

@@ -105,6 +105,14 @@ pub fn is_test_path(path: &str) -> bool {
         || path.contains("src/test/")
 }
 
+/// A changelog or release notes: `CHANGES.rst`, `CHANGELOG.md`, `HISTORY`, `NEWS`, `RELEASE_NOTES.md`.
+pub fn is_changelog_path(path: &str) -> bool {
+    let lower = file_name(path).to_ascii_lowercase();
+    ["changelog", "changes", "history", "news", "release_notes", "release-notes", "releases"]
+        .iter()
+        .any(|n| lower == *n || lower.starts_with(&format!("{n}.")))
+}
+
 pub fn is_docs_path(path: &str) -> bool {
     let file = file_name(path);
     let lower = file.to_ascii_lowercase();

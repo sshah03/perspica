@@ -676,6 +676,15 @@ pub fn grep_words(target: &Target, names: &[&str], limit: usize) -> Vec<(String,
     hits
 }
 
+/// A file's contents on the new side of `target`.
+pub fn read_new(target: &Target, path: &str) -> Option<String> {
+    match target {
+        Target::Range(_, b) => git_cmd(&["show", &format!("{b}:{path}")]).ok(),
+        Target::Staged => git_cmd(&["show", &format!(":{path}")]).ok(),
+        Target::WorkingTree(_) | Target::Branch { .. } => std::fs::read_to_string(repo_root()?.join(path)).ok(),
+    }
+}
+
 /// Parse a unified diff string into DiffHunks that match our data model.
 pub fn parse_unified_diff(raw: &str) -> Vec<perspica_core::manifest::DiffHunk> {
     use perspica_core::manifest::{Change, ChangeKind, DiffHunk, LineRange, Span};

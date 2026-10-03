@@ -316,6 +316,7 @@ impl<'a> Graph<'a> {
                 .filter(|&d| match rc.qualifier {
                     Qualifier::SelfType => owner_hash(d).is_some() && owner_hash(d) == my_owner,
                     Qualifier::Named(q) | Qualifier::Path(q) => owner_hash(d) == Some(receiver(q)) || (owner_hash(d).is_none() && module_hash[nodes[d].file] == q),
+                    Qualifier::Constructed(t, _) => owner_hash(d) == Some(t),
                     Qualifier::None => owner_hash(d).is_none(),
                     _ => false,
                 })
@@ -349,6 +350,13 @@ impl<'a> Graph<'a> {
         }
         for (k, v) in assigned { field_types.entry(k).or_insert(v); }
         let typed_fields: HashSet<u64> = field_types.keys().map(|&(t, _)| t).collect();
+        // Each type's constructor methods: Python's `__init__`, JavaScript's `constructor`.
+        let mut constructors: HashMap<u64, Vec<usize>> = HashMap::new();
+        for (i, n) in nodes.iter().enumerate() {
+            if n.kind == StepKind::Function && matches!(bare_name(&n.name), "__init__" | "constructor") {
+                if let Some(o) = owner_hash(i) { constructors.entry(o).or_default().push(i); }
+            }
+        }
         let out: Vec<Vec<usize>> = nodes.iter().enumerate().map(|(i, n)| {
             // A type's own body (`self.` in a class) belongs to the type itself.
             let my_owner = if n.kind == StepKind::Type { Some(ident_hash(bare_name(&n.name))) } else { crate::cross_file::owner_of(&n.name).map(ident_hash) };
@@ -363,9 +371,20 @@ impl<'a> Graph<'a> {
             let dynamic = [".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts"].iter().any(|e| analyses[n.file].path.ends_with(e));
             let self_values = dynamic;
             for call in n.calls {
+                // `x.Foo(…).go(` where Foo isn't a type here: the chain is x's, as if Foo were any method.
+                let call = &match call.qualifier {
+                    Qualifier::Constructed(t, root) if root != 0 && !known_owners.contains(&unalias(t)) => CallRef { qualifier: Qualifier::Named(root), ..*call },
+                    _ => *call,
+                };
                 // Without arguments, only a function passed as a value: `f(g)`, `Type::name`, `self.name`.
                 let value = !call.parens && !member_calls;
                 if value && !matches!(call.qualifier, Qualifier::None | Qualifier::Path(_)) && !(self_values && call.qualifier == Qualifier::SelfType) { continue; }
+                // `Foo(…)` / `new Foo(…)` runs Foo's constructor (`__init__`, `constructor`).
+                if call.parens && matches!(call.qualifier, Qualifier::None | Qualifier::Named(_)) {
+                    if let Some(cs) = constructors.get(&call.name) {
+                        targets.extend(narrow(n, cs.clone()).into_iter().filter(|&t| sees(n.file, nodes[t].file) || sees_type(n.file, t)));
+                    }
+                }
                 let Some(defs) = by_name.get(&call.name) else { continue };
                 let funcs: Vec<usize> = defs.iter().copied().filter(|&d| nodes[d].kind == StepKind::Function).collect();
                 if funcs.is_empty() { continue; }
@@ -403,26 +422,31 @@ impl<'a> Graph<'a> {
                     Qualifier::None if value => funcs.iter().copied().filter(|&d| owner_hash(d).is_none()).collect(),
                     Qualifier::None => funcs.iter().copied().filter(|&d| owner_hash(d).is_none() || (!bare_is_free && owner_hash(d) == my_owner)
                         || crate::cross_file::owner_of(&nodes[d].name) == Some(bare_name(&nodes[d].name))).collect(),
+                    // `Foo(…).go(`: Foo's go, if Foo is a type here; otherwise like any unknown receiver.
+                    Qualifier::Constructed(t, _) => {
+                        let t = unalias(t);
+                        if known_owners.contains(&t) { bound = true; funcs.iter().copied().filter(|&d| owner_hash(d) == Some(t)).collect() } else { vec![] }
+                    }
                     Qualifier::Unknown => vec![],
                 };
                 // Only a qualifier that names the type settles a call beyond the import gate.
                 let named = !matches!(call.qualifier, Qualifier::None | Qualifier::Unknown);
                 // A receiver of unknown type calling a built-in container method: the built-in.
-                let untyped = exact.is_empty() && !bound && matches!(call.qualifier, Qualifier::Named(_) | Qualifier::Field(_) | Qualifier::Member(..) | Qualifier::Unknown);
+                let untyped = exact.is_empty() && !bound && matches!(call.qualifier, Qualifier::Named(_) | Qualifier::Field(_) | Qualifier::Member(..) | Qualifier::Unknown | Qualifier::Constructed(..));
                 if untyped && (if dynamic { builtin.contains(&call.name) } else { interface_methods.contains(&call.name) }) { continue; }
                 // A path, or a receiver whose type is known, that resolves to nothing stays unresolved.
                 // An unknown receiver may still be any same-named method, but never a free function.
                 // A call on a result (`f().g(`) can only be a method; `x.g(` may also be a namespaced free function.
                 let (cands, settled) = if !exact.is_empty() { (exact, named) }
                     else if bound || matches!(call.qualifier, Qualifier::None | Qualifier::Path(_)) { (vec![], false) }
-                    else if matches!(call.qualifier, Qualifier::Unknown) { (funcs.into_iter().filter(|&d| owner_hash(d).is_some()).collect(), false) }
+                    else if matches!(call.qualifier, Qualifier::Unknown | Qualifier::Constructed(..)) { (funcs.into_iter().filter(|&d| owner_hash(d).is_some()).collect(), false) }
                     else { (funcs, false) };
                 if cands.is_empty() || (!settled && (cands.len() > MAX_DEFS_PER_NAME || short(cands[0]))) { continue; }
                 let picked: Vec<usize> = narrow(n, cands).into_iter().filter(|&t| settled || sees(n.file, nodes[t].file) || sees_type(n.file, t)).collect();
                 // A receiver of unknown type with same-named methods left on unrelated types is a
                 // guess either way. On one hierarchy (`param.get_default(` on Parameter and its
                 // subclass Option) it is whichever override runs.
-                let guessed = !settled && matches!(call.qualifier, Qualifier::Named(_) | Qualifier::Field(_) | Qualifier::Member(..) | Qualifier::Unknown);
+                let guessed = !settled && matches!(call.qualifier, Qualifier::Named(_) | Qualifier::Field(_) | Qualifier::Member(..) | Qualifier::Unknown | Qualifier::Constructed(..));
                 if guessed {
                     let owners: Vec<Option<u64>> = picked.iter().map(|&t| owner_hash(t)).collect::<HashSet<_>>().into_iter().collect();
                     let one_hierarchy = owners.iter().all(Option::is_some)

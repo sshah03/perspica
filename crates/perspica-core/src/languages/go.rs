@@ -190,7 +190,8 @@ fn extract_type_declaration(node: &tree_sitter::Node, source: &str) -> Option<Se
     // type_declaration contains one or more type_spec children
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        if child.kind() == "type_spec" {
+        // `type T struct{…}` and the alias form `type T = U`.
+        if child.kind() == "type_spec" || child.kind() == "type_alias" {
             let name = child
                 .child_by_field_name("name")
                 .map(|n| node_text(&n, source))?;

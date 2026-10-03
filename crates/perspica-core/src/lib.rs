@@ -117,6 +117,10 @@ pub fn analyze_multi(files: &[cross_file::FileChange]) -> Result<cross_file::Mul
 
     let moves = cross_file::detect_cross_file_moves(&mut analyses, &mut next_id);
     cross_file::filter_dead_code_cross_file(&mut analyses);
+    // Unused code in tests is nearly always on purpose (type tests, fixtures kept for later).
+    for a in analyses.iter_mut().filter(|a| a.result.review.role == roles::FileRole::Test) {
+        a.result.manifest.dead_code.clear();
+    }
     let vanished = cross_file::vanished_names(&analyses, &moves).into_iter()
         .map(|(name, renamed_to, origin, owner)| cross_file::VanishedSymbol { name, renamed_to, origin, owner })
         .collect();
@@ -963,6 +967,23 @@ mod tests {
     }
 
     #[test]
+    fn test_constructors_and_what_they_build() {
+        let new = "class Stream:\n    def read(self):\n        return 2\n\nclass File:\n    def __init__(self, p):\n        self.p = 2\n\n    def encode(self) -> Stream:\n        return 2\n\n\
+            class Other:\n    def encode(self):\n        return 2\n\n    def read(self):\n        return 2\n\ndef run():\n    with File(\"x\").encode() as s:\n        s.read()\n";
+        let old = new.replace("return 2", "return 1").replace("self.p = 2", "self.p = 1").replace("    with File(\"x\").encode() as s:\n        s.read()\n", "    return 0\n");
+        let files = vec![cross_file::FileChange::new("f.py", &old, new, Language::Python)];
+        let result = analyze_multi(&files).unwrap();
+        let callers = |name: &str| -> Vec<String> {
+            result.cross_file.reading_order.iter().find(|s| s.name == name).map(|s| s.called_by.clone()).unwrap_or_default()
+        };
+        // `File("x")` runs __init__; `.encode()` on it is File's; `with … as s` makes s what encode returns.
+        for f in ["File.__init__", "File.encode", "Stream.read"] {
+            assert_eq!(callers(f), vec!["run"], "{f}: {:?}", result.cross_file.reading_order);
+        }
+        assert!(callers("Other.encode").is_empty() && callers("Other.read").is_empty());
+    }
+
+    #[test]
     fn test_functions_handed_on_as_values_in_js() {
         let new = "export function handleClick() {\n  return 2;\n}\n\nexport function handleError() {\n  return 2;\n}\n\nexport function handleSubmit() {\n  return 2;\n}\n\n\
             export function App(props) {\n  const local = 1;\n  render({ onError: handleError, handleSubmit, local });\n  return <button onClick={handleClick} />;\n}\n";
@@ -1050,6 +1071,182 @@ mod tests {
         assert_eq!(impact.call_sites.len(), 2);
         assert!(impact.call_sites.iter().any(|c| c.line == 1 && c.updated));
         assert!(impact.call_sites.iter().any(|c| c.line == 2 && !c.updated));
+    }
+
+    #[test]
+    fn test_stale_call_sites_are_judged_by_what_they_pass() {
+        let stale = |files: Vec<cross_file::FileChange>| -> Vec<(String, usize)> {
+            let r = analyze_multi(&files).unwrap();
+            r.cross_file.signature_impacts.iter().flat_map(|s| s.call_sites.iter().filter(|c| !c.updated).map(|c| (c.file.clone(), c.line))).collect()
+        };
+        let ts = |p: &str, o: &str, n: &str| cross_file::FileChange::new(p, o, n, Language::TypeScript);
+        // A new required parameter: the caller that wasn't updated is stale, wherever it is.
+        let lib = || ts("src/auth.ts", "export function auth(user: string): boolean {\n  return !!user;\n}\n", "export function auth(user: string, pass: string): boolean {\n  return !!user && !!pass;\n}\n");
+        let app = "import { auth } from './auth';\nexport const a = auth('x');\n";
+        assert_eq!(stale(vec![lib(), ts("src/app.ts", app, &format!("{app}// touched\n"))]), vec![("src/app.ts".into(), 2)]);
+        // A new optional parameter breaks nobody.
+        let opt = ts("src/auth.ts", "export function auth(user: string): boolean {\n  return !!user;\n}\n", "export function auth(user: string, pass?: string): boolean {\n  return !!user;\n}\n");
+        assert!(stale(vec![opt, ts("src/app.ts", app, &format!("{app}// touched\n"))]).is_empty());
+        // Swapped parameters: the same two arguments now land on different parameters.
+        let swap = ts("src/auth.ts", "export function auth(user: string, pass: string): boolean {\n  return !!user;\n}\n", "export function auth(pass: string, user: string): boolean {\n  return !!user;\n}\n");
+        let app2 = "import { auth } from './auth';\nexport const a = auth('x', 'y');\n";
+        assert_eq!(stale(vec![swap, ts("src/app.ts", app2, &format!("{app2}// touched\n"))]).len(), 1);
+        // A same-named function from another module isn't this one.
+        let other = "import { auth } from './other-auth';\nexport const a = auth('x');\n";
+        assert!(stale(vec![lib(), ts("src/app.ts", other, &format!("{other}// touched\n"))]).is_empty());
+        // A multi-line call whose arguments were updated below its first line is updated.
+        let multi_old = "import { auth } from './auth';\nexport const a = auth(\n  'x',\n);\n";
+        let multi_new = "import { auth } from './auth';\nexport const a = auth(\n  'x',\n  'p',\n);\n";
+        assert!(stale(vec![lib(), ts("src/app.ts", multi_old, multi_new)]).is_empty());
+        // Python: a removed parameter still passed by keyword is stale.
+        let py = |p: &str, o: &str, n: &str| cross_file::FileChange::new(p, o, n, Language::Python);
+        let pylib = py("pkg/net.py", "def fetch(url, timeout=5):\n    return url\n", "def fetch(url):\n    return url\n");
+        let caller = "from pkg.net import fetch\n\ndef run():\n    return fetch('u', timeout=1)\n";
+        assert_eq!(stale(vec![pylib, py("pkg/run.py", caller, &format!("{caller}# touched\n"))]), vec![("pkg/run.py".into(), 4)]);
+        // Rust: a removed parameter, multi-line caller untouched, is stale.
+        let rs = |p: &str, o: &str, n: &str| cross_file::FileChange::new(p, o, n, Language::Rust);
+        let rlib = rs("src/lib.rs", "pub fn size(n: u32, unit: u32) -> u32 {\n    n * unit\n}\n", "pub fn size(n: u32) -> u32 {\n    n\n}\n");
+        let rcall = "fn main() {\n    let s = size(\n        3,\n        8,\n    );\n}\n";
+        assert_eq!(stale(vec![rlib, rs("src/main.rs", rcall, &format!("{rcall}// touched\n"))]).len(), 1);
+    }
+
+    #[test]
+    fn test_stale_references_and_unused_code_skip_the_noise() {
+        let py = |p: &str, o: &str, n: &str| cross_file::FileChange::new(p, o, n, Language::Python);
+        let lib_old = "def old_name():\n    return 1\n";
+        let lib_new = "def new_name():\n    return 1\n\n\ndef __getattr__(name):\n    if name == \"old_name\":\n        return new_name\n";
+        let broken = |extra: cross_file::FileChange| {
+            let r = analyze_multi(&[py("pkg/api.py", lib_old, lib_new), extra]).unwrap();
+            r.cross_file.broken_references.iter().map(|b| (b.reference_file.clone(), b.reference_location.line_start)).collect::<Vec<_>>()
+        };
+        // The deprecation shim's string isn't a use, a changelog names old things on purpose, a
+        // file that defines the name itself is using its own, but a real call and `__all__` are stale.
+        let user = "from pkg.api import old_name\n__all__ = [\"old_name\"]\n\ndef run():\n    return old_name()\n";
+        let found = broken(py("pkg/use.py", "", user));
+        assert!(found.contains(&("pkg/use.py".to_string(), 5)) && found.contains(&("pkg/use.py".to_string(), 2)), "{found:?}");
+        assert!(!found.iter().any(|(f, _)| f == "pkg/api.py"), "{found:?}");
+        assert!(broken(cross_file::FileChange::new("CHANGES.rst", "", "- ``old_name`` is deprecated.\n", Language::Unknown)).is_empty());
+        assert!(broken(py("pkg/own.py", "", "def old_name():\n    return 2\n\n\nx = old_name()\n")).is_empty());
+        // `const { a, b } = require(…)` is used if either name is.
+        let js = "const { used, unused } = require('./m');\nconsole.log(used);\n";
+        let r = analyze_multi(&[cross_file::FileChange::new("src/a.js", "", js, Language::TypeScript)]).unwrap();
+        assert!(r.file_results[0].1.manifest.dead_code.is_empty(), "{:?}", r.file_results[0].1.manifest.dead_code);
+    }
+
+    #[test]
+    fn test_go_capitalized_methods_and_shadowed_names() {
+        let go = |p: &str, o: &str, n: &str| cross_file::FileChange::new(p, o, n, Language::Go);
+        // `canvas.Compose(c).Render()`: Compose is a method (Go capitalizes exported ones), so the
+        // chain is canvas's, and Render is Canvas's.
+        let new = "package a\n\ntype Canvas struct{}\n\nfunc (c *Canvas) Compose(x int) *Canvas {\n\treturn c\n}\n\nfunc (c *Canvas) Render() string {\n\treturn \"b\"\n}\n\ntype Other struct{}\n\nfunc (o *Other) Render() string {\n\treturn \"b\"\n}\n\nfunc Draw(canvas *Canvas) string {\n\treturn canvas.Compose(1).Render()\n}\n";
+        let old = new.replace("\"b\"", "\"a\"").replace("canvas.Compose(1).Render()", "\"\"");
+        let r = analyze_multi(&[go("a.go", &old, new)]).unwrap();
+        let callers = |name: &str| -> Vec<String> { r.cross_file.reading_order.iter().find(|s| s.name == name).map(|s| s.called_by.clone()).unwrap_or_default() };
+        assert!(callers("Canvas.Render").contains(&"Draw".to_string()), "{:?}", r.cross_file.reading_order);
+        assert!(callers("Other.Render").is_empty());
+        // A removed lowercase type (`type layers []*Layer`) isn't what a `layers` variable or parameter is.
+        let lib_old = "package a\n\ntype layers []int\n\nfunc sortLayers(l layers) {}\n";
+        let lib_new = "package a\n\nfunc sortLayers(l []int) {}\n";
+        let user = "package a\n\nfunc Add(layers ...int) int {\n\treturn len(layers)\n}\n";
+        let r = analyze_multi(&[go("lib.go", lib_old, lib_new), go("user.go", "", user)]).unwrap();
+        assert!(r.cross_file.broken_references.is_empty(), "{:?}", r.cross_file.broken_references);
+    }
+
+    #[test]
+    fn test_warnings_from_fresh_prs() {
+        let stale_calls = |r: &cross_file::MultiDiffResult| r.cross_file.signature_impacts.iter().flat_map(|s| s.call_sites.iter().filter(|c| !c.updated)).count();
+        // Rust: `*x` is a dereference, not a spread; a renamed parameter of the same type breaks nobody.
+        let rs = |p: &str, o: &str, n: &str| cross_file::FileChange::new(p, o, n, Language::Rust);
+        let old = "fn bump(sections: &mut [u32], by: u32) {}\n\nfn run(v: &mut Vec<u32>, n: &u32) {\n    bump(v, *n);\n}\n";
+        let new = old.replace("bump(sections: &mut [u32]", "bump(items: &mut [u32]");
+        assert_eq!(stale_calls(&analyze_multi(&[rs("src/lib.rs", old, &new)]).unwrap()), 0);
+        // Go: a type renamed inside a package of the same name; `stacktrace.Take` is the package,
+        // and a parameter whose type is the renamed one still fits.
+        let go = |p: &str, o: &str, n: &str| cross_file::FileChange::new(p, o, n, Language::Go);
+        let pkg_old = "package stacktrace\n\ntype stacktrace struct{}\n\nfunc Take() string { return \"\" }\n\nfunc Format(s *stacktrace) {}\n";
+        let pkg_new = "package stacktrace\n\ntype Stack struct{}\n\nfunc Take() string { return \"\" }\n\nfunc Format(s *Stack) {}\n";
+        let user = "package zap\n\nimport \"go.uber.org/zap/internal/stacktrace\"\n\nfunc Log() string {\n\treturn stacktrace.Take()\n}\n";
+        let r = analyze_multi(&[go("internal/stacktrace/stack.go", pkg_old, pkg_new), go("logger.go", "", user)]).unwrap();
+        assert!(r.cross_file.broken_references.is_empty(), "{:?}", r.cross_file.broken_references);
+        assert_eq!(stale_calls(&r), 0);
+        // Python: a renamed free function `split` isn't what `line.split(",")` calls, but bare and
+        // module-qualified uses still are.
+        let py = |p: &str, o: &str, n: &str| cross_file::FileChange::new(p, o, n, Language::Python);
+        let util_old = "def split(xs, n):\n    return xs\n";
+        let util_new = "def split_iterable(xs, n):\n    return xs\n";
+        let user = "from pkg import utils\nfrom pkg.utils import split\n\ndef run(line):\n    a = line.split(',')\n    b = split(a, 2)\n    return utils.split(b, 2)\n";
+        let r = analyze_multi(&[py("pkg/utils.py", util_old, util_new), py("pkg/run.py", "", user)]).unwrap();
+        let lines: Vec<usize> = r.cross_file.broken_references.iter().filter(|b| b.reference_file == "pkg/run.py").map(|b| b.reference_location.line_start).collect();
+        assert!(!lines.contains(&5) && lines.contains(&6) && lines.contains(&7), "{lines:?}");
+    }
+
+    #[test]
+    fn test_methods_of_renamed_types() {
+        let go = |p: &str, o: &str, n: &str| cross_file::FileChange::new(p, o, n, Language::Go);
+        let stale = |files: &[cross_file::FileChange]| analyze_multi(files).unwrap().cross_file.signature_impacts.iter()
+            .flat_map(|s| s.call_sites.iter().filter(|c| !c.updated)).count();
+        let user = "package a\n\nfunc Use(s *SSESource, c *Client) {\n\ts.SetTLS(1)\n\tc.SetTLS(2)\n}\n";
+        // `EventSource` renamed to `SSESource`; SetTLS only changes its return type: nothing to update.
+        let old = "package a\n\ntype EventSource struct{}\n\nfunc (e *EventSource) SetTLS(n int) *EventSource {\n\treturn e\n}\n";
+        let new = "package a\n\ntype SSESource struct{}\n\nfunc (e *SSESource) SetTLS(n int) *SSESource {\n\treturn e\n}\n";
+        assert_eq!(stale(&[go("sse.go", old, new), go("use.go", user, &format!("{user}// touched\n"))]), 0);
+        // The same rename with a new required parameter: the untouched call is stale.
+        let new2 = "package a\n\ntype SSESource struct{}\n\nfunc (e *SSESource) SetTLS(n int, strict bool) *SSESource {\n\treturn e\n}\n";
+        assert!(stale(&[go("sse.go", old, new2), go("use.go", user, &format!("{user}// touched\n"))]) >= 1);
+    }
+
+    #[test]
+    fn test_decorated_python_methods_are_tracked() {
+        let old = "class Bool:\n    @staticmethod\n    def str_to_bool(value):\n        return bool(value)\n\n    def convert(self, value):\n        return self.str_to_bool(value)\n";
+        let new = old.replace("def str_to_bool(value):", "def str_to_bool(value, strict):");
+        let r = analyze_multi(&[cross_file::FileChange::new("types.py", old, &new, Language::Python)]).unwrap();
+        let stale: Vec<usize> = r.cross_file.signature_impacts.iter().flat_map(|s| s.call_sites.iter().filter(|c| !c.updated).map(|c| c.line)).collect();
+        assert_eq!(stale, vec![7], "{:?}", r.cross_file.signature_impacts);
+    }
+
+    #[test]
+    fn test_method_call_sites_by_name_and_file() {
+        let rs = |p: &str, o: &str, n: &str| cross_file::FileChange::new(p, o, n, Language::Rust);
+        let stale = |files: &[cross_file::FileChange]| -> Vec<(String, usize)> {
+            analyze_multi(files).unwrap().cross_file.signature_impacts.iter()
+                .flat_map(|s| s.call_sites.iter().filter(|c| !c.updated).map(|c| (c.file.clone(), c.line))).collect()
+        };
+        // `Mode::deduce` gains a parameter. `Self::deduce(` in another impl's file is that type's;
+        // a common name on some value elsewhere (`b.usage(`) is another type's; a distinctive one isn't.
+        let mode_old = "pub struct Mode;\nimpl Mode {\n    pub fn deduce(a: u32) -> u32 { a }\n    pub fn usage(&self) {}\n    pub fn render_summary(&self) {}\n}\n";
+        let mode_new = "pub struct Mode;\nimpl Mode {\n    pub fn deduce(a: u32, tty: bool) -> u32 { a }\n    pub fn usage(&self, w: u32) {}\n    pub fn render_summary(&self, w: u32) {}\n}\n";
+        let other = "pub struct View;\nimpl View {\n    pub fn deduce(a: u32) -> u32 { Self::deduce(a) }\n    pub fn show(m: &Mode, b: &Builder) {\n        b.usage();\n        m.render_summary();\n    }\n}\n";
+        let found = stale(&[rs("src/mode.rs", mode_old, mode_new), rs("src/view.rs", other, &format!("{other}// touched\n"))]);
+        assert_eq!(found, vec![("src/view.rs".to_string(), 6)], "{found:?}");
+    }
+
+    #[test]
+    fn test_catch_all_params_and_imports_from_elsewhere() {
+        let py = |p: &str, o: &str, n: &str| cross_file::FileChange::new(p, o, n, Language::Python);
+        // An optional parameter added before `**kwargs`: nobody breaks, and `int.__new__(` isn't ours.
+        let old = "class DateTime(int):\n    def __new__(cls, year, tz=None, **kwargs):\n        return int.__new__(cls, year)\n\n\ndef make():\n    return DateTime(1, tz=None)\n";
+        let new = old.replace("tz=None, **kwargs", "tz=None, fold=0, **kwargs");
+        let r = analyze_multi(&[py("items.py", old, &new)]).unwrap();
+        assert!(r.cross_file.signature_impacts.iter().all(|s| s.call_sites.iter().all(|c| c.updated)), "{:?}", r.cross_file.signature_impacts);
+        // A removed name imported from another package is that package's; from its own module it's stale.
+        let ts = |p: &str, o: &str, n: &str| cross_file::FileChange::new(p, o, n, Language::TypeScript);
+        let lib_old = "export const topSites = [1];\nexport const other = 2;\n";
+        let lib_new = "export const other = 2;\n";
+        let outside = "import topSites from 'top-sites';\nexport const n = topSites.length;\n";
+        let inside = "import { topSites } from './sites';\nexport const n = topSites.length;\n";
+        let refs = |user: &str| analyze_multi(&[ts("src/sites.ts", lib_old, lib_new), ts("src/use.ts", "", user)]).unwrap().cross_file.broken_references.len();
+        assert_eq!(refs(outside), 0);
+        assert!(refs(inside) >= 1);
+    }
+
+    #[test]
+    fn test_c_pointer_params_are_not_catch_alls() {
+        // `*item` is a pointer in C, not Python's `*args`: dropping a parameter still breaks callers.
+        let old = "static int parse(char *item, int *buffer) {\n    return 0;\n}\n\nint run(char *s, int *b) {\n    return parse(s, b);\n}\n";
+        let new = old.replace("static int parse(char *item, int *buffer)", "static int parse(char *item)");
+        let r = analyze_multi(&[cross_file::FileChange::new("lib.c", old, &new, Language::C)]).unwrap();
+        let stale: Vec<usize> = r.cross_file.signature_impacts.iter().flat_map(|s| s.call_sites.iter().filter(|c| !c.updated).map(|c| c.line)).collect();
+        assert_eq!(stale, vec![6], "{:?}", r.cross_file.signature_impacts);
     }
 
     #[test]
@@ -1355,3 +1552,4 @@ mod tests {
         assert_eq!(result.manifest.dependency_changes.len(), 1);
     }
 }
+
