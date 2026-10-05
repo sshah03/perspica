@@ -31,6 +31,7 @@ pub fn classify(
         if matches!(new_item, SemanticItem::Import { .. }) {
             continue; // imports are compared per module below
         }
+        let shell_changed = old_tree.meta.get(pair.old_idx).map(|m| m.shell_hash) != new_tree.meta.get(pair.new_idx).map(|m| m.shell_hash);
 
         match pair.match_kind {
             MatchKind::Exact => {}
@@ -52,11 +53,11 @@ pub fn classify(
                     });
                 }
                 if pair.match_kind == MatchKind::RenameModified {
-                    classify_modified(old_item, new_item, new_source, &mut manifest, &mut id);
+                    classify_modified(old_item, new_item, new_source, shell_changed, &mut manifest, &mut id);
                 }
             }
             MatchKind::Modified => {
-                classify_modified(old_item, new_item, new_source, &mut manifest, &mut id);
+                classify_modified(old_item, new_item, new_source, shell_changed, &mut manifest, &mut id);
             }
         }
     }
@@ -129,6 +130,7 @@ fn classify_modified(
     old_item: &SemanticItem,
     new_item: &SemanticItem,
     new_source: &str,
+    shell_changed: bool,
     manifest: &mut ChangeManifest,
     id: &mut impl FnMut() -> ManifestEntryId,
 ) {
@@ -181,6 +183,7 @@ fn classify_modified(
                 .filter(|f| of.iter().any(|o| o.name == f.name && o.type_annotation != f.type_annotation))
                 .map(|f| f.name.as_str())
                 .collect();
+            let members_changed = manifest.ids().len() > before;
             let mut parts = Vec::new();
             if !added.is_empty() { parts.push(format!("added field{} {}", pl(added.len()), ticks(&added))); }
             if !removed.is_empty() { parts.push(format!("removed field{} {}", pl(removed.len()), ticks(&removed))); }
@@ -194,13 +197,22 @@ fn classify_modified(
                     location: location_of(new_item),
                 });
             }
-            // Something changed outside members/fields (extends clause, decorators …).
-            if manifest.ids().len() == before {
+            // Same methods and nothing else changed, just their order.
+            if manifest.ids().len() == before && !shell_changed && parts.is_empty() && om.len() == nm.len() && om.len() > 1 {
+                manifest.formatting_only.push(FormattingEntry {
+                    id: id(),
+                    location: location_of(new_item),
+                    description: format!("{name}: methods reordered, otherwise unchanged"),
+                });
+                return;
+            }
+            // Something changed outside the methods and fields, like the extends clause, decorators or a nested class.
+            if manifest.ids().len() == before || (shell_changed && parts.is_empty()) {
                 manifest.logic_changes.push(LogicChangeEntry {
                     id: id(),
                     name: name.clone(),
                     kind: SymbolKind::Class,
-                    description: "declaration modified".to_string(),
+                    description: if members_changed { "changed outside its methods" } else { "declaration modified" }.to_string(),
                     location: location_of(new_item),
                 });
             }
@@ -237,7 +249,7 @@ fn classify_members(
         match new.iter().enumerate().position(|(i, n)| !new_used[i] && n.name() == o.name()) {
             Some(i) => {
                 new_used[i] = true;
-                classify_modified(o, &new[i], "", manifest, id);
+                classify_modified(o, &new[i], "", false, manifest, id);
                 // classify_modified names entries by bare method name; qualify them.
                 qualify_last(manifest, &new[i], &qualified(&new[i]));
             }

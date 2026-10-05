@@ -229,7 +229,15 @@ pub fn collect(target: &Target) -> Result<Vec<GitFileDiff>, String> {
     ns_args.extend(&arg_refs);
     let entries = parse_name_status_z(&git_cmd(&ns_args)?);
     if entries.is_empty() {
-        return Ok(vec![]);
+        // The branch may only have new files.
+        return match (target, repo_root()) {
+            (Target::Branch { .. }, Some(root)) => {
+                let mut out = untracked_files(&root)?;
+                apply_attribute_roles(&mut out);
+                Ok(out)
+            }
+            _ => Ok(vec![]),
+        };
     }
 
     let mut patch_args = vec![

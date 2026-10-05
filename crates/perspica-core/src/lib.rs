@@ -130,21 +130,27 @@ pub fn analyze_multi(files: &[cross_file::FileChange]) -> Result<cross_file::Mul
     // Annotate hunks with manifest links and noise.
     // Renames of top-level items apply everywhere; member renames (`Svc.get`,
     // `Type::new`) only in their own file, since a bare `get` elsewhere is
-    // usually some other type's method.
-    let is_member = |name: &str| parser::bare_name(name) != name;
+    // usually some other type's method, unless the name is distinctive (`write_usage`).
+    let is_member = |name: &str| parser::bare_name(name) != name && !cross_file::distinctive(parser::bare_name(name));
     let bare_pair = |old: &str, new: &str| (parser::bare_name(old).to_string(), parser::bare_name(new).to_string());
+    // Only identifiers get renamed. A destructuring pattern that gained a name is an edit.
+    let identifier = |n: &str| !n.is_empty() && n.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$');
     let mut ctx = annotate::AnnotateContext::default();
     let mut local_renames: Vec<Vec<(String, String)>> = vec![Vec::new(); analyses.len()];
+    let lines: Vec<(Vec<&str>, Vec<&str>)> = files.iter().map(|f| (f.old_source.lines().collect(), f.new_source.lines().collect())).collect();
+    let bodies: Vec<Vec<(manifest::Span, manifest::Span)>> = analyses.iter().map(function_pairs).collect();
     for (fi, a) in analyses.iter().enumerate() {
-        ctx.collect_lines(&a.result.hunks);
+        ctx.collect_lines(&a.result.hunks, &file_facts(fi, &files[fi], &lines[fi], &bodies[fi], &a.old_tree, &a.new_tree));
         for r in &a.result.manifest.renames {
             let pair = bare_pair(&r.old_name, &r.new_name);
+            if !identifier(&pair.0) || !identifier(&pair.1) { continue; }
             if is_member(&r.old_name) { local_renames[fi].push(pair) } else { ctx.renames.push(pair) }
         }
     }
     for m in &moves {
         if let Some(new) = &m.renamed_to {
             let pair = bare_pair(&m.name, new);
+            if !identifier(&pair.0) || !identifier(&pair.1) { continue; }
             if is_member(&m.name) {
                 for (fi, f) in files.iter().enumerate() {
                     if f.new_path == m.from_file || f.new_path == m.to_file { local_renames[fi].push(pair.clone()); }
@@ -168,10 +174,10 @@ pub fn analyze_multi(files: &[cross_file::FileChange]) -> Result<cross_file::Mul
         let detect_comments = a.result.review.parsed;
         let hunks = std::mem::take(&mut a.result.hunks);
         a.result.hunks = split_by_tests(hunks, a.result.review.role, &test_spans[fi]);
-        let indent_sensitive = files[fi].language == Language::Python || annotate::is_indent_sensitive(path);
+        let facts = file_facts(fi, &files[fi], &lines[fi], &bodies[fi], &a.old_tree, &a.new_tree);
         annotate::annotate_file(
-            &mut a.result.hunks, &a.result.manifest, &moved_spans, &ctx, &local_renames[fi],
-            generated, detect_comments, indent_sensitive,
+            &mut a.result.hunks, &a.result.manifest, &moved_spans, &ctx, &local_renames[fi], &facts,
+            generated, detect_comments,
         );
         let (changed, mechanical) = a.result.hunks.iter()
             .flat_map(|h| h.changes.iter())
@@ -179,6 +185,7 @@ pub fn analyze_multi(files: &[cross_file::FileChange]) -> Result<cross_file::Mul
             .fold((0, 0), |(t, m), c| (t + 1, m + c.noise.is_some() as usize));
         a.result.review.changed_lines = changed;
         a.result.review.mechanical_lines = mechanical;
+        only_renamed_references(&mut a.result);
         mark_tests(&mut a.result, &test_spans[fi]);
     }
     let graph = flow::Graph::build(&analyses);
@@ -191,6 +198,83 @@ pub fn analyze_multi(files: &[cross_file::FileChange]) -> Result<cross_file::Mul
         file_results: analyses.into_iter().map(|a| (a.path, a.result)).collect(),
         cross_file: cross_file::CrossFileManifest { moves, broken_references, signature_impacts, vanished, reading_order, test_reach, graph_debug },
     })
+}
+
+fn file_facts<'a>(
+    fi: usize,
+    file: &cross_file::FileChange,
+    lines: &'a (Vec<&'a str>, Vec<&'a str>),
+    bodies: &'a [(manifest::Span, manifest::Span)],
+    old_tree: &'a parser::SemanticTree,
+    new_tree: &'a parser::SemanticTree,
+) -> annotate::FileFacts<'a> {
+    annotate::FileFacts {
+        file: fi,
+        lines: (&lines.0, &lines.1),
+        comments: (&old_tree.comment_lines, &new_tree.comment_lines),
+        strings: (&old_tree.string_lines, &new_tree.string_lines),
+        literals: (&old_tree.literal_lines, &new_tree.literal_lines),
+        bodies,
+        indent_sensitive: file.language == Language::Python || annotate::is_indent_sensitive(&file.new_path),
+        unparsed: file.language == Language::Unknown,
+    }
+}
+
+/// Items where every changed line only follows a rename elsewhere, like `old_name(x)` to
+/// `new_name(x)`. These aren't logic changes, so they move to `formatting_only` with the same id.
+fn only_renamed_references(result: &mut DiffResult) {
+    let mut moved = Vec::new();
+    for (k, e) in result.manifest.logic_changes.iter().enumerate() {
+        if matches!(e.description.as_str(), "added" | "removed") || e.location.side != Side::New { continue; }
+        let (a, b) = (e.location.line_start, e.location.line_end);
+        let mut renamed = false;
+        let mut other = false;
+        for h in &result.hunks {
+            // Removed lines count toward the next new-side line.
+            let mut upcoming = h.new_range.end.max(h.new_range.start);
+            let mut at = vec![0usize; h.changes.len()];
+            for (i, c) in h.changes.iter().enumerate().rev() {
+                if let Some(s) = &c.new_span { upcoming = s.start_line; }
+                at[i] = upcoming;
+            }
+            for (i, c) in h.changes.iter().enumerate() {
+                if c.kind == ChangeKind::Context || !(a..=b).contains(&at[i]) { continue; }
+                match c.noise {
+                    Some(manifest::Noise::Rename) => renamed = true,
+                    Some(manifest::Noise::Formatting | manifest::Noise::Comment) => {}
+                    _ => other = true,
+                }
+            }
+        }
+        if renamed && !other { moved.push(k); }
+    }
+    for k in moved.into_iter().rev() {
+        let e = result.manifest.logic_changes.remove(k);
+        result.manifest.formatting_only.push(manifest::FormattingEntry {
+            id: e.id,
+            location: e.location,
+            description: format!("{}: only renamed references", e.name),
+        });
+    }
+}
+
+/// (old, new) spans of every function and method present on both sides of a file.
+fn function_pairs(a: &cross_file::InternalAnalysis) -> Vec<(manifest::Span, manifest::Span)> {
+    let mut out = Vec::new();
+    for p in &a.diff_output.matched {
+        match (&a.old_tree.items[p.old_idx], &a.new_tree.items[p.new_idx]) {
+            (o @ parser::SemanticItem::Function { .. }, n @ parser::SemanticItem::Function { .. }) => out.push((o.span().clone(), n.span().clone())),
+            (parser::SemanticItem::Class { methods: om, .. }, parser::SemanticItem::Class { methods: nm, .. }) => {
+                for n in nm {
+                    if let Some(o) = om.iter().find(|o| o.name().is_some() && o.name() == n.name()) {
+                        out.push((o.span().clone(), n.span().clone()));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Old- and new-side spans of test items inside a source file.
@@ -1239,6 +1323,186 @@ mod tests {
         assert!(refs(inside) >= 1);
     }
 
+    /// (text, noise) of every added line in one file's hunks.
+    fn added_noise(r: &DiffResult) -> Vec<(String, Option<manifest::Noise>)> {
+        r.hunks.iter().flat_map(|h| h.changes.iter())
+            .filter(|c| matches!(c.kind, ChangeKind::Added | ChangeKind::Modified))
+            .map(|c| (c.content_new.clone().unwrap_or_default().trim().to_string(), c.noise))
+            .collect()
+    }
+
+    fn logic(r: &DiffResult) -> Vec<(String, String)> {
+        r.manifest.logic_changes.iter().map(|l| (l.name.clone(), l.description.clone())).collect()
+    }
+
+    #[test]
+    fn test_operator_lines_are_code_not_comments() {
+        // rustfmt puts the operator at the start of continuation lines, so `* qty` is code.
+        let old = "pub fn total(price: u32, qty: u32, extra: u32) -> u32 {\n    /* Price\n     * times quantity. */\n    price\n        * qty\n        + extra\n}\n";
+        let new = "pub fn total(price: u32, qty: u32, extra: u32) -> u32 {\n    /* Price\n     * times the quantity. */\n    price\n        * extra\n        + qty\n}\n";
+        let r = analyze_multi(&[cross_file::FileChange::new("a.rs", old, new, Language::Rust)]).unwrap();
+        let added = added_noise(&r.file_results[0].1);
+        assert!(added.contains(&("* times the quantity. */".into(), Some(manifest::Noise::Comment))), "{added:?}");
+        assert!(added.contains(&("* extra".into(), None)), "{added:?}");
+        assert!(added.contains(&("+ qty".into(), None)), "{added:?}");
+    }
+
+    #[test]
+    fn test_reordered_statements_stay_visible() {
+        let old = "pub fn run(x: u32) {\n    validate(x);\n    check(x);\n    lock(x);\n    save(x);\n    log(x);\n    notify(x);\n}\n";
+        let new = "pub fn run(x: u32) {\n    save(x);\n    log(x);\n    notify(x);\n    validate(x);\n    check(x);\n    lock(x);\n}\n";
+        let r = analyze_multi(&[cross_file::FileChange::new("a.rs", old, new, Language::Rust)]).unwrap();
+        let r = &r.file_results[0].1;
+        assert_eq!(r.review.mechanical_lines, 0, "{:?}", r.hunks);
+        assert_eq!(logic(r), vec![("run".into(), "body modified".into())]);
+    }
+
+    #[test]
+    fn test_edit_in_moved_code_stays_visible() {
+        // Function moved to the end of the file and `return False` became `return True`,
+        // which also shows up somewhere else in the old version.
+        let f = "def is_async(call):\n    if inspect.isclass(call):\n        return False\n    if inspect.iscoroutinefunction(call):\n        return True\n    partial = getattr(call, 'func', None)\n    return inspect.iscoroutinefunction(partial)\n";
+        let other = "def wrap(call):\n    async def inner(*args):\n        return call(*args)\n    return inner\n";
+        let old = format!("{f}\n\n{other}");
+        let new = format!("{other}\n\n{}", f.replace("return False", "return True"));
+        let r = analyze_multi(&[cross_file::FileChange::new("u.py", &old, &new, Language::Python)]).unwrap();
+        let r = &r.file_results[0].1;
+        let added = added_noise(r);
+        assert_eq!(added.iter().filter(|(t, n)| t == "return True" && n.is_none()).count(), 1, "{added:?}");
+        assert!(logic(r).iter().any(|(n, _)| n == "is_async"), "{:?}", logic(r));
+    }
+
+    #[test]
+    fn test_formatting_pairs_follow_line_order() {
+        // Reformatted, and `javadoc = false` changed to `true`. The changed line shouldn't get
+        // paired with the other `javadoc = true` that didn't change.
+        let old = "class W {\n  void emit() {\n    javadoc = true;\n    try {\n      write(block, true);\n    } finally {\n      javadoc = false;\n    }\n  }\n}\n";
+        let new = "class W {\n  void emit() {\n      javadoc = true;\n      try {\n        write(block,true);\n      } finally {\n        javadoc = true;\n      }\n  }\n}\n";
+        let r = analyze_multi(&[cross_file::FileChange::new("W.java", old, new, Language::Java)]).unwrap();
+        let r = &r.file_results[0].1;
+        let visible: Vec<usize> = r.hunks.iter().flat_map(|h| h.changes.iter())
+            .filter(|c| c.kind == ChangeKind::Added && c.noise.is_none())
+            .filter_map(|c| c.new_span.as_ref().map(|s| s.start_line))
+            .collect();
+        assert_eq!(visible, vec![7], "{:?}", r.hunks);
+    }
+
+    #[test]
+    fn test_reformat_is_mechanical_across_the_function() {
+        let old = "func Allow(enc ...string) func(http.Handler) http.Handler {\n\tallowed := make(map[string]struct{}, len(enc))\n\treturn func(next http.Handler) http.Handler {\n\t\tfn := func(w http.ResponseWriter, r *http.Request) {\n\t\t\tif r.ContentLength == 0 {\n\t\t\t\tnext.ServeHTTP(w, r)\n\t\t\t\treturn\n\t\t\t}\n\t\t\tfor _, e := range r.Header[\"X\"] {\n\t\t\t\tif _, ok := allowed[e]; !ok {\n\t\t\t\t\tw.WriteHeader(415)\n\t\t\t\t\treturn\n\t\t\t\t}\n\t\t\t}\n\t\t\tnext.ServeHTTP(w, r)\n\t\t}\n\t\treturn http.HandlerFunc(fn)\n\t}\n}\n";
+        let new: String = old.lines().enumerate()
+            .map(|(i, l)| if i == 0 || l == "}" { l.to_string() } else { format!("\t{}", l.replace(", ", ",")) })
+            .collect::<Vec<_>>().join("\n") + "\n";
+        let r = analyze_multi(&[cross_file::FileChange::new("a.go", old, &new, Language::Go)]).unwrap();
+        let r = &r.file_results[0].1;
+        assert_eq!(r.review.mechanical_lines, r.review.changed_lines, "{:?}", r.hunks);
+    }
+
+    #[test]
+    fn test_class_changes_outside_methods_are_reported() {
+        let old = "final class A {\n  void top() {\n    run(1);\n  }\n\n  private static final class Counts<T> {\n    void drop(T t) {\n      put(t, count - 1);\n    }\n  }\n}\n";
+        let new = old.replace("run(1);", "run(2);").replace("count - 1", "count - 2");
+        let r = analyze(old, &new, Language::Java).unwrap();
+        let l: Vec<(String, String)> = r.manifest.logic_changes.iter().map(|l| (l.name.clone(), l.description.clone())).collect();
+        assert!(l.contains(&("A".into(), "changed outside its methods".into())), "{l:?}");
+        assert!(l.contains(&("A.top".into(), "body modified".into())), "{l:?}");
+    }
+
+    #[test]
+    fn test_reordered_methods_are_mechanical() {
+        let a = "    def first(self):\n        return self.x + 1\n";
+        let b = "    def second(self):\n        return self.y * 2\n";
+        let old = format!("class C:\n{a}\n{b}");
+        let new = format!("class C:\n{b}\n{a}");
+        let r = analyze_multi(&[cross_file::FileChange::new("c.py", &old, &new, Language::Python)]).unwrap();
+        let r = &r.file_results[0].1;
+        assert!(r.manifest.logic_changes.is_empty(), "{:?}", r.manifest.logic_changes);
+        assert_eq!(r.manifest.formatting_only.len(), 1, "{:?}", r.manifest);
+        assert_eq!(r.review.mechanical_lines, r.review.changed_lines, "{:?}", r.hunks);
+    }
+
+    #[test]
+    fn test_whitespace_inside_strings_is_content() {
+        for (path, old, new, lang) in [
+            ("a.ts", "export function q(): string {\n  return `select a,\n    b from t`;\n}\n", "export function q(): string {\n  return `select a,\n      b from t`;\n}\n", Language::TypeScript),
+            ("a.ts", "export function q(name: string): string {\n  return `hello ${name}`;\n}\n", "export function q(name: string): string {\n  return `hello  ${name}`;\n}\n", Language::TypeScript),
+            ("A.scala", "object A {\n  def q(n: String): String = {\n    s\"hello $n\"\n  }\n}\n", "object A {\n  def q(n: String): String = {\n    s\"hello  $n\"\n  }\n}\n", Language::Scala),
+            ("a.ts", "export function words(s: string): string[] {\n  return s.split(/ +/);\n}\n", "export function words(s: string): string[] {\n  return s.split(/  +/);\n}\n", Language::TypeScript),
+            ("m.c", "#define SQUARE(x) ((x) * (x))\n\nint f(int y) {\n  return SQUARE(y);\n}\n", "#define SQUARE (x) ((x) * (x))\n\nint f(int y) {\n  return SQUARE(y);\n}\n", Language::C),
+        ] {
+            let r = analyze_multi(&[cross_file::FileChange::new(path, old, new, lang)]).unwrap();
+            let r = &r.file_results[0].1;
+            let dimmed: Vec<_> = r.hunks.iter().flat_map(|h| h.changes.iter())
+                .filter(|c| c.noise.is_some() && c.content_new.as_deref().or(c.content_old.as_deref()).is_some_and(|t| !t.trim().is_empty()))
+                .collect();
+            assert!(dimmed.is_empty(), "{new}: {dimmed:?}");
+            assert!(!r.manifest.logic_changes.is_empty() && r.manifest.formatting_only.is_empty(), "{new}: {:?}", r.manifest);
+        }
+    }
+
+    #[test]
+    fn test_directives_decorators_and_default_exports_are_code() {
+        for (path, old, new, lang) in [
+            ("a.go", "package a\n\nfunc f(n int) int {\n\treturn n + 1\n}\n", "package a\n\n//go:noinline\nfunc f(n int) int {\n\treturn n + 1\n}\n", Language::Go),
+            ("a.py", "def f(n):\n    return n + 1\n", "@functools.cache\ndef f(n):\n    return n + 1\n", Language::Python),
+            ("a.ts", "export default define({\n  build(x) {\n    one(x);\n    two(x);\n  },\n});\n", "export default define({\n  build(x) {\n    two(x);\n    one(x);\n  },\n});\n", Language::TypeScript),
+        ] {
+            let r = analyze_multi(&[cross_file::FileChange::new(path, old, new, lang)]).unwrap();
+            let r = &r.file_results[0].1;
+            assert_eq!(r.review.mechanical_lines, 0, "{new}: {:?}", r.hunks);
+            assert_eq!(r.manifest.logic_changes.len(), 1, "{new}: {:?}", r.manifest);
+        }
+    }
+
+    #[test]
+    fn test_linter_switches_show_but_are_not_logic() {
+        // `// @ts-ignore` stays visible, but it's not a logic change.
+        let old = "export function f(n: number): number {\n  return g(n);\n}\n";
+        let new = "export function f(n: number): number {\n  // @ts-ignore\n  return g(n);\n}\n";
+        let r = analyze_multi(&[cross_file::FileChange::new("a.ts", old, new, Language::TypeScript)]).unwrap();
+        let r = &r.file_results[0].1;
+        assert_eq!(r.review.mechanical_lines, 0, "{:?}", r.hunks);
+        assert!(r.manifest.logic_changes.is_empty(), "{:?}", r.manifest.logic_changes);
+        // A comment between the parts of a concatenated string isn't part of the string.
+        let old = "def f(v):\n    return (\n        f\"a {v} \"  # type: ignore[x]\n        f\"b\"\n    )\n";
+        let new = old.replace("  # type: ignore[x]", "");
+        let r = analyze(old, &new, Language::Python).unwrap();
+        assert!(r.manifest.logic_changes.is_empty(), "{:?}", r.manifest.logic_changes);
+        // A trailing directive belongs to its own line, not the statement after it.
+        let old = "from .a import b  # noqa: E402\n\nif t.TYPE_CHECKING:\n    import c\n";
+        let new = "from .a import b  # noqa: E402\n\nif t.TYPE_CHECKING:\n    import d\n";
+        let r = analyze(old, new, Language::Python).unwrap();
+        assert_eq!(r.manifest.logic_changes.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), vec!["if t.TYPE_CHECKING:"]);
+    }
+
+    #[test]
+    fn test_destructuring_changes_are_not_renames() {
+        let old = "const { kConnecting, kUrl } = require('./symbols')\n\nexport function f(p) {\n  return p[kUrl]\n}\n";
+        let new = "const { kConnecting, kUrl, kQueued } = require('./symbols')\n\nexport function f(p) {\n  return p[kUrl]\n}\n";
+        let r = analyze_multi(&[cross_file::FileChange::new("pool.js", old, new, Language::TypeScript)]).unwrap();
+        let r = &r.file_results[0].1;
+        assert_eq!(r.review.mechanical_lines, 0, "{:?}", r.hunks);
+        assert_eq!(r.manifest.logic_changes.len(), 1, "{:?}", r.manifest);
+    }
+
+    #[test]
+    fn test_callers_only_following_a_rename_are_mechanical() {
+        let files = [
+            cross_file::FileChange::new("src/fmt.rs", "pub fn write_usage(out: &mut String, prog: &str) {\n    out.push_str(prog);\n    out.push('\\n');\n}\n", "pub fn print_usage(out: &mut String, prog: &str) {\n    out.push_str(prog);\n    out.push('\\n');\n}\n", Language::Rust),
+            cross_file::FileChange::new("src/cli.rs", "pub fn help(out: &mut String) {\n    let name = program();\n    write_usage(out, &name);\n}\n", "pub fn help(out: &mut String) {\n    let name = program();\n    print_usage(out, &name);\n}\n", Language::Rust),
+        ];
+        let r = analyze_multi(&files).unwrap();
+        let cli = &r.file_results[1].1;
+        assert!(cli.manifest.logic_changes.is_empty(), "{:?}", cli.manifest.logic_changes);
+        assert_eq!(cli.manifest.formatting_only.len(), 1, "{:?}", cli.manifest);
+        assert_eq!(cli.review.mechanical_lines, cli.review.changed_lines);
+        // A caller that also changed something else stays a logic change.
+        let mut files = files;
+        files[1].new_source = files[1].new_source.replace("program()", "program_name()");
+        let r = analyze_multi(&files).unwrap();
+        assert_eq!(logic(&r.file_results[1].1), vec![("help".into(), "body modified".into())]);
+    }
+
     #[test]
     fn test_c_pointer_params_are_not_catch_alls() {
         // `*item` is a pointer in C, not Python's `*args`: dropping a parameter still breaks callers.
@@ -1261,6 +1525,22 @@ mod tests {
         let r = &result.file_results[0].1;
         assert_eq!(r.review.changed_lines, r.review.mechanical_lines, "rename + reformat is all mechanical: {:?}", r.hunks);
         assert!(r.hunks.iter().all(|h| !h.manifest_refs.is_empty() || h.noise.is_some()));
+    }
+
+    #[test]
+    fn test_whitespace_that_renders_stays_visible_in_unparsed_files() {
+        // Indenting makes a Markdown code block, two trailing spaces are a line break, and Makefiles need tabs.
+        for (path, old, new) in [
+            ("README.md", "run this:\n\nnpm install\n", "run this:\n\n    npm install\n"),
+            ("README.md", "Line one\nLine two\n", "Line one  \nLine two\n"),
+            ("Makefile", "build:\n\tcargo build\n", "build:\n    cargo build\n"),
+        ] {
+            let r = analyze_multi(&[cross_file::FileChange::new(path, old, new, Language::Unknown)]).unwrap();
+            assert_eq!(r.file_results[0].1.review.mechanical_lines, 0, "{new:?}: {:?}", r.file_results[0].1.hunks);
+        }
+        // Spacing within a line is still formatting.
+        let r = analyze_multi(&[cross_file::FileChange::new("Cargo.toml", "a = { version=\"1\" }\n", "a = { version = \"1\" }\n", Language::Unknown)]).unwrap();
+        assert_eq!(r.file_results[0].1.review.mechanical_lines, 2, "{:?}", r.file_results[0].1.hunks);
     }
 
     #[test]

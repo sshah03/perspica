@@ -70,9 +70,9 @@ const CATEGORIES = [
     { key: 'logic', label: 'Logic changes' },
     { key: 'structure', label: 'Renames, moves & extractions', note: 'Structural edits. Mostly verify nothing else changed.' },
     { key: 'tests', label: 'Tests', note: 'Test code. Check it asserts the new behavior.' },
-    { key: 'mechanical', label: 'Mechanical changes', note: 'Formatting, comments and unchanged moves.', mechanical: true },
+    { key: 'mechanical', label: 'Mechanical changes', note: 'Formatting, comments, renames and unchanged moves.', mechanical: true },
 ];
-const MECH_NOTE = 'Formatting, comments and unchanged moves.';
+const MECH_NOTE = 'Formatting, comments, renames and unchanged moves.';
 const ROLE_TAG = { test: 'test', docs: 'docs', vendored: 'vendored' };
 /** Category of an entry for "By category" and the Changes tab. */
 function entryCat(e) { return e.mechanical ? 'mechanical' : testIds.has(e.id) ? 'tests' : KIND[e.kind].cat; }
@@ -596,7 +596,7 @@ function renderSidebar() {
     const el = document.getElementById('toc-content');
     document.querySelectorAll('.sidebar-tab').forEach(b => {
         b.classList.toggle('active', b.dataset.tab === S.tab);
-        if (b.dataset.tab === 'changes') b.innerHTML = `Changes<span class="count">${E.size}</span>`;
+        if (b.dataset.tab === 'changes') b.innerHTML = `Changes<span class="count">${changeListCount()}</span>`;
     });
     const shows = sidebarShows();
     if (shows === 'changes') { el.innerHTML = renderChangeList(); }
@@ -742,15 +742,51 @@ function renderGroupEntries(g) {
     return g.ids.map(row).join('');
 }
 
+/** Hunks with no entry, by file, grouped the same way the reading order does. */
+function unclassifiedFiles() {
+    const d = S.data;
+    const out = { other: [], tests: [], docs: [], mechanical: [] };
+    d.results.forEach((r, fi) => {
+        const buckets = {};
+        r.hunks.forEach(h => {
+            if ((h.manifest_refs || []).length) return;
+            const b = h.noise || r.review.generated ? 'mechanical' : h.test || r.review.role === 'test' ? 'tests' : r.review.role === 'docs' ? 'docs' : 'other';
+            (buckets[b] = buckets[b] || []).push(h);
+        });
+        for (const [b, hs] of Object.entries(buckets)) out[b].push({ fi, path: d.files[fi].new_path, hunks: hs.length, line: hs[0].new_range.start || hs[0].old_range.start || 1 });
+    });
+    return out;
+}
+
+function changeListCount() {
+    const u = unclassifiedFiles();
+    return E.size + Object.values(u).reduce((n, fs) => n + fs.length, 0);
+}
+
 function renderChangeList() {
+    const files = unclassifiedFiles();
+    const fileRow = (f) => `<div class="toc-row entry" data-jump-file="${esc(f.path)}" data-jump-line="${f.line}" data-filter="${esc(f.path.toLowerCase())}" title="${esc(f.path)}">
+        <span class="ic">▤</span><span class="txt">${esc(baseName(f.path))}${f.hunks > 1 ? ` · ${f.hunks} hunks` : ''}</span><span class="loc">${esc(f.path.split('/').slice(0, -1).join('/'))}</span></div>`;
+    const section = (label, n, body, collapsed) => `<div class="toc-group${collapsed ? ' collapsed' : ''}"><div class="toc-head" data-group-toggle><span class="chev">▼</span><span class="title">${esc(label)}</span><span class="n">${n}</span></div>
+            <div class="toc-body">${body}</div></div>`;
     let html = '';
     for (const c of CATEGORIES) {
         const ids = [...E.values()].filter(e => entryCat(e) === c.key).map(e => e.id);
-        if (!ids.length) continue;
-        html += `<div class="toc-group${c.mechanical ? ' collapsed' : ''}"><div class="toc-head" data-group-toggle><span class="chev">▼</span><span class="title">${esc(c.label)}</span><span class="n">${ids.length}</span></div>
-            <div class="toc-body">${renderGroupEntries({ ids })}</div></div>`;
+        const extra = files[c.key] || [];
+        if (c.key === 'mechanical' || c.key === 'tests') {
+            // Also add generated files, comment-only edits and test code that have no entry.
+            if (!ids.length && !extra.length) continue;
+            html += section(c.label, ids.length + extra.length, renderGroupEntries({ ids }) + extra.map(fileRow).join(''), c.mechanical);
+            continue;
+        }
+        if (ids.length) html += section(c.label, ids.length, renderGroupEntries({ ids }), false);
+        if (c.key === 'structure') {
+            // Same spot as in the reading order, before tests and mechanical.
+            if (files.other.length) html += section('Other changes', files.other.length, files.other.map(fileRow).join(''), false);
+            if (files.docs.length) html += section('Docs', files.docs.length, files.docs.map(fileRow).join(''), false);
+        }
     }
-    return html || '<div class="toc-empty">No classified changes. Unsupported file types are shown as plain diffs.</div>';
+    return html || '<div class="toc-empty">No changes.</div>';
 }
 
 function applyFilter(q) {

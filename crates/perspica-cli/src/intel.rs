@@ -28,7 +28,7 @@ pub struct IntentGroup {
     /// What a reviewer should verify for this group.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_note: Option<String>,
-    /// Deterministic group of mechanical changes (formatting, moves), never sent to the LLM.
+    /// Deterministic group of mechanical changes (formatting, renames, moves), never sent to the LLM.
     #[serde(default)]
     pub mechanical: bool,
     /// With agent-session requirements: "requested" (the user asked for it, with a
@@ -145,7 +145,7 @@ pub async fn run_analysis(input: &IntelInput<'_>, provider: &dyn LlmProvider) ->
     if llm_entry_ids(input).is_empty() {
         return Ok(IntelResult {
             groups: mechanical_group(&all_entries(input)).into_iter().collect(),
-            summary: "Only mechanical changes (formatting, comments, or unchanged moves). No behavior change detected.".into(),
+            summary: "Only mechanical changes (formatting, comments, renames, or unchanged moves). No behavior change detected.".into(),
             concerns: vec![],
         });
     }
@@ -370,7 +370,7 @@ fn build_entry_listing(input: &IntelInput<'_>) -> String {
         lines.push("(no semantic changes, only mechanical edits)".into());
     }
     if mechanical > 0 {
-        lines.push(format!("({mechanical} mechanical entries (formatting, unchanged moves) are grouped separately; ignore them)"));
+        lines.push(format!("({mechanical} mechanical entries (formatting, renames, unchanged moves) are grouped separately; ignore them)"));
     }
     lines.join("\n")
 }
@@ -518,7 +518,7 @@ fn mechanical_group(entries: &[Entry]) -> Option<IntentGroup> {
     }
     let descriptions: Vec<String> = entries.iter().filter(|e| e.mechanical).map(Entry::description).collect();
     Some(IntentGroup {
-        label: "Mechanical changes (formatting, moves)".into(),
+        label: "Mechanical changes (formatting, renames, moves)".into(),
         entry_ids: ids.clone(),
         descriptions: descriptions.clone(),
         sub_groups: vec![SubGroup { label: "No behavior change".into(), entry_ids: ids, descriptions }],
@@ -541,14 +541,18 @@ pub fn build_rich_context(results: &[DiffResult], sources: &[(String, String, St
         let Some(result) = results.get(i) else { continue };
         let old_lines: Vec<&str> = old_src.lines().collect();
         let new_lines: Vec<&str> = new_src.lines().collect();
-        for lc in &result.manifest.logic_changes {
-            let lines = if lc.location.side == Side::Old { &old_lines } else { &new_lines };
-            let start = lc.location.line_start.saturating_sub(1);
-            let end = lc.location.line_end.min(lines.len());
+        // Extracted helpers too. Their lines are marked as moved, so the diff below leaves them out.
+        let extracted = result.manifest.extracted_functions.iter()
+            .flat_map(|e| e.locations_new.iter().zip(&e.extracted_names).map(|(loc, name)| (loc, name, "extracted")));
+        let changed = result.manifest.logic_changes.iter()
+            .map(|lc| (&lc.location, &lc.name, if lc.location.side == Side::Old { "removed" } else { "new" }));
+        for (loc, name, version) in changed.chain(extracted) {
+            let lines = if loc.side == Side::Old { &old_lines } else { &new_lines };
+            let start = loc.line_start.saturating_sub(1);
+            let end = loc.line_end.min(lines.len());
             let count = end.saturating_sub(start);
             if count == 0 || count > 50 { continue; }
-            let version = if lc.location.side == Side::Old { "removed" } else { "new" };
-            let entry = format!("--- {path}:{} {} ({version})\n{}\n\n", lc.location.line_start, lc.name, lines[start..end].join("\n"));
+            let entry = format!("--- {path}:{} {name} ({version})\n{}\n\n", loc.line_start, lines[start..end].join("\n"));
             if budget - (entry.len() as i64) < 4000 { break 'outer; }
             budget -= entry.len() as i64;
             bodies.push_str(&entry);
@@ -562,7 +566,7 @@ pub fn build_rich_context(results: &[DiffResult], sources: &[(String, String, St
     if budget > 500 {
         let hunks = build_hunks_budgeted(results, sources, budget as usize);
         if !hunks.is_empty() {
-            sections.push(format!("Diff (mechanical lines omitted):\n{hunks}"));
+            sections.push(format!("Diff (+ added, - removed; unmarked lines are unchanged or only reformatted, moved or renamed):\n{hunks}"));
         }
     }
 
@@ -579,12 +583,14 @@ fn build_hunks_budgeted(results: &[DiffResult], sources: &[(String, String, Stri
         let mut header_done = false;
         for hunk in &result.hunks {
             if hunk.noise.is_some() { continue; }
+            // Show the whole hunk. Real changes get +/-, everything else is plain context.
             for change in &hunk.changes {
-                if change.noise.is_some() { continue; }
-                let line = match change.kind {
-                    ChangeKind::Added => format!("+ {}", change.content_new.as_deref().unwrap_or("")),
-                    ChangeKind::Removed => format!("- {}", change.content_old.as_deref().unwrap_or("")),
-                    _ => continue,
+                let text = change.content_new.as_deref().or(change.content_old.as_deref()).unwrap_or("");
+                let line = match (change.kind, change.noise.is_some()) {
+                    (ChangeKind::Added | ChangeKind::Modified, false) => format!("+ {text}"),
+                    (ChangeKind::Removed, false) => format!("- {}", change.content_old.as_deref().unwrap_or("")),
+                    (ChangeKind::Removed, true) => continue,
+                    _ => format!("  {text}"),
                 };
                 if !header_done {
                     out.push(format!("=== {path}"));
@@ -646,6 +652,20 @@ mod tests {
 
     fn input_with<'a>(results: &'a [DiffResult], cf: &'a CrossFileManifest) -> IntelInput<'a> {
         IntelInput { results, sources: &[], cross_file: cf, author_context: None, requirements: &[] }
+    }
+
+    #[test]
+    fn extracted_helpers_reach_the_model() {
+        // The helper's lines moved out of `run`, so the diff leaves them out. Its body should be shown instead.
+        let old = "export function run(x: number): number {\n  const a = x * 2;\n  const b = a + 1;\n  const c = b * b;\n  log(c);\n  return c;\n}\n";
+        let new = "export function run(x: number): number {\n  const c = square(x);\n  log(c);\n  return c;\n}\n\nfunction square(x: number): number {\n  const a = x * 2;\n  const b = a + 1;\n  const c = b * b;\n  return c;\n}\n";
+        let r = perspica_core::analyze_multi(&[perspica_core::cross_file::FileChange::new("a.ts", old, new, perspica_core::Language::TypeScript)]).unwrap();
+        let results: Vec<DiffResult> = r.file_results.into_iter().map(|(_, r)| r).collect();
+        assert!(!results[0].manifest.extracted_functions.is_empty(), "{:?}", results[0].manifest);
+        let context = build_rich_context(&results, &[("a.ts".into(), old.into(), new.into())]);
+        assert!(context.contains("square (extracted)") && context.contains("const b = a + 1;"), "{context}");
+        // The call site should keep its surrounding lines.
+        assert!(context.contains("+   const c = square(x);") && context.contains("    log(c);"), "{context}");
     }
 
     #[test]

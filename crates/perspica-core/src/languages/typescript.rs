@@ -86,7 +86,11 @@ fn extract_item(node: &tree_sitter::Node, source: &str) -> Option<SemanticItem> 
                     _ => {} // skip keywords, decorators, etc.
                 }
             }
-            None
+            // `export default defineConfig({ ... })` or `export { a, b }`, kept as a plain statement.
+            Some(SemanticItem::Other {
+                span: node_span(node),
+                content_hash: hash_str(&node_text(node, source)),
+            })
         }
         "lexical_declaration" => extract_variable(node, source),
         "import_statement" => extract_import(node, source),

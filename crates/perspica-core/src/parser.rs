@@ -12,11 +12,24 @@ pub struct SemanticTree {
     /// Per-item fingerprints, parallel to `items`. Filled in by `parse`.
     #[serde(skip)]
     pub meta: Vec<ItemMeta>,
+    /// Lines (1-based) holding nothing but comments, from the syntax tree. Filled in by `parse`.
+    #[serde(skip)]
+    pub comment_lines: HashSet<usize>,
+    /// Lines (1-based) inside a multi-line string, where whitespace matters.
+    #[serde(skip)]
+    pub string_lines: HashSet<usize>,
+    /// Lines with a regex or a C `#define`, where some whitespace matters. Holds the regexes on
+    /// the line, or `None` for a `#define` where the whole line counts.
+    #[serde(skip)]
+    pub literal_lines: LiteralLines,
 }
+
+/// Regexes on each line, or `None` for a `#define` line.
+pub type LiteralLines = HashMap<usize, Option<Vec<String>>>;
 
 impl SemanticTree {
     pub fn new(items: Vec<SemanticItem>) -> Self {
-        SemanticTree { items, meta: Vec::new() }
+        SemanticTree { items, meta: Vec::new(), comment_lines: HashSet::new(), string_lines: HashSet::new(), literal_lines: HashMap::new() }
     }
 }
 
@@ -44,6 +57,9 @@ pub struct ItemMeta {
     pub declared: HashSet<u64>,
     /// Visible outside the file (export / pub / capitalized / non-static …).
     pub exported: bool,
+    /// For classes: `norm_hash` without the methods, so changes elsewhere in the class
+    /// (a nested class, a field, the header) still show up when a method changed too.
+    pub shell_hash: u64,
     /// The item is a comment (dropped from the tree after parsing).
     pub is_comment: bool,
     /// Test code inside a source file: `#[test]` / `#[cfg(test)]` on the item or an
@@ -180,6 +196,7 @@ pub fn parse(source: &str, lang: &dyn LanguageSupport) -> Result<SemanticTree, E
 
     let mut sem = lang.extract_semantic_tree(&tree, source);
     fingerprint(&mut sem, &tree, source, lang);
+    (sem.comment_lines, sem.string_lines, sem.literal_lines) = comment_and_string_lines(&tree, source);
     Ok(sem)
 }
 
@@ -239,6 +256,8 @@ pub struct CallRef {
 
 struct TokenWalk {
     norm: DefaultHasher,
+    /// `norm` without the `members` subtrees (the class without its methods).
+    shell: DefaultHasher,
     shape: DefaultHasher,
     tokens: Vec<u32>,
     refs: HashSet<u64>,
@@ -567,9 +586,15 @@ impl CallSpotter {
 const SUBTREE_END: u16 = u16::MAX;
 
 /// `skip` excludes one descendant subtree (e.g. a function body for its declaration hash).
-fn walk_tokens(node: tree_sitter::Node, source: &str, mask: Option<&str>, skip: Option<tree_sitter::Node>) -> TokenWalk {
+fn walk_tokens(node: tree_sitter::Node, source: &str, mask: Option<&str>, skip: &[tree_sitter::Node]) -> TokenWalk {
+    walk_tokens_with(node, source, mask, skip, &HashSet::new())
+}
+
+/// Same as `walk_tokens`, but also hashes the item without the `members` subtrees into `shell`.
+fn walk_tokens_with(node: tree_sitter::Node, source: &str, mask: Option<&str>, skip: &[tree_sitter::Node], members: &HashSet<usize>) -> TokenWalk {
     let mut w = TokenWalk {
         norm: DefaultHasher::new(),
+        shell: DefaultHasher::new(),
         shape: DefaultHasher::new(),
         tokens: Vec::new(),
         refs: HashSet::new(),
@@ -581,23 +606,38 @@ fn walk_tokens(node: tree_sitter::Node, source: &str, mask: Option<&str>, skip: 
     };
     let mut cursor = node.walk();
     let mut spotter = CallSpotter::default();
+    // How deep we are inside `members` subtrees. The shell hash only counts what's outside them.
+    let mut in_member = 0usize;
+    let is_member = |n: &tree_sitter::Node| !members.is_empty() && members.contains(&n.id());
     'outer: loop {
         let n = cursor.node();
+        if is_member(&n) { in_member += 1; }
         let kind = n.kind();
-        let skip = kind.contains("comment") || skip == Some(n);
+        let comment = is_comment_kind(kind);
+        // Directive comments like `//go:noinline` count as code. Strings are hashed from the source
+        // since some grammars leave their whitespace out of the tokens.
+        if (comment && is_build_directive(&source[n.byte_range()])) || is_string_kind(kind) {
+            let text = &source[n.byte_range()];
+            text.hash(&mut w.norm);
+            text.hash(&mut w.shape);
+            if in_member == 0 { text.hash(&mut w.shell); }
+        }
+        let skip = comment || skip.contains(&n);
         if !skip {
             if n.child_count() == 0 {
                 let text = &source[n.byte_range()];
                 text.hash(&mut w.norm);
+                if in_member == 0 { text.hash(&mut w.shell); }
                 if mask == Some(text) { "\u{0}NAME".hash(&mut w.shape) } else { text.hash(&mut w.shape) }
                 w.tokens.push(hash_str(text) as u32);
-                if kind.contains("identifier") {
+                if kind.ends_with("identifier") || kind.ends_with("identifier_pattern") {
                     w.refs.insert(ident_hash(text));
                 }
                 spotter.leaf(kind, text, &mut w.calls);
             } else if n.is_named() {
                 n.kind_id().hash(&mut w.norm);
                 n.kind_id().hash(&mut w.shape);
+                if in_member == 0 { n.kind_id().hash(&mut w.shell); }
                 spotter.enter(kind, &mut w.calls);
             }
             if cursor.goto_first_child() {
@@ -605,6 +645,8 @@ fn walk_tokens(node: tree_sitter::Node, source: &str, mask: Option<&str>, skip: 
             }
         }
         loop {
+            // Done with this node's subtree.
+            if is_member(&cursor.node()) { in_member -= 1; }
             if cursor.node() == node {
                 break 'outer;
             }
@@ -618,6 +660,7 @@ fn walk_tokens(node: tree_sitter::Node, source: &str, mask: Option<&str>, skip: 
             if cursor.node().is_named() {
                 SUBTREE_END.hash(&mut w.norm);
                 SUBTREE_END.hash(&mut w.shape);
+                if in_member == 0 { SUBTREE_END.hash(&mut w.shell); }
                 spotter.leave(cursor.node().kind(), &mut w.calls);
             }
         }
@@ -652,7 +695,7 @@ fn function_body(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
 
 fn body_token_hash(node: tree_sitter::Node, source: &str) -> Option<u64> {
     let body = function_body(node)?;
-    Some(walk_tokens(body, source, None, None).norm.finish())
+    Some(walk_tokens(body, source, None, &[]).norm.finish())
 }
 
 /// Hash of a function's declaration outside its body (visibility, `async`,
@@ -660,14 +703,71 @@ fn body_token_hash(node: tree_sitter::Node, source: &str) -> Option<u64> {
 fn decl_token_hash(node: tree_sitter::Node, attrs: &[tree_sitter::Node], source: &str) -> u64 {
     let mut h = DefaultHasher::new();
     for a in attrs {
-        walk_tokens(*a, source, None, None).norm.finish().hash(&mut h);
+        walk_tokens(*a, source, None, &[]).norm.finish().hash(&mut h);
     }
-    walk_tokens(node, source, None, function_body(node)).norm.finish().hash(&mut h);
+    walk_tokens(node, source, None, function_body(node).as_slice()).norm.finish().hash(&mut h);
     h.finish()
 }
 
 /// Attribute nodes (`#[derive(..)]`, `#[test]`) directly preceding an item.
 /// They belong to that item: its span and fingerprint include them.
+/// Comment node kinds end in "comment" in every grammar. This runs on every node, so it's a
+/// suffix check instead of a substring search.
+fn is_comment_kind(kind: &str) -> bool {
+    kind.ends_with("comment")
+}
+
+/// A full string literal. Not its parts, and not `"a" "b"` since each part is hashed on its own.
+fn is_string_kind(kind: &str) -> bool {
+    matches!(kind, "string" | "template_string" | "text_block" | "interpolated_string" | "interpolated_string_expression" | "system_lib_string")
+        || kind.ends_with("string_literal")
+}
+
+/// Comments that tools act on, like build constraints, type checker and linter switches,
+/// and bundler hints. These should show up in the diff.
+pub fn is_directive(comment: &str) -> bool {
+    is_build_directive(comment)
+        || comment.trim_start().starts_with("# type:")
+        || [
+            "@ts-ignore", "@ts-expect-error", "@ts-nocheck", "@ts-check", "@flow", "eslint-disable", "eslint-enable",
+            "noqa", "nolint", "pragma:", "type: ignore", "pyright:", "mypy:", "rubocop:", "NOLINT", "clippy::",
+            "prettier-ignore", "biome-ignore",
+        ].iter().any(|d| comment.contains(d))
+}
+
+/// Directives that change what gets built, like `//go:noinline`, build constraints, shebangs,
+/// JSX pragmas and bundler hints. They count as code in fingerprints. Linter and type checker
+/// switches don't.
+pub fn is_build_directive(comment: &str) -> bool {
+    let t = comment.trim_start();
+    t.starts_with("//go:") || t.starts_with("// +build") || t.starts_with("//export ") || t.starts_with("//line ")
+        || t.starts_with("#!")
+        // Check single characters first since this runs on every comment.
+        || (t.contains('@') && (t.contains("@jsx") || t.contains("@__PURE__")))
+        || (t.contains('#') && t.contains("#__PURE__"))
+        || (t.contains('*') && t.contains("-*- coding"))
+        || (t.contains("webpack") && t.contains("webpackChunkName"))
+}
+
+/// Attributes, decorators and build directives (on their own line) right before an item.
+fn leading_attributes_and_directives<'t>(node: tree_sitter::Node<'t>, source: &str) -> Vec<tree_sitter::Node<'t>> {
+    let own_line = |p: &tree_sitter::Node| {
+        let start = p.start_byte();
+        source[..start].rsplit('\n').next().is_none_or(|before| before.trim().is_empty())
+    };
+    let mut attrs = Vec::new();
+    let mut prev = node.prev_named_sibling();
+    while let Some(p) = prev.filter(|p| {
+        matches!(p.kind(), "attribute_item" | "decorator")
+            || (is_comment_kind(p.kind()) && own_line(p) && is_build_directive(&source[p.byte_range()]))
+    }) {
+        attrs.push(p);
+        prev = p.prev_named_sibling();
+    }
+    attrs.reverse();
+    attrs
+}
+
 fn leading_attributes(node: tree_sitter::Node) -> Vec<tree_sitter::Node> {
     let mut attrs = Vec::new();
     let mut prev = node.prev_named_sibling();
@@ -705,6 +805,69 @@ fn extend_span_to(span: &mut crate::manifest::Span, attrs: &[tree_sitter::Node])
     }
 }
 
+/// Lines that only have comments, lines inside multi-line strings, and lines with a regex or
+/// `#define`. Uses the syntax tree, so `* rate` continuing an expression or `#define` is code.
+fn comment_and_string_lines(tree: &tree_sitter::Tree, source: &str) -> (HashSet<usize>, HashSet<usize>, LiteralLines) {
+    let bytes = source.as_bytes();
+    let mut in_comment = vec![false; bytes.len()];
+    let mut strings = HashSet::new();
+    let mut literals = LiteralLines::new();
+    // Classify each node kind once, since this visits every node in the file.
+    const OTHER: u8 = 1;
+    const COMMENT: u8 = 2;
+    const STRING: u8 = 3;
+    const REGEX: u8 = 4;
+    const DEFINE: u8 = 5;
+    let mut kinds = vec![0u8; tree.language().node_kind_count() + 1];
+    let mut cursor = tree.root_node().walk();
+    'outer: loop {
+        let n = cursor.node();
+        let id = n.kind_id() as usize;
+        if id < kinds.len() && kinds[id] == 0 {
+            let kind = n.kind();
+            kinds[id] = if is_comment_kind(kind) { COMMENT }
+                else if is_string_kind(kind) { STRING }
+                else if kind == "regex" { REGEX }
+                else if kind.starts_with("preproc_def") || kind == "preproc_function_def" { DEFINE }
+                else { OTHER };
+        }
+        let what = kinds.get(id).copied().unwrap_or(OTHER);
+        if what == COMMENT {
+            in_comment[n.start_byte()..n.end_byte().min(bytes.len())].iter_mut().for_each(|b| *b = true);
+        } else if what == STRING && n.end_position().row > n.start_position().row {
+            strings.extend(n.start_position().row + 2..=n.end_position().row + 1);
+            if cursor.goto_first_child() { continue; }
+        } else if what == REGEX {
+            // Whitespace in a regex is content: `/ +/` vs `/  +/`.
+            if let Some(found) = literals.entry(n.start_position().row + 1).or_insert_with(|| Some(Vec::new())) {
+                found.push(source[n.byte_range()].to_string());
+            }
+        } else if what == DEFINE {
+            // `#define F(x)` is a function-like macro, `#define F (x)` is a constant.
+            for row in n.start_position().row + 1..=n.end_position().row + 1 { literals.insert(row, None); }
+            if cursor.goto_first_child() { continue; }
+        } else if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() { continue 'outer; }
+            if !cursor.goto_parent() { break 'outer; }
+        }
+    }
+    let mut out = HashSet::new();
+    let (mut line, mut any, mut code) = (1, false, false);
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'\n' {
+            if any && !code { out.insert(line); }
+            line += 1; any = false; code = false;
+        } else if !b.is_ascii_whitespace() {
+            if in_comment[i] { any = true } else { code = true }
+        }
+    }
+    if any && !code { out.insert(line); }
+    (out, strings, literals)
+}
+
 fn fingerprint(sem: &mut SemanticTree, tree: &tree_sitter::Tree, source: &str, lang: &dyn LanguageSupport) {
     let root = tree.root_node();
     let mut metas = Vec::with_capacity(sem.items.len());
@@ -712,15 +875,28 @@ fn fingerprint(sem: &mut SemanticTree, tree: &tree_sitter::Tree, source: &str, l
         let node = find_node(root, item.span());
         let mut meta = ItemMeta::default();
         if let Some(node) = node {
-            meta.is_comment = node.kind().contains("comment");
+            meta.is_comment = is_comment_kind(node.kind());
             let mask = item.name().map(bare_name);
-            let attrs = leading_attributes(node);
-            let mut w = walk_tokens(node, source, mask, None);
+            let attrs = leading_attributes_and_directives(node, source);
+            // Find the class's methods (and their attributes) once. The walk below leaves them out of
+            // the shell hash, and each one is fingerprinted on its own further down.
+            let method_nodes: Vec<Option<(tree_sitter::Node, Vec<tree_sitter::Node>)>> = match &*item {
+                SemanticItem::Class { methods, .. } => methods.iter()
+                    .map(|m| find_node(root, m.span()).map(|mn| (mn, leading_attributes_and_directives(mn, source))))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let members: HashSet<usize> = method_nodes.iter().flatten()
+                .flat_map(|(mn, m_attrs)| m_attrs.iter().chain([mn]).map(|n| n.id()))
+                .collect();
+            let mut w = walk_tokens_with(node, source, mask, &[], &members);
+            let mut shell = DefaultHasher::new();
             for a in &attrs {
-                let aw = walk_tokens(*a, source, None, None);
+                let aw = walk_tokens(*a, source, None, &[]);
                 let h = aw.norm.finish();
                 h.hash(&mut w.norm);
                 h.hash(&mut w.shape);
+                h.hash(&mut shell);
                 w.tokens.extend(aw.tokens);
                 w.refs.extend(aw.refs);
                 w.calls.extend(aw.calls);
@@ -745,9 +921,10 @@ fn fingerprint(sem: &mut SemanticTree, tree: &tree_sitter::Tree, source: &str, l
                     *decl_hash = decl_token_hash(node, &attrs, source);
                 }
                 SemanticItem::Class { methods, .. } => {
-                    for m in methods {
-                        let span = m.span().clone();
-                        let Some(mn) = find_node(root, &span) else {
+                    w.shell.finish().hash(&mut shell);
+                    meta.shell_hash = shell.finish();
+                    for (m, found) in methods.iter_mut().zip(&method_nodes) {
+                        let Some((mn, m_attrs)) = found else {
                             meta.method_refs.push(HashSet::new());
                             meta.method_calls.push(HashSet::new());
                             meta.method_binds.push(HashMap::new());
@@ -756,19 +933,18 @@ fn fingerprint(sem: &mut SemanticTree, tree: &tree_sitter::Tree, source: &str, l
                             meta.method_self_fields.push(HashMap::new());
                             continue;
                         };
-                        let mw = walk_tokens(mn, source, None, None);
+                        let mw = walk_tokens(*mn, source, None, &[]);
                         meta.method_refs.push(mw.refs);
                         meta.method_calls.push(mw.calls);
                         meta.method_binds.push(mw.binds);
                         meta.method_returns.push(mw.returns);
                         meta.method_declared.push(mw.declared);
                         meta.method_self_fields.push(mw.self_fields);
-                        let m_attrs = leading_attributes(mn);
                         if let SemanticItem::Function { body_hash, decl_hash, .. } = m {
-                            if let Some(h) = body_token_hash(mn, source) { *body_hash = h; }
-                            *decl_hash = decl_token_hash(mn, &m_attrs, source);
+                            if let Some(h) = body_token_hash(*mn, source) { *body_hash = h; }
+                            *decl_hash = decl_token_hash(*mn, m_attrs, source);
                         }
-                        extend_span_to(m.span_mut(), &m_attrs);
+                        extend_span_to(m.span_mut(), m_attrs);
                     }
                 }
                 _ => {}

@@ -5,12 +5,14 @@
 
 use crate::classify::find_identifier;
 use crate::diff::{is_nontrivial, norm_line};
-use crate::manifest::{ChangeKind, ChangeManifest, DiffHunk, Location, Noise, Side};
-use std::collections::HashMap;
+use crate::manifest::{ChangeKind, ChangeManifest, DiffHunk, Location, Noise, Side, Span};
+use std::collections::{HashMap, HashSet};
 
-/// Consecutive moved-looking lines required before calling a block "moved"
-/// (single lines repeat by coincidence).
+/// How many non-trivial lines have to match in order before a block counts as moved.
+/// Single lines repeat by coincidence.
 const MIN_MOVED_RUN: usize = 3;
+/// Above this many cells (removed lines times added lines) pair lines greedily instead of with a full LCS.
+const MAX_ALIGN_CELLS: usize = 1 << 20;
 
 /// Global context shared by every file's annotation pass.
 #[derive(Default)]
@@ -19,36 +21,178 @@ pub struct AnnotateContext {
     /// callers in any file may reference. Member renames (`Svc.get`) are passed
     /// per file instead: a bare `get` elsewhere is usually a different method.
     pub renames: Vec<(String, String)>,
-    /// Normalized non-trivial removed/added lines across all files.
-    pub removed_lines: HashMap<String, usize>,
-    pub added_lines: HashMap<String, usize>,
+    /// Removed and added code lines across all files, used to find moved code.
+    removed: Runs,
+    added: Runs,
+}
+
+/// A run of changed code lines, normalized. Blank and comment lines are skipped.
+#[derive(Default)]
+struct Runs {
+    runs: Vec<Run>,
+    /// Where each non-trivial normalized line shows up, as (run, position).
+    at: HashMap<String, Vec<(usize, usize)>>,
+}
+
+struct Run {
+    file: usize,
+    lines: Vec<usize>,
+    norms: Vec<String>,
+}
+
+impl Runs {
+    fn push(&mut self, run: Run) {
+        if run.norms.is_empty() { return; }
+        let r = self.runs.len();
+        for (p, n) in run.norms.iter().enumerate() {
+            if is_nontrivial(n) { self.at.entry(n.clone()).or_default().push((r, p)); }
+        }
+        self.runs.push(run);
+    }
 }
 
 impl AnnotateContext {
-    pub fn collect_lines(&mut self, hunks: &[DiffHunk]) {
-        for c in hunks.iter().flat_map(|h| h.changes.iter()) {
-            match c.kind {
-                ChangeKind::Removed => bump(&mut self.removed_lines, c.content_old.as_deref()),
-                ChangeKind::Added => bump(&mut self.added_lines, c.content_new.as_deref()),
-                _ => {}
+    /// Record one file's changed lines.
+    pub fn collect_lines(&mut self, hunks: &[DiffHunk], facts: &FileFacts) {
+        let file = facts.file;
+        for h in hunks {
+            let mut removed = Run { file, lines: Vec::new(), norms: Vec::new() };
+            let mut added = Run { file, lines: Vec::new(), norms: Vec::new() };
+            for c in &h.changes {
+                let Some((side, line, text)) = side_line(c) else {
+                    self.removed.push(std::mem::replace(&mut removed, Run { file, lines: Vec::new(), norms: Vec::new() }));
+                    self.added.push(std::mem::replace(&mut added, Run { file, lines: Vec::new(), norms: Vec::new() }));
+                    continue;
+                };
+                let n = facts.move_key(side, line, text);
+                if n.is_empty() || facts.is_comment(side, line) { continue; }
+                let run = if side == Side::Old { &mut removed } else { &mut added };
+                run.lines.push(line);
+                run.norms.push(n);
             }
+            self.removed.push(removed);
+            self.added.push(added);
         }
     }
 }
 
-fn bump(map: &mut HashMap<String, usize>, line: Option<&str>) {
-    if let Some(l) = line {
-        let n = norm_line(l);
-        if is_nontrivial(&n) {
-            *map.entry(n).or_default() += 1;
+/// Side, line number and text of a changed line. `None` for context lines.
+fn side_line(c: &crate::manifest::Change) -> Option<(Side, usize, &str)> {
+    match c.kind {
+        ChangeKind::Removed => Some((Side::Old, c.old_span.as_ref()?.start_line, c.content_old.as_deref().unwrap_or(""))),
+        ChangeKind::Context => None,
+        _ => Some((Side::New, c.new_span.as_ref()?.start_line, c.content_new.as_deref().unwrap_or(""))),
+    }
+}
+
+/// What annotating one file needs to know about its source.
+pub struct FileFacts<'a> {
+    /// Index of this file in the list of files.
+    pub file: usize,
+    /// Old and new source lines.
+    pub lines: (&'a [&'a str], &'a [&'a str]),
+    /// Comment-only lines of the old and new source (1-based).
+    pub comments: (&'a HashSet<usize>, &'a HashSet<usize>),
+    /// Lines inside a multi-line string. Whitespace matters on these.
+    pub strings: (&'a HashSet<usize>, &'a HashSet<usize>),
+    /// Lines with a regex or a `#define`. The regex text has to match exactly, and for a `#define` (`None`) the whole line does.
+    pub literals: (&'a crate::parser::LiteralLines, &'a crate::parser::LiteralLines),
+    /// (old, new) spans of functions and methods that exist on both sides.
+    /// Code moving around inside one of these is a reorder, not a move.
+    pub bodies: &'a [(Span, Span)],
+    /// Leading whitespace is syntax (Python, YAML).
+    pub indent_sensitive: bool,
+    /// A file we don't parse (Markdown, Makefiles, config). Indentation and trailing whitespace
+    /// can matter there, so only spacing inside a line counts as formatting.
+    pub unparsed: bool,
+}
+
+impl FileFacts<'_> {
+    fn pick<T>(side: Side, pair: (T, T)) -> T {
+        if side == Side::Old { pair.0 } else { pair.1 }
+    }
+
+    fn is_comment(&self, side: Side, line: usize) -> bool {
+        Self::pick(side, self.comments).contains(&line)
+    }
+
+    fn line(&self, side: Side, line: usize) -> Option<&str> {
+        Self::pick(side, self.lines).get(line.checked_sub(1)?).copied()
+    }
+
+    /// Key for comparing lines for formatting. Whitespace between tokens is dropped,
+    /// except inside strings and where indentation matters.
+    fn format_key(&self, side: Side, line: usize, text: &str) -> String {
+        if Self::pick(side, self.strings).contains(&line) {
+            text.to_string()
+        } else if let Some(literal) = Self::pick(side, self.literals).get(&line) {
+            match literal {
+                None => text.trim().to_string(),
+                Some(regexes) => {
+                    // Set the regexes aside, normalize the rest, then add the regexes back as they are.
+                    let mut rest = text.to_string();
+                    for r in regexes { rest = rest.replacen(r.as_str(), "\u{0}", 1); }
+                    let mut key = norm_code_line(&rest, self.indent_sensitive);
+                    for r in regexes { key.push('\u{0}'); key.push_str(r); }
+                    key
+                }
+            }
+        } else if self.unparsed {
+            let mut key = norm_code_line(text, true);
+            key.push_str(&text[text.trim_end().len()..]);
+            key
+        } else {
+            norm_code_line(text, self.indent_sensitive)
         }
     }
+
+    /// Key for comparing lines for moves. All whitespace is dropped, except inside strings.
+    fn move_key(&self, side: Side, line: usize, text: &str) -> String {
+        if Self::pick(side, self.strings).contains(&line) { text.to_string() } else { norm_line(text) }
+    }
+}
+
+/// Changed lines in a function that are the same code in the same order on both sides,
+/// ignoring whitespace. Returns (old lines, new lines) with their noise, moved if the text is
+/// identical and formatting if not. Doing this over the whole function keeps a reformat
+/// dimmed even when git lines things up unevenly. Reorders and edits stay unpaired.
+fn function_formatting(hunks: &[DiffHunk], facts: &FileFacts) -> (HashMap<usize, Noise>, HashMap<usize, Noise>) {
+    let (mut old_changed, mut new_changed) = (Vec::new(), Vec::new());
+    for c in hunks.iter().flat_map(|h| h.changes.iter()) {
+        match side_line(c) {
+            Some((Side::Old, line, _)) => old_changed.push(line),
+            Some((_, line, _)) => new_changed.push(line),
+            None => {}
+        }
+    }
+    let (mut old_fmt, mut new_fmt) = (HashMap::new(), HashMap::new());
+    for (o, n) in facts.bodies {
+        let touched = old_changed.iter().any(|l| o.start_line <= *l && *l <= o.end_line)
+            || new_changed.iter().any(|l| n.start_line <= *l && *l <= n.end_line);
+        if !touched { continue; }
+        let code = |span: &Span, side: Side| -> Vec<(usize, String, &str)> {
+            (span.start_line..=span.end_line)
+                .filter_map(|l| {
+                    let t = facts.line(side, l)?;
+                    (!t.trim().is_empty() && !facts.is_comment(side, l)).then(|| (l, facts.format_key(side, l, t), t))
+                })
+                .collect()
+        };
+        let (a, b) = (code(o, Side::Old), code(n, Side::New));
+        let pairs = align(a.len(), b.len(), |i, j| {
+            (a[i].1 == b[j].1).then_some(if a[i].2 == b[j].2 { Noise::Moved } else { Noise::Formatting })
+        });
+        for (i, j, kind) in pairs {
+            old_fmt.insert(a[i].0, kind);
+            new_fmt.insert(b[j].0, kind);
+        }
+    }
+    (old_fmt, new_fmt)
 }
 
 /// Annotate one file's hunks in place.
 /// `moved_spans` are locations of whole items known to have moved unchanged.
-/// `local_renames` apply to this file only; `indent_sensitive` means leading
-/// whitespace is syntax (Python, YAML), so re-indenting is never formatting.
+/// `local_renames` apply to this file only.
 #[allow(clippy::too_many_arguments)]
 pub fn annotate_file(
     hunks: &mut [DiffHunk],
@@ -56,12 +200,13 @@ pub fn annotate_file(
     moved_spans: &[Location],
     ctx: &AnnotateContext,
     local_renames: &[(String, String)],
+    facts: &FileFacts,
     generated: bool,
     detect_comments: bool,
-    indent_sensitive: bool,
 ) {
     let renames: Vec<(String, String)> = ctx.renames.iter().chain(local_renames).cloned().collect();
-    let opts = BlockOpts { renames: &renames, detect_comments, indent_sensitive };
+    let formatted = if generated { Default::default() } else { function_formatting(hunks, facts) };
+    let opts = BlockOpts { renames: &renames, detect_comments, formatted: &formatted, facts };
     let entry_locs = manifest.locations();
     for hunk in hunks.iter_mut() {
         // Link hunk to manifest entries by changed-line overlap.
@@ -113,7 +258,9 @@ pub fn annotate_file(
 struct BlockOpts<'a> {
     renames: &'a [(String, String)],
     detect_comments: bool,
-    indent_sensitive: bool,
+    /// Lines `function_formatting` paired: (old, new).
+    formatted: &'a (HashMap<usize, Noise>, HashMap<usize, Noise>),
+    facts: &'a FileFacts<'a>,
 }
 
 fn is_change(kind: ChangeKind) -> bool {
@@ -161,49 +308,47 @@ fn annotate_block(block: &mut [crate::manifest::Change], moved_spans: &[Location
         }
     };
 
-    // Blank lines and comments.
+    // Blank lines and comments. Comments come from the parser, so `* rate` continuing an expression is code.
     for c in block.iter_mut() {
         if c.noise.is_some() { continue; }
         let t = text(c);
-        let trimmed = t.trim();
-        if trimmed.is_empty() {
+        if t.trim().is_empty() {
             c.noise = Some(Noise::Formatting);
-        } else if opts.detect_comments && is_comment_line(trimmed) {
-            c.noise = Some(Noise::Comment);
-        }
-    }
-
-    // Pair removed with added lines: identical tokens → formatting; identical
-    // after applying renames → rename.
-    let norm = |t: &str| norm_code_line(t, opts.indent_sensitive);
-    let mut added_by_norm: HashMap<String, Vec<usize>> = HashMap::new();
-    for (k, c) in block.iter().enumerate() {
-        if c.kind == ChangeKind::Added && c.noise.is_none() {
-            added_by_norm.entry(norm(&text(c))).or_default().push(k);
-        }
-    }
-    for k in 0..block.len() {
-        if block[k].kind != ChangeKind::Removed || block[k].noise.is_some() { continue; }
-        let t = text(&block[k]);
-        let norm_t = norm(&t);
-        if let Some(j) = added_by_norm.get_mut(&norm_t).and_then(|v| v.pop()) {
-            block[k].noise = Some(Noise::Formatting);
-            block[j].noise = Some(Noise::Formatting);
-            continue;
-        }
-        if !opts.renames.is_empty() {
-            let renamed = apply_renames(&t, opts.renames);
-            if renamed != t {
-                if let Some(j) = added_by_norm.get_mut(&norm(&renamed)).and_then(|v| v.pop()) {
-                    block[k].noise = Some(Noise::Rename);
-                    block[j].noise = Some(Noise::Rename);
-                }
+        } else if opts.detect_comments && is_comment(c, opts.facts) {
+            if !crate::parser::is_directive(&t) { c.noise = Some(Noise::Comment); }
+        } else if let Some((side, line, _)) = side_line(c) {
+            if let Some(&kind) = FileFacts::pick(side, (&opts.formatted.0, &opts.formatted.1)).get(&line) {
+                c.noise = Some(kind);
             }
         }
     }
 
-    // Moved: inside a known moved item, or a run of lines that appear verbatim
-    // on the opposite side elsewhere in the diff.
+    // Pair removed and added lines in order. Same tokens means formatting, same after renames
+    // means rename. Keeping the order means a reorder or an edited line doesn't get paired
+    // with a similar line somewhere else.
+    let key = |c: &crate::manifest::Change, t: &str| match side_line(c) {
+        Some((side, line, _)) => opts.facts.format_key(side, line, t),
+        None => t.to_string(),
+    };
+    let removed: Vec<usize> = (0..block.len()).filter(|&k| block[k].kind == ChangeKind::Removed && block[k].noise.is_none()).collect();
+    let added: Vec<usize> = (0..block.len()).filter(|&k| block[k].kind != ChangeKind::Removed && block[k].noise.is_none()).collect();
+    let added_keys: Vec<String> = added.iter().map(|&k| key(&block[k], &text(&block[k]))).collect();
+    let removed_keys: Vec<(String, Option<String>)> = removed.iter().map(|&k| {
+        let t = text(&block[k]);
+        let renamed = if opts.renames.is_empty() { t.clone() } else { apply_renames(&t, opts.renames) };
+        (key(&block[k], &t), (renamed != t).then(|| key(&block[k], &renamed)))
+    }).collect();
+    let pairs = align(removed.len(), added.len(), |i, j| {
+        let (plain, renamed) = &removed_keys[i];
+        if *plain == added_keys[j] { Some(Noise::Formatting) } else if renamed.as_ref() == Some(&added_keys[j]) { Some(Noise::Rename) } else { None }
+    });
+    for (i, j, kind) in pairs {
+        block[removed[i]].noise = Some(kind);
+        block[added[j]].noise = Some(kind);
+    }
+
+    // Moved: inside a known moved item, or part of a run of lines that shows up in the
+    // same order on the other side.
     for c in block.iter_mut() {
         if c.noise.is_some() { continue; }
         let (side, line) = match c.kind {
@@ -216,26 +361,100 @@ fn annotate_block(block: &mut [crate::manifest::Change], moved_spans: &[Location
             }
         }
     }
-    let seen_elsewhere = |c: &crate::manifest::Change| -> bool {
-        let n = norm_line(&text(c));
-        if !is_nontrivial(&n) { return false; }
-        let other = if c.kind == ChangeKind::Removed { &ctx.added_lines } else { &ctx.removed_lines };
-        other.contains_key(&n)
-    };
-    let mut k = 0;
-    while k < block.len() {
-        let kind = block[k].kind;
-        let start = k;
-        while k < block.len() && block[k].kind == kind && block[k].noise.is_none() && seen_elsewhere(&block[k]) {
-            k += 1;
-        }
-        if k - start >= MIN_MOVED_RUN {
-            for c in &mut block[start..k] {
-                c.noise = Some(Noise::Moved);
+    for kind in [ChangeKind::Removed, ChangeKind::Added] {
+        mark_moved_runs(block, kind, ctx, opts);
+    }
+}
+
+fn is_comment(c: &crate::manifest::Change, facts: &FileFacts) -> bool {
+    side_line(c).is_some_and(|(side, line, _)| facts.is_comment(side, line))
+}
+
+/// Pairs `n` removed lines with `m` added lines, keeping both in order (longest common
+/// subsequence). `pair(i, j)` says whether two lines match and how.
+fn align(n: usize, m: usize, pair: impl Fn(usize, usize) -> Option<Noise>) -> Vec<(usize, usize, Noise)> {
+    if n == 0 || m == 0 { return vec![]; }
+    let mut out = Vec::new();
+    if n.saturating_mul(m) > MAX_ALIGN_CELLS {
+        // Greedy: each removed line takes the next added line that matches.
+        let mut next = 0;
+        for i in 0..n {
+            if let Some((j, kind)) = (next..m).find_map(|j| pair(i, j).map(|k| (j, k))) {
+                out.push((i, j, kind));
+                next = j + 1;
             }
         }
-        if k == start {
-            k += 1;
+        return out;
+    }
+    // Longest common subsequence, filled from the end so we can walk it forward.
+    let mut len = vec![0u32; (n + 1) * (m + 1)];
+    let at = |i: usize, j: usize| i * (m + 1) + j;
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            len[at(i, j)] = if pair(i, j).is_some() { len[at(i + 1, j + 1)] + 1 } else { len[at(i + 1, j)].max(len[at(i, j + 1)]) };
+        }
+    }
+    let (mut i, mut j) = (0, 0);
+    while i < n && j < m {
+        match pair(i, j) {
+            Some(kind) if len[at(i, j)] == len[at(i + 1, j + 1)] + 1 => { out.push((i, j, kind)); i += 1; j += 1; }
+            _ if len[at(i + 1, j)] >= len[at(i, j + 1)] => i += 1,
+            _ => j += 1,
+        }
+    }
+    out
+}
+
+/// Marks runs of `kind` lines that show up in the same order in the other side's changes.
+/// A run that only moved inside one function is a reorder, which can change behavior,
+/// so it stays visible.
+fn mark_moved_runs(block: &mut [crate::manifest::Change], kind: ChangeKind, ctx: &AnnotateContext, opts: &BlockOpts) {
+    let is_kind = |c: &crate::manifest::Change| (c.kind == ChangeKind::Removed) == (kind == ChangeKind::Removed);
+    // This side's code lines, in order: (index in block, line number, normalized text).
+    let seq: Vec<(usize, usize, String)> = block.iter().enumerate()
+        .filter(|(_, c)| is_kind(c) && !matches!(c.noise, Some(Noise::Comment)))
+        .filter_map(|(k, c)| {
+            let (side, line, text) = side_line(c)?;
+            let n = opts.facts.move_key(side, line, text);
+            (!n.is_empty()).then_some((k, line, n))
+        })
+        .collect();
+    let other = if kind == ChangeKind::Removed { &ctx.added } else { &ctx.removed };
+    let mut i = 0;
+    while i < seq.len() {
+        let mut best = 0;
+        if block[seq[i].0].noise.is_none() {
+            for &(r, p) in other.at.get(&seq[i].2).map(Vec::as_slice).unwrap_or_default().iter().take(64) {
+                let run = &other.runs[r];
+                let mut l = 0;
+                while i + l < seq.len() && p + l < run.norms.len() && seq[i + l].2 == run.norms[p + l] {
+                    l += 1;
+                }
+                if l <= best || seq[i..i + l].iter().filter(|x| is_nontrivial(&x.2)).count() < MIN_MOVED_RUN {
+                    continue;
+                }
+                let here = (seq[i].1, seq[i + l - 1].1);
+                let there = (run.lines[p], run.lines[p + l - 1]);
+                let (old, new) = if kind == ChangeKind::Removed { (here, there) } else { (there, here) };
+                // Inside the function, below its first line. A whole function moving is still a move.
+                let inside = |s: &Span, side: Side, (a, b): (usize, usize)| {
+                    let head = (s.start_line..=s.end_line)
+                        .find(|&l| opts.facts.line(side, l).is_some_and(|t| !t.trim().is_empty()) && !opts.facts.is_comment(side, l))
+                        .unwrap_or(s.start_line);
+                    head < a && b <= s.end_line
+                };
+                let reordered = run.file == opts.facts.file
+                    && opts.facts.bodies.iter().any(|(o, n)| inside(o, Side::Old, old) && inside(n, Side::New, new));
+                if !reordered { best = l; }
+            }
+        }
+        if best > 0 {
+            for x in &seq[i..i + best] {
+                if block[x.0].noise.is_none() { block[x.0].noise = Some(Noise::Moved); }
+            }
+            i += best;
+        } else {
+            i += 1;
         }
     }
 }
@@ -288,19 +507,6 @@ fn norm_code_line(line: &str, indent_sensitive: bool) -> String {
 pub fn is_indent_sensitive(path: &str) -> bool {
     let ext = path.rsplit('.').next().unwrap_or("");
     matches!(ext, "py" | "pyi" | "pyw" | "yaml" | "yml" | "coffee" | "pug" | "sass" | "haml" | "nim")
-}
-
-fn is_comment_line(t: &str) -> bool {
-    t.starts_with("//")
-        || t.starts_with("/*")
-        || t.starts_with("*/")
-        || t == "*"
-        || t.starts_with("* ")
-        || t == "#"
-        || t.starts_with("# ")
-        || t.starts_with("#!") && !t.starts_with("#![")
-        || t.starts_with("<!--")
-        || t.starts_with("-- ")
 }
 
 /// Replace every identifier occurrence of an old name with its new name.
