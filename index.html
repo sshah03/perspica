@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>perspica examples</title>
+<meta name="description" content="Real pull requests from popular open source projects, reviewed with perspica.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cg fill='none' stroke-linecap='round' transform='translate(1.4 -1)'%3E%3Cpath stroke='%2357606a' stroke-width='2.8' d='M7.6 13.8V28.4'/%3E%3Ccircle stroke='%2357606a' stroke-width='2.8' cx='15.2' cy='13.8' r='7.6'/%3E%3Cpath stroke='%2358a6ff' stroke-width='3' d='M11.3 13.8h7.8'/%3E%3C/g%3E%3C/svg%3E">
+<style>
+:root {
+    color-scheme: light;
+    --bg-0: #ffffff; --bg-1: #f6f8fa; --border: #d0d7de;
+    --text-0: #1f2328; --text-1: #31363b; --text-2: #59636e;
+    --accent: #0969da; --add: #1a7f37; --del: #cf222e; --chip: #ddf4ff; --chip-fg: #0550ae;
+    --font: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+    :root {
+        color-scheme: dark;
+        --bg-0: #0d1117; --bg-1: #161b22; --border: #30363d;
+        --text-0: #e6edf3; --text-1: #c9d1d9; --text-2: #8b949e;
+        --accent: #58a6ff; --add: #56d364; --del: #f85149; --chip: #1f6feb26; --chip-fg: #79c0ff;
+    }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg-0); color: var(--text-0); font-family: var(--font); line-height: 1.5; }
+main { max-width: 1040px; margin: 0 auto; padding: 48px 16px 64px; }
+header h1 { font-size: 28px; margin: 0 0 8px; letter-spacing: -0.01em; }
+header h1 a { color: inherit; text-decoration: none; }
+header p { margin: 0 0 8px; color: var(--text-1); max-width: 720px; }
+header .small { color: var(--text-2); font-size: 14px; }
+code { font-family: var(--mono); font-size: 0.9em; background: var(--bg-1); border: 1px solid var(--border); padding: 1px 6px; border-radius: 6px; }
+a { color: var(--accent); }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 460px), 1fr)); gap: 16px; margin-top: 32px; }
+.card { display: flex; flex-direction: column; gap: 10px; padding: 18px; background: var(--bg-1); border: 1px solid var(--border); border-radius: 10px; }
+.meta { display: flex; gap: 8px; align-items: center; font-size: 13px; color: var(--text-2); min-width: 0; }
+.lang { background: var(--chip); color: var(--chip-fg); font-weight: 600; padding: 1px 8px; border-radius: 999px; flex: none; }
+.repo { font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.card h2 { font-size: 17px; margin: 0; line-height: 1.35; }
+.card h2 a { color: var(--text-0); text-decoration: none; }
+.card h2 a:hover { color: var(--accent); }
+.hook { margin: 0; color: var(--text-0); font-size: 15px; font-weight: 500; padding-left: 10px; border-left: 3px solid var(--accent); }
+.summary { margin: 0; color: var(--text-2); font-size: 14px; flex: 1; }
+.stats { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 13px; color: var(--text-2); }
+.stats b { color: var(--text-0); font-weight: 600; }
+.add { color: var(--add); } .del { color: var(--del); }
+.links { display: flex; gap: 16px; font-size: 14px; }
+.links .open { font-weight: 600; text-decoration: none; }
+.links a:hover { text-decoration: underline; }
+footer { margin-top: 40px; color: var(--text-2); font-size: 13px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1><a href="https://github.com/sshah03/perspica">perspica</a> examples</h1>
+    <p>Real pull requests from popular open source projects, reviewed with perspica. Click one to see the full review.</p>
+    <p class="small">The reading order, the mechanical changes and the checks come from perspica on its own. The summary and notes come from Claude Opus 5.5. To try it on your own code, run <code>cargo install perspica</code>, then <code>perspica --pr 123 --web</code> in your repo.</p>
+  </header>
+  <section class="grid">
+      <article class="card">
+        <div class="meta"><span class="lang">TSX</span><span class="repo">pmndrs/react-three-fiber</span></div>
+        <h2><a href="examples/react-three-fiber-4008.html">refactor(fiber): clarify v9 core domain boundaries</a></h2>
+        <p class="hook">393 of the 545 changed lines are moves and reformatting. You only need to read 152.</p>
+        <p class="summary">Backports v10&#x27;s core file layout to v9. Constructor registration moves to extend.ts, renderer creation and release move to renderer.ts, React helpers move to utils/react.tsx, and followDpr moves to configuration.ts.</p>
+        <div class="stats">
+          <span>16 files</span><span class="add">+307</span><span class="del">−238</span>
+          <span><b>152</b> to review</span><span><b>393</b> mechanical</span><span><b>4</b> notes</span>
+        </div>
+        <div class="links"><a class="open" href="examples/react-three-fiber-4008.html">Open the review</a><a class="gh" href="https://github.com/pmndrs/react-three-fiber/pull/4008">PR on GitHub</a></div>
+      </article>
+      <article class="card">
+        <div class="meta"><span class="lang">Rust</span><span class="repo">BurntSushi/ripgrep</span></div>
+        <h2><a href="examples/ripgrep-3189.html">ignore: fix global gitignore bug that arises with absolute paths</a></h2>
+        <p class="hook">Flags that <code>--ignore-file</code> still uses the process directory, because <code>add_ignore</code> runs before <code>current_dir</code>.</p>
+        <p class="summary">Global gitignores (core.excludesFile and WalkBuilder::add_ignore / --ignore-file) were rooted at an empty path, so anchored patterns failed when ripgrep searched an absolute path. They are now rooted at the CWD.</p>
+        <div class="stats">
+          <span>6 files</span><span class="add">+213</span><span class="del">−11</span>
+          <span><b>109</b> to review</span><span><b>98</b> mechanical</span><span><b>5</b> notes</span>
+        </div>
+        <div class="links"><a class="open" href="examples/ripgrep-3189.html">Open the review</a><a class="gh" href="https://github.com/BurntSushi/ripgrep/pull/3189">PR on GitHub</a></div>
+      </article>
+      <article class="card">
+        <div class="meta"><span class="lang">Python</span><span class="repo">pallets/flask</span></div>
+        <h2><a href="examples/flask-5818.html">pass context through dispatch methods</a></h2>
+        <p class="hook">Flags that <code>update_template_context</code> was left out of the compat list.</p>
+        <p class="summary">Flask request-dispatch methods (dispatch, error handling, pre/post-processing, teardown, template context) now take the active AppContext as an explicit first parameter instead of reading proxies, to speed up dispatch.</p>
+        <div class="stats">
+          <span>6 files</span><span class="add">+167</span><span class="del">−72</span>
+          <span><b>197</b> to review</span><span><b>32</b> mechanical</span><span><b>5</b> notes</span>
+        </div>
+        <div class="links"><a class="open" href="examples/flask-5818.html">Open the review</a><a class="gh" href="https://github.com/pallets/flask/pull/5818">PR on GitHub</a></div>
+      </article>
+      <article class="card">
+        <div class="meta"><span class="lang">Scala</span><span class="repo">typelevel/fs2</span></div>
+        <h2><a href="examples/fs2-3681.html">feature: support process stream redirection and error stream merging </a></h2>
+        <p class="hook">Flags that <code>Discard</code> on stdin breaks on the JVM.</p>
+        <p class="summary">Adds a public <code>Redirect</code> ADT (Pipe, Inherit, Discard, FromPath, ToPath) and stdio redirection, <code>redirectErrorStream</code> and <code>inheritStdio</code> options to <code>ProcessBuilder</code>.</p>
+        <div class="stats">
+          <span>7 files</span><span class="add">+349</span><span class="del">−67</span>
+          <span><b>200</b> to review</span><span><b>131</b> mechanical</span><span><b>5</b> notes</span>
+        </div>
+        <div class="links"><a class="open" href="examples/fs2-3681.html">Open the review</a><a class="gh" href="https://github.com/typelevel/fs2/pull/3681">PR on GitHub</a></div>
+      </article>
+      <article class="card">
+        <div class="meta"><span class="lang">Java</span><span class="repo">jhy/jsoup</span></div>
+        <h2><a href="examples/jsoup-2618.html">Fixed HTML parser edge cases and streamlined node insertion</a></h2>
+        <p class="hook">Tests reach all 20 changed functions.</p>
+        <p class="summary">Character tokens in table contexts now go through insertNode, so misplaced text is foster-parented before the table, as the HTML spec requires. Frameset modes keep only the whitespace from mixed text, and &#x27;&lt;!doctypehtml&gt;&#x27; now gets the name &#x27;html&#x27;.</p>
+        <div class="stats">
+          <span>7 files</span><span class="add">+207</span><span class="del">−95</span>
+          <span><b>158</b> to review</span><span><b>73</b> mechanical</span><span><b>5</b> notes</span>
+        </div>
+        <div class="links"><a class="open" href="examples/jsoup-2618.html">Open the review</a><a class="gh" href="https://github.com/jhy/jsoup/pull/2618">PR on GitHub</a></div>
+      </article>
+      <article class="card">
+        <div class="meta"><span class="lang">Java</span><span class="repo">apache/spark</span></div>
+        <h2><a href="examples/spark-59118.html">[SPARK-59831][SQL] Validate bounds in the vectorized BYTE_STREAM_SPLIT reader</a></h2>
+        <p class="hook">Tests reach 30 of the 31 changed functions.</p>
+        <p class="summary">VectorizedByteStreamSplitValuesReader now throws ParquetDecodingException on corrupt pages. It rejects a page whose length is not a multiple of the value width, a page with more encoded values than the page count, and, for required columns, a count mismatch.</p>
+        <div class="stats">
+          <span>6 files</span><span class="add">+594</span><span class="del">−39</span>
+          <span><b>87</b> to review</span><span><b>123</b> mechanical</span><span><b>3</b> notes</span>
+        </div>
+        <div class="links"><a class="open" href="examples/spark-59118.html">Open the review</a><a class="gh" href="https://github.com/apache/spark/pull/59118">PR on GitHub</a></div>
+      </article>
+      <article class="card">
+        <div class="meta"><span class="lang">JavaScript</span><span class="repo">sindresorhus/execa</span></div>
+        <h2><a href="examples/execa-1251.html">Move away from `cross-spawn`</a></h2>
+        <p class="hook">Flags that line breaks in arguments now throw on Windows, which the PR doesn't mention.</p>
+        <p class="summary">Removes the cross-spawn dependency (fixes #578). Its Windows logic is reimplemented in lib/arguments/command-file.js: PATH/PATHEXT resolution via which, shebang emulation, and cmd.exe argument escaping. normalizeOptions now calls parseCommandFile.</p>
+        <div class="stats">
+          <span>11 files</span><span class="add">+540</span><span class="del">−8</span>
+          <span><b>132</b> to review</span><span><b>189</b> mechanical</span><span><b>5</b> notes</span>
+        </div>
+        <div class="links"><a class="open" href="examples/execa-1251.html">Open the review</a><a class="gh" href="https://github.com/sindresorhus/execa/pull/1251">PR on GitHub</a></div>
+      </article>
+      <article class="card">
+        <div class="meta"><span class="lang">C</span><span class="repo">jqlang/jq</span></div>
+        <h2><a href="examples/jq-3539.html">fix(jv): guard deep structural equality recursion</a></h2>
+        <p class="hook">Flags that the new depth limit also changes sort, group and unique, which the PR doesn't mention.</p>
+        <p class="summary">Adds 10000-level depth guards to structural equality (jvp_equal) and ordering comparison (jvp_cmp). Past that depth, jv_equal returns -1 and jv_cmp returns INT_MIN instead of exhausting the C stack.</p>
+        <div class="stats">
+          <span>4 files</span><span class="add">+180</span><span class="del">−28</span>
+          <span><b>169</b> to review</span><span><b>22</b> mechanical</span><span><b>5</b> notes</span>
+        </div>
+        <div class="links"><a class="open" href="examples/jq-3539.html">Open the review</a><a class="gh" href="https://github.com/jqlang/jq/pull/3539">PR on GitHub</a></div>
+      </article>
+      <article class="card">
+        <div class="meta"><span class="lang">Go</span><span class="repo">junegunn/fzf</span></div>
+        <h2><a href="examples/fzf-4891.html">Restore bracketed paste mode instead of forcing it off</a></h2>
+        <p class="hook">Flags that the new 500ms startup timeout isn't in the PR title.</p>
+        <p class="summary">fzf now sends a DECRQM query for bracketed paste mode together with the cursor-position query at startup, in one round trip. On exit it restores the mode instead of always turning it off, which fixes pasting in shell line-editor widgets.</p>
+        <div class="stats">
+          <span>9 files</span><span class="add">+192</span><span class="del">−55</span>
+          <span><b>119</b> to review</span><span><b>109</b> mechanical</span><span><b>5</b> notes</span>
+        </div>
+        <div class="links"><a class="open" href="examples/fzf-4891.html">Open the review</a><a class="gh" href="https://github.com/junegunn/fzf/pull/4891">PR on GitHub</a></div>
+      </article>
+      <article class="card">
+        <div class="meta"><span class="lang">TypeScript</span><span class="repo">honojs/hono</span></div>
+        <h2><a href="examples/hono-5237.html">refactor: Reduce TrieRouter bundle size without a meaningful performance regression</a></h2>
+        <p class="hook">Flags that <code>Node.insert</code> no longer returns the node, which can break outside callers.</p>
+        <p class="summary">Shrinks TrieRouter&#x27;s minified bundle by about 276 B. It drops the Node and TrieRouter constructors, moves score ordering to a module-level counter, stores child nodes in #patterns in place of pattern keys, and simplifies search bookkeeping.</p>
+        <div class="stats">
+          <span>3 files</span><span class="add">+49</span><span class="del">−97</span>
+          <span><b>111</b> to review</span><span><b>20</b> mechanical</span><span><b>4</b> notes</span>
+        </div>
+        <div class="links"><a class="open" href="examples/hono-5237.html">Open the review</a><a class="gh" href="https://github.com/honojs/hono/pull/5237">PR on GitHub</a></div>
+      </article>
+      <article class="card">
+        <div class="meta"><span class="lang">C#</span><span class="repo">jellyfin/jellyfin</span></div>
+        <h2><a href="examples/jellyfin-18090.html">Reconcile missing episodes by episode, not by number</a></h2>
+        <p class="hook">53 of the 215 changed lines are mechanical and 77 are tests, so 85 are left to read.</p>
+        <p class="summary">Missing-episode reconciliation now matches episodes by provider id across the whole series, not just by season and episode number. This stops virtual episodes from being kept when the files use a different order (aired, DVD or absolute).</p>
+        <div class="stats">
+          <span>4 files</span><span class="add">+202</span><span class="del">−13</span>
+          <span><b>85</b> to review</span><span><b>53</b> mechanical</span><span><b>5</b> notes</span>
+        </div>
+        <div class="links"><a class="open" href="examples/jellyfin-18090.html">Open the review</a><a class="gh" href="https://github.com/jellyfin/jellyfin/pull/18090">PR on GitHub</a></div>
+      </article>
+      <article class="card">
+        <div class="meta"><span class="lang">Kotlin</span><span class="repo">square/okhttp</span></div>
+        <h2><a href="examples/okhttp-9656.html">Handle unsupported AliasMode records</a></h2>
+        <p class="hook">Flags that an unexpected question type now throws on the DNS callback thread.</p>
+        <p class="summary">OkHttp doesn&#x27;t implement HTTPS AliasMode (priority 0). With this change, StateMachineDnsCall ignores every record in an HTTPS response that contains an AliasMode record. Records are now filtered by the question&#x27;s type, so mismatched records are dropped.</p>
+        <div class="stats">
+          <span>3 files</span><span class="add">+129</span><span class="del">−29</span>
+          <span><b>31</b> to review</span><span><b>40</b> mechanical</span><span><b>4</b> notes</span>
+        </div>
+        <div class="links"><a class="open" href="examples/okhttp-9656.html">Open the review</a><a class="gh" href="https://github.com/square/okhttp/pull/9656">PR on GitHub</a></div>
+      </article>
+  </section>
+  <footer>Made with <a href="https://github.com/sshah03/perspica">perspica</a>. The code belongs to each project.</footer>
+</main>
+</body>
+</html>
