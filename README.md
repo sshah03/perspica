@@ -132,7 +132,7 @@ Options:
       --port <PORT>          Port for web viewer (the next free port is used if taken) [default: 7890]
       --no-open              Don't open a browser tab (web mode)
       --no-color             Disable colored output
-      --show-noise           Show mechanical hunks (formatting, renames, moves) in full in the terminal
+      --show-noise           Show mechanical changes (formatting, renames, moves) in full in the terminal
       --staged               Diff staged changes
       --git [<GIT>]          Diff working tree against HEAD, or specify a commit range (a..b, a...b, or a ref)
       --pr <PR>              Review a GitHub pull request by number (uses the `gh` CLI)

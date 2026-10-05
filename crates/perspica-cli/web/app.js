@@ -354,6 +354,14 @@ function buildIntentGroups() {
     }
 }
 
+/** Lines added and removed across some hunks, shown like GitHub's `+12 −3`. */
+function lineStats(list) {
+    let add = 0, del = 0;
+    for (const { fi, hi } of list) for (const c of S.data.results[fi].hunks[hi].changes) { if (c.kind === 'added') add++; else if (c.kind === 'removed') del++; }
+    return { add, del };
+}
+const statsHtml = ({ add, del }) => add || del ? `<span class="stats"><span class="a">+${add}</span><span class="d">−${del}</span></span>` : '';
+
 function groupHunks(gi) {
     const out = [];
     for (const [k, g] of hunkGroup) if (g === gi) { const [fi, hi] = k.split(':').map(Number); out.push({ fi, hi }); }
@@ -711,7 +719,8 @@ function renderGroupList() {
     let html = '';
     groups.forEach((g, gi) => {
         const reviewed = !!S.groupsReviewed[g.key];
-        const hunks = groupHunks(gi).length;
+        const hunks = groupHunks(gi);
+        const st = lineStats(hunks);
         const entries = renderGroupEntries(g);
         // Reading-order steps are one line each; their entries are a click away.
         const folded = g.mechanical || g.key.startsWith('flow:') || reviewed;
@@ -720,7 +729,7 @@ function renderGroupList() {
                 <span class="chev" data-group-toggle title="Show entries">▼</span><span class="num">${gi + 1}</span>
                 <span class="title${g.flow ? ' flow-title' : ''}"${g.flow ? ` style="padding-left:${Math.min(g.flow.depth, 6) * 10}px" title="${esc(g.label)} · ${esc(g.flow.file)}"` : ''}>${g.flow ? `<span class="flow-name">${g.flow.depth ? '<span class="flow-depth">└ </span>' : ''}${flowLabel(g.label)}</span><span class="flow-file">${esc(baseName(g.flow.file))}</span>` : esc(g.label)}${g.note && !g.flow ? `<span class="note" title="${esc(g.note)}">${richText(g.note, false)}</span>` : ''}</span>
                 ${riskHtml(g.risk)}${g.origin === 'autonomous' ? originChip(g) : ''}
-                <span class="n" title="${hunks} hunk${pl(hunks)}">${g.ids.length || hunks}</span>
+                <span class="n" title="+${st.add} −${st.del} lines">${g.ids.length || hunks.length}</span>
             </div>
             <div class="toc-body">${entries}</div>
         </div>`;
@@ -753,7 +762,11 @@ function unclassifiedFiles() {
             const b = h.noise || r.review.generated ? 'mechanical' : h.test || r.review.role === 'test' ? 'tests' : r.review.role === 'docs' ? 'docs' : 'other';
             (buckets[b] = buckets[b] || []).push(h);
         });
-        for (const [b, hs] of Object.entries(buckets)) out[b].push({ fi, path: d.files[fi].new_path, hunks: hs.length, line: hs[0].new_range.start || hs[0].old_range.start || 1 });
+        for (const [b, hs] of Object.entries(buckets)) {
+            const add = hs.reduce((n, h) => n + h.changes.filter(c => c.kind === 'added').length, 0);
+            const del = hs.reduce((n, h) => n + h.changes.filter(c => c.kind === 'removed').length, 0);
+            out[b].push({ fi, path: d.files[fi].new_path, add, del, line: hs[0].new_range.start || hs[0].old_range.start || 1 });
+        }
     });
     return out;
 }
@@ -766,7 +779,7 @@ function changeListCount() {
 function renderChangeList() {
     const files = unclassifiedFiles();
     const fileRow = (f) => `<div class="toc-row entry" data-jump-file="${esc(f.path)}" data-jump-line="${f.line}" data-filter="${esc(f.path.toLowerCase())}" title="${esc(f.path)}">
-        <span class="ic">▤</span><span class="txt">${esc(baseName(f.path))}${f.hunks > 1 ? ` · ${f.hunks} hunks` : ''}</span><span class="loc">${esc(f.path.split('/').slice(0, -1).join('/'))}</span></div>`;
+        <span class="ic">▤</span><span class="txt">${esc(baseName(f.path))} ${statsHtml(f)}</span><span class="loc">${esc(f.path.split('/').slice(0, -1).join('/'))}</span></div>`;
     const section = (label, n, body, collapsed) => `<div class="toc-group${collapsed ? ' collapsed' : ''}"><div class="toc-head" data-group-toggle><span class="chev">▼</span><span class="title">${esc(label)}</span><span class="n">${n}</span></div>
             <div class="toc-body">${body}</div></div>`;
     let html = '';
@@ -901,7 +914,7 @@ function fileHeadHtml(fi) {
 
 function groupHeadHtml(g, gi) {
     const reviewed = !!S.groupsReviewed[g.key];
-    const n = groupHunks(gi).length;
+    const st = lineStats(groupHunks(gi));
     const f = g.flow;
     const depth = f ? `<span class="flow-depth">${'  '.repeat(Math.min(f.depth, 8))}${f.depth ? '└ ' : ''}</span>` : '';
     let reach = '';
@@ -914,7 +927,7 @@ function groupHeadHtml(g, gi) {
         <span class="chev">▼</span><span class="num">${gi + 1}.</span>${depth}<span class="title">${esc(g.label)}</span>
         ${f ? `<span class="flow-file">${esc(shortPath(f.file))}</span>` : ''}${reach}
         ${riskHtml(g.risk)}${originChip(g)}
-        <span class="spacer"></span><span class="tag">${n} hunk${pl(n)}</span>
+        <span class="spacer"></span>${statsHtml(st)}
         <label class="viewed-toggle" title="Mark as viewed (v)"><input type="checkbox" data-group-reviewed="${gi}"${reviewed ? ' checked' : ''}><span>Viewed</span></label>
     </div>`;
 }
@@ -985,7 +998,7 @@ function renderSectionBody(section) {
     if (key[0] === 'f') html = renderFileBody(+key.slice(1));
     else {
         const hs = groupHunks(+key.slice(1));
-        html = hs.length ? renderHunkList(hs, true) : intro ? '' : '<div class="section-note">No diff hunks in this group.</div>';
+        html = hs.length ? renderHunkList(hs, true) : intro ? '' : '<div class="section-note">No changes to show in this group.</div>';
     }
     body.innerHTML = intro + html;
     body.querySelectorAll('.hunk').forEach(h => hunkObserver?.observe(h));
@@ -1047,7 +1060,7 @@ function noiseRunHtml(run, withFile) {
     const kinds = [...new Set(run.map(({ fi, hi }) => NOISE_LABEL[S.data.results[fi].hunks[hi].noise] || 'mechanical'))];
     const keys = run.map(({ fi, hi }) => fi + ':' + hi).join(',');
     return `<div class="noise-run" data-run="${keys}" data-with-file="${withFile ? 1 : 0}">
-        <div class="noise-row">${run.length} mechanical hunks · ${lines} line${pl(lines)} · ${esc(kinds.join(', '))} <button class="link-btn" data-open-run>show</button></div>
+        <div class="noise-row">${run.length} mechanical changes · ${lines} line${pl(lines)} · ${esc(kinds.join(', '))} <button class="link-btn" data-open-run>show</button></div>
         <div class="run-body">${run.map(({ fi, hi }) => renderHunk(fi, hi, withFile)).join('')}</div>
     </div>`;
 }
@@ -1282,7 +1295,7 @@ function updateNavCounter() {
     const cur = list.indexOf(order[S.currentHunk]);
     document.getElementById('nav-counter').textContent = list.length
         ? `${cur >= 0 ? `Change ${cur + 1} of ${list.length}` : `${list.length} change${pl(list.length)}`}${S.hideNoise && list.length < order.length ? ` · ${order.length - list.length} mechanical hidden` : ''}`
-        : (order.length ? `${order.length} mechanical hunk${pl(order.length)} hidden` : 'No changes');
+        : (order.length ? `${order.length} mechanical change${pl(order.length)} hidden` : 'No changes');
     const k = order[S.currentHunk];
     document.getElementById('nav-location').textContent = k ? S.data.files[+k.split(':')[0]].new_path : '';
     markCurrent();

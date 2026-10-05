@@ -57,7 +57,7 @@ struct Cli {
     #[arg(long)]
     no_color: bool,
 
-    /// Show mechanical hunks (formatting, renames, moves) in full in the terminal
+    /// Show mechanical changes (formatting, renames, moves) in full in the terminal
     #[arg(long)]
     show_noise: bool,
 
@@ -440,7 +440,11 @@ fn enrich_with_repo_references(multi: &mut MultiFileResult, target: &git::Target
         .map(|s| perspica_core::cross_file::call_name(&s.name).to_string())
         .filter(|n| n.len() >= 3)
         .collect();
-    let mut names: Vec<&str> = vanished.iter().map(|v| v.0.as_str()).chain(sig_names.iter().map(String::as_str)).collect();
+    // Skip multi-line names like a destructuring pattern `{ a, b }`. They can never match a single
+    // line, and git grep splits them into patterns like `{` that match almost every line.
+    let mut names: Vec<&str> = vanished.iter().map(|v| v.0.as_str()).chain(sig_names.iter().map(String::as_str))
+        .filter(|n| !n.contains('\n'))
+        .collect();
     names.sort_unstable();
     names.dedup();
     if names.is_empty() {

@@ -299,12 +299,15 @@ pub(crate) fn detect_broken_references(
     for (name, renamed_to, origin, owner) in vanished_names(analyses, moves) {
         // A changelog names old things on purpose.
         for a in analyses.iter().filter(|a| !crate::roles::is_changelog_path(&a.path)) {
+            // Most files never mention the name, so find references first and only then run the other checks.
+            let found = scan_references_in(&a.new_source, &name, owner.as_deref(), &origin, &a.path);
+            if found.is_empty() { continue; }
             // `const name = …`, `name := …`, a `name` parameter or field: this file's own name explains its
             // bare mentions, not a qualified call like `opts.name()` (a method can't be the local).
             let declares = declares_name(&a.new_source, &name) || imports_name_from_elsewhere(&a.new_source, &a.path, &name, &origin);
             // In Go, `name.X` in a file that is or imports package `name` is the package (`stacktrace.Take`).
             let go_pkg = a.path.ends_with(".go") && go_package_named(&a.new_source, &name);
-            let refs = scan_references_in(&a.new_source, &name, owner.as_deref(), &origin, &a.path).into_iter()
+            let refs = found.into_iter()
                 .filter(|(_, text)| !(go_pkg && go_package_mention(text, &name)))
                 .filter(|(_, text)| !declares || qualified_mention(text, &name));
             for (line, text) in refs.take(5) {
@@ -337,6 +340,8 @@ pub(crate) fn detect_signature_impacts(
     next_id: &mut ManifestEntryId,
 ) -> Vec<SignatureImpactEntry> {
     let mut impacts = Vec::new();
+    // Each file's code with comments and strings blanked out, computed once when a file needs it.
+    let masks: Vec<std::cell::OnceCell<String>> = analyses.iter().map(|_| std::cell::OnceCell::new()).collect();
     // Names the change renames (`stacktrace` → `Stack`), so a parameter of a renamed type isn't a changed type.
     let renames: HashMap<String, String> = analyses.iter()
         .flat_map(|a| a.result.manifest.renames.iter())
@@ -380,7 +385,11 @@ pub(crate) fn detect_signature_impacts(
                 .filter(|o| o.path != a.path && o.new_tree.items.iter().any(|i| matches!(i, SemanticItem::Function { .. }) && i.name().map(bare_name) == Some(callee)))
                 .map(|o| o.path.as_str())
                 .collect();
-            for b in analyses {
+            for (bi, b) in analyses.iter().enumerate() {
+                // A file that never mentions the name can't call it.
+                if !b.new_source.contains(callee) {
+                    continue;
+                }
                 // Only code can call it, and a private function only from its own file.
                 if !b.result.review.parsed || (!exported && !private_reaches(&a.path, &b.path) && !includes_file(&b.new_source, &a.path)) {
                     continue;
@@ -392,9 +401,9 @@ pub(crate) fn detect_signature_impacts(
                 }
                 let added = added_lines(&b.result.hunks);
                 let accept = |q: Option<&str>| call_qualifier_ok_from(q, &a.path, &callee_sig, &b.path);
-                let masked = code_only(&b.new_source);
+                let masked = masks[bi].get_or_init(|| code_only(&b.new_source));
                 let elsewhere = b.path != a.path && imports_it_elsewhere(&b.new_source, &b.path, &a.path, callee);
-                for (line, text, open) in scan_calls_at(&b.new_source, &masked, callee, &accept) {
+                for (line, text, open) in scan_calls_at(&b.new_source, masked, callee, &accept) {
                     if b.path == a.path && line == sig.location.line_start { continue; }
                     if elsewhere && unqualified_call(&text, callee) { continue; }
                     let args = call_arguments(&masked[open..], &b.path);

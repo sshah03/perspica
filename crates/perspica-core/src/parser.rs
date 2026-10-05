@@ -258,6 +258,8 @@ struct TokenWalk {
     norm: DefaultHasher,
     /// `norm` without the `members` subtrees (the class without its methods).
     shell: DefaultHasher,
+    /// `norm` of just the function body, when one was given.
+    body: Option<u64>,
     shape: DefaultHasher,
     tokens: Vec<u32>,
     refs: HashSet<u64>,
@@ -587,14 +589,23 @@ const SUBTREE_END: u16 = u16::MAX;
 
 /// `skip` excludes one descendant subtree (e.g. a function body for its declaration hash).
 fn walk_tokens(node: tree_sitter::Node, source: &str, mask: Option<&str>, skip: &[tree_sitter::Node]) -> TokenWalk {
-    walk_tokens_with(node, source, mask, skip, &HashSet::new())
+    walk_tokens_with(node, source, mask, skip, &HashSet::new(), None)
 }
 
-/// Same as `walk_tokens`, but also hashes the item without the `members` subtrees into `shell`.
-fn walk_tokens_with(node: tree_sitter::Node, source: &str, mask: Option<&str>, skip: &[tree_sitter::Node], members: &HashSet<usize>) -> TokenWalk {
+/// Same as `walk_tokens`, but also hashes the item without the `members` subtrees into `shell`,
+/// and the `body` subtree on its own into `body`, the same as walking the body by itself would.
+fn walk_tokens_with(
+    node: tree_sitter::Node,
+    source: &str,
+    mask: Option<&str>,
+    skip: &[tree_sitter::Node],
+    members: &HashSet<usize>,
+    body: Option<tree_sitter::Node>,
+) -> TokenWalk {
     let mut w = TokenWalk {
         norm: DefaultHasher::new(),
         shell: DefaultHasher::new(),
+        body: None,
         shape: DefaultHasher::new(),
         tokens: Vec::new(),
         refs: HashSet::new(),
@@ -609,9 +620,13 @@ fn walk_tokens_with(node: tree_sitter::Node, source: &str, mask: Option<&str>, s
     // How deep we are inside `members` subtrees. The shell hash only counts what's outside them.
     let mut in_member = 0usize;
     let is_member = |n: &tree_sitter::Node| !members.is_empty() && members.contains(&n.id());
+    let body_id = body.map(|b| b.id());
+    let mut in_body = false;
+    let mut body_hash = DefaultHasher::new();
     'outer: loop {
         let n = cursor.node();
         if is_member(&n) { in_member += 1; }
+        if body_id == Some(n.id()) { in_body = true; }
         let kind = n.kind();
         let comment = is_comment_kind(kind);
         // Directive comments like `//go:noinline` count as code. Strings are hashed from the source
@@ -621,6 +636,7 @@ fn walk_tokens_with(node: tree_sitter::Node, source: &str, mask: Option<&str>, s
             text.hash(&mut w.norm);
             text.hash(&mut w.shape);
             if in_member == 0 { text.hash(&mut w.shell); }
+            if in_body { text.hash(&mut body_hash); }
         }
         let skip = comment || skip.contains(&n);
         if !skip {
@@ -628,6 +644,7 @@ fn walk_tokens_with(node: tree_sitter::Node, source: &str, mask: Option<&str>, s
                 let text = &source[n.byte_range()];
                 text.hash(&mut w.norm);
                 if in_member == 0 { text.hash(&mut w.shell); }
+                if in_body { text.hash(&mut body_hash); }
                 if mask == Some(text) { "\u{0}NAME".hash(&mut w.shape) } else { text.hash(&mut w.shape) }
                 w.tokens.push(hash_str(text) as u32);
                 if kind.ends_with("identifier") || kind.ends_with("identifier_pattern") {
@@ -638,6 +655,7 @@ fn walk_tokens_with(node: tree_sitter::Node, source: &str, mask: Option<&str>, s
                 n.kind_id().hash(&mut w.norm);
                 n.kind_id().hash(&mut w.shape);
                 if in_member == 0 { n.kind_id().hash(&mut w.shell); }
+                if in_body { n.kind_id().hash(&mut body_hash); }
                 spotter.enter(kind, &mut w.calls);
             }
             if cursor.goto_first_child() {
@@ -647,6 +665,10 @@ fn walk_tokens_with(node: tree_sitter::Node, source: &str, mask: Option<&str>, s
         loop {
             // Done with this node's subtree.
             if is_member(&cursor.node()) { in_member -= 1; }
+            if body_id == Some(cursor.node().id()) {
+                in_body = false;
+                w.body = Some(body_hash.finish());
+            }
             if cursor.node() == node {
                 break 'outer;
             }
@@ -661,6 +683,7 @@ fn walk_tokens_with(node: tree_sitter::Node, source: &str, mask: Option<&str>, s
                 SUBTREE_END.hash(&mut w.norm);
                 SUBTREE_END.hash(&mut w.shape);
                 if in_member == 0 { SUBTREE_END.hash(&mut w.shell); }
+                if in_body { SUBTREE_END.hash(&mut body_hash); }
                 spotter.leave(cursor.node().kind(), &mut w.calls);
             }
         }
@@ -691,11 +714,6 @@ fn function_body(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
         }
     }
     None
-}
-
-fn body_token_hash(node: tree_sitter::Node, source: &str) -> Option<u64> {
-    let body = function_body(node)?;
-    Some(walk_tokens(body, source, None, &[]).norm.finish())
 }
 
 /// Hash of a function's declaration outside its body (visibility, `async`,
@@ -889,7 +907,9 @@ fn fingerprint(sem: &mut SemanticTree, tree: &tree_sitter::Tree, source: &str, l
             let members: HashSet<usize> = method_nodes.iter().flatten()
                 .flat_map(|(mn, m_attrs)| m_attrs.iter().chain([mn]).map(|n| n.id()))
                 .collect();
-            let mut w = walk_tokens_with(node, source, mask, &[], &members);
+            let body = match &*item { SemanticItem::Function { .. } => function_body(node), _ => None };
+            let mut w = walk_tokens_with(node, source, mask, &[], &members, body);
+            let w_body = w.body;
             let mut shell = DefaultHasher::new();
             for a in &attrs {
                 let aw = walk_tokens(*a, source, None, &[]);
@@ -917,7 +937,7 @@ fn fingerprint(sem: &mut SemanticTree, tree: &tree_sitter::Tree, source: &str, l
             // Comment-insensitive body and declaration hashes for functions and class methods.
             match item {
                 SemanticItem::Function { body_hash, decl_hash, .. } => {
-                    if let Some(h) = body_token_hash(node, source) { *body_hash = h; }
+                    if let Some(h) = w_body { *body_hash = h; }
                     *decl_hash = decl_token_hash(node, &attrs, source);
                 }
                 SemanticItem::Class { methods, .. } => {
@@ -933,7 +953,7 @@ fn fingerprint(sem: &mut SemanticTree, tree: &tree_sitter::Tree, source: &str, l
                             meta.method_self_fields.push(HashMap::new());
                             continue;
                         };
-                        let mw = walk_tokens(*mn, source, None, &[]);
+                        let mw = walk_tokens_with(*mn, source, None, &[], &HashSet::new(), function_body(*mn));
                         meta.method_refs.push(mw.refs);
                         meta.method_calls.push(mw.calls);
                         meta.method_binds.push(mw.binds);
@@ -941,7 +961,7 @@ fn fingerprint(sem: &mut SemanticTree, tree: &tree_sitter::Tree, source: &str, l
                         meta.method_declared.push(mw.declared);
                         meta.method_self_fields.push(mw.self_fields);
                         if let SemanticItem::Function { body_hash, decl_hash, .. } = m {
-                            if let Some(h) = body_token_hash(*mn, source) { *body_hash = h; }
+                            if let Some(h) = mw.body { *body_hash = h; }
                             *decl_hash = decl_token_hash(*mn, m_attrs, source);
                         }
                         extend_span_to(m.span_mut(), m_attrs);
