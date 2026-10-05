@@ -22,6 +22,21 @@ pub struct SemanticTree {
     /// the line, or `None` for a `#define` where the whole line counts.
     #[serde(skip)]
     pub literal_lines: LiteralLines,
+    /// Functions defined inside other functions, which only their scope can call.
+    #[serde(skip)]
+    pub local_fns: Vec<LocalFn>,
+}
+
+/// A function defined inside another function, or in Python inside a module-level `if` or `try`.
+/// Only code inside `scope` can call it.
+#[derive(Debug, Clone)]
+pub struct LocalFn {
+    pub name: String,
+    pub params: Vec<Param>,
+    pub span: crate::manifest::Span,
+    pub scope: crate::manifest::Span,
+    /// The function it's defined in, or empty for module-level blocks.
+    pub scope_name: String,
 }
 
 /// Regexes on each line, or `None` for a `#define` line.
@@ -29,7 +44,7 @@ pub type LiteralLines = HashMap<usize, Option<Vec<String>>>;
 
 impl SemanticTree {
     pub fn new(items: Vec<SemanticItem>) -> Self {
-        SemanticTree { items, meta: Vec::new(), comment_lines: HashSet::new(), string_lines: HashSet::new(), literal_lines: HashMap::new() }
+        SemanticTree { items, meta: Vec::new(), comment_lines: HashSet::new(), string_lines: HashSet::new(), literal_lines: HashMap::new(), local_fns: Vec::new() }
     }
 }
 
@@ -589,18 +604,20 @@ const SUBTREE_END: u16 = u16::MAX;
 
 /// `skip` excludes one descendant subtree (e.g. a function body for its declaration hash).
 fn walk_tokens(node: tree_sitter::Node, source: &str, mask: Option<&str>, skip: &[tree_sitter::Node]) -> TokenWalk {
-    walk_tokens_with(node, source, mask, skip, &HashSet::new(), None)
+    walk_tokens_with(node, source, mask, skip, &HashSet::new(), None, None)
 }
 
 /// Same as `walk_tokens`, but also hashes the item without the `members` subtrees into `shell`,
 /// and the `body` subtree on its own into `body`, the same as walking the body by itself would.
-fn walk_tokens_with(
-    node: tree_sitter::Node,
+#[allow(clippy::too_many_arguments)]
+fn walk_tokens_with<'t>(
+    node: tree_sitter::Node<'t>,
     source: &str,
     mask: Option<&str>,
     skip: &[tree_sitter::Node],
     members: &HashSet<usize>,
     body: Option<tree_sitter::Node>,
+    mut defs: Option<(&[u16], &mut Vec<tree_sitter::Node<'t>>)>,
 ) -> TokenWalk {
     let mut w = TokenWalk {
         norm: DefaultHasher::new(),
@@ -626,6 +643,9 @@ fn walk_tokens_with(
     'outer: loop {
         let n = cursor.node();
         if is_member(&n) { in_member += 1; }
+        if let Some((kinds, found)) = defs.as_mut() {
+            if kinds.contains(&n.kind_id()) { found.push(n); }
+        }
         if body_id == Some(n.id()) { in_body = true; }
         let kind = n.kind();
         let comment = is_comment_kind(kind);
@@ -886,9 +906,43 @@ fn comment_and_string_lines(tree: &tree_sitter::Tree, source: &str) -> (HashSet<
     (out, strings, literals)
 }
 
+/// Picks out the local functions from the definitions found while walking one item. Each one's
+/// scope is the closest function around it. A definition with nothing around it is the item
+/// itself, unless it's in a module-level block, where it belongs to the whole module.
+fn scope_local_fns(found: &[tree_sitter::Node], root: tree_sitter::Node, module_block: bool, source: &str, lang: &dyn LanguageSupport) -> Vec<LocalFn> {
+    let defs: Vec<(tree_sitter::Node, crate::languages::FunctionDef)> = found.iter()
+        .filter_map(|n| lang.function_def(n, source).map(|d| (*n, d)))
+        .collect();
+    let span = |n: &tree_sitter::Node| crate::manifest::Span {
+        start_line: n.start_position().row + 1,
+        start_col: n.start_position().column,
+        end_line: n.end_position().row + 1,
+        end_col: n.end_position().column,
+    };
+    let mut out = Vec::new();
+    for (n, d) in &defs {
+        if !d.bare { continue; }
+        let around = defs.iter()
+            .filter(|(o, _)| o.id() != n.id() && o.start_byte() <= n.start_byte() && n.end_byte() <= o.end_byte())
+            .min_by_key(|(o, _)| o.end_byte() - o.start_byte());
+        let (scope, scope_name) = match around {
+            Some((o, od)) => (span(o), od.name.clone()),
+            None if module_block => (span(&root), String::new()),
+            None => continue,
+        };
+        out.push(LocalFn { name: d.name.clone(), params: d.params.clone(), span: span(n), scope, scope_name });
+    }
+    out
+}
+
 fn fingerprint(sem: &mut SemanticTree, tree: &tree_sitter::Tree, source: &str, lang: &dyn LanguageSupport) {
     let root = tree.root_node();
     let mut metas = Vec::with_capacity(sem.items.len());
+    let def_kinds: Vec<u16> = lang.function_kinds().iter()
+        .map(|k| tree.language().id_for_node_kind(k, true))
+        .filter(|&id| id != 0)
+        .collect();
+    let mut local_fns = Vec::new();
     for item in &mut sem.items {
         let node = find_node(root, item.span());
         let mut meta = ItemMeta::default();
@@ -908,7 +962,15 @@ fn fingerprint(sem: &mut SemanticTree, tree: &tree_sitter::Tree, source: &str, l
                 .flat_map(|(mn, m_attrs)| m_attrs.iter().chain([mn]).map(|n| n.id()))
                 .collect();
             let body = match &*item { SemanticItem::Function { .. } => function_body(node), _ => None };
-            let mut w = walk_tokens_with(node, source, mask, &[], &members, body);
+            // Look for local functions in functions and module-level statements. Classes are
+            // handled one method at a time below.
+            let module_block = matches!(&*item, SemanticItem::Other { .. }) && lang.module_blocks_define();
+            let finds_defs = !def_kinds.is_empty()
+                && (matches!(&*item, SemanticItem::Function { .. } | SemanticItem::Variable { .. }) || module_block);
+            let mut found = Vec::new();
+            let defs = finds_defs.then_some((def_kinds.as_slice(), &mut found));
+            let mut w = walk_tokens_with(node, source, mask, &[], &members, body, defs);
+            local_fns.extend(scope_local_fns(&found, root, module_block, source, lang));
             let w_body = w.body;
             let mut shell = DefaultHasher::new();
             for a in &attrs {
@@ -953,7 +1015,10 @@ fn fingerprint(sem: &mut SemanticTree, tree: &tree_sitter::Tree, source: &str, l
                             meta.method_self_fields.push(HashMap::new());
                             continue;
                         };
-                        let mw = walk_tokens_with(*mn, source, None, &[], &HashSet::new(), function_body(*mn));
+                        let mut found = Vec::new();
+                        let defs = (!def_kinds.is_empty()).then_some((def_kinds.as_slice(), &mut found));
+                        let mw = walk_tokens_with(*mn, source, None, &[], &HashSet::new(), function_body(*mn), defs);
+                        local_fns.extend(scope_local_fns(&found, root, false, source, lang));
                         meta.method_refs.push(mw.refs);
                         meta.method_calls.push(mw.calls);
                         meta.method_binds.push(mw.binds);
@@ -987,6 +1052,7 @@ fn fingerprint(sem: &mut SemanticTree, tree: &tree_sitter::Tree, source: &str, l
     }
     sem.items = items;
     sem.meta = kept;
+    sem.local_fns = local_fns;
 }
 
 fn source_text(item: &SemanticItem, source: &str) -> String {

@@ -124,8 +124,11 @@ pub fn analyze_multi(files: &[cross_file::FileChange]) -> Result<cross_file::Mul
     let vanished = cross_file::vanished_names(&analyses, &moves).into_iter()
         .map(|(name, renamed_to, origin, owner)| cross_file::VanishedSymbol { name, renamed_to, origin, owner })
         .collect();
-    let broken_references = cross_file::detect_broken_references(&analyses, &moves, &mut next_id);
-    let signature_impacts = cross_file::detect_signature_impacts(&analyses, &mut next_id);
+    let mut broken_references = cross_file::detect_broken_references(&analyses, &moves, &mut next_id);
+    let mut signature_impacts = cross_file::detect_signature_impacts(&analyses, &mut next_id);
+    // Functions defined inside other functions, checked in their own scope.
+    broken_references.extend(cross_file::local_broken_references(&analyses, &mut next_id));
+    signature_impacts.extend(cross_file::local_signature_impacts(&analyses, &mut next_id));
 
     // Annotate hunks with manifest links and noise.
     // Renames of top-level items apply everywhere; member renames (`Svc.get`,
@@ -1501,6 +1504,118 @@ mod tests {
         files[1].new_source = files[1].new_source.replace("program()", "program_name()");
         let r = analyze_multi(&files).unwrap();
         assert_eq!(logic(&r.file_results[1].1), vec![("help".into(), "body modified".into())]);
+    }
+
+    type Stale = Vec<(String, usize)>;
+    type Sites = Vec<(String, usize, bool)>;
+
+    fn local_warnings(path: &str, old: &str, new: &str, lang: Language) -> (Stale, Sites) {
+        let r = analyze_multi(&[cross_file::FileChange::new(path, old, new, lang)]).unwrap();
+        let stale = r.cross_file.broken_references.iter().map(|b| (b.symbol_name.clone(), b.reference_location.line_start)).collect();
+        let sites = r.cross_file.signature_impacts.iter().filter(|s| s.local)
+            .flat_map(|s| s.call_sites.iter().map(move |c| (s.name.clone(), c.line, c.updated))).collect();
+        (stale, sites)
+    }
+
+    #[test]
+    fn test_local_functions_are_checked_in_their_scope() {
+        // A decorator's wrapper renamed, with the old name still returned.
+        let old = "def setupmethod(f):\n    def wrapper_func(self, *args):\n        return f(self, *args)\n    return update_wrapper(wrapper_func, f)\n";
+        let new = old.replacen("def wrapper_func(", "def wrapped(", 1);
+        let (stale, _) = local_warnings("s.py", old, &new, Language::Python);
+        assert_eq!(stale, vec![("wrapper_func".to_string(), 4)]);
+
+        // A nested function gets a new parameter, and its call in the same function wasn't updated.
+        let old = "def install(width):\n    def excepthook(kind, value):\n        print(kind, value, width)\n    hook = lambda k, v: excepthook(k, v)\n    return hook\n";
+        let new = old.replacen("def excepthook(kind, value):", "def excepthook(kind, value, tb):", 1);
+        let (_, sites) = local_warnings("t.py", old, &new, Language::Python);
+        assert_eq!(sites, vec![("excepthook".to_string(), 4, false)]);
+
+        // Defined in a module-level `if`, so the whole module can call it.
+        let old = "import sys\n\nif sys.version_info >= (3, 12):\n    def is_alias(t):\n        return True\n\n\ndef check(t):\n    return is_alias(t)\n";
+        let new = old.replacen("def is_alias(t):", "def is_alias(t, strict):", 1);
+        let (_, sites) = local_warnings("c.py", old, &new, Language::Python);
+        assert_eq!(sites, vec![("is_alias".to_string(), 9, false)]);
+
+        // A handler inside a component renamed, still passed to the button.
+        let old = "export function Form() {\n  const handleSave = (e) => { save(e); };\n  return <button onClick={handleSave}>Save</button>;\n}\n";
+        let new = old.replacen("const handleSave =", "const onSave =", 1);
+        let (stale, _) = local_warnings("f.jsx", old, &new, Language::Tsx);
+        assert_eq!(stale, vec![("handleSave".to_string(), 3)]);
+
+        // A Rust inner function gains a parameter.
+        let old = "pub fn run(xs: &[u32]) -> u32 {\n    fn double(x: u32) -> u32 { x * 2 }\n    xs.iter().map(|x| double(*x)).sum()\n}\n";
+        let new = old.replacen("fn double(x: u32)", "fn double(x: u32, by: u32)", 1);
+        let (_, sites) = local_warnings("r.rs", old, &new, Language::Rust);
+        assert_eq!(sites, vec![("double".to_string(), 3, false)]);
+    }
+
+    #[test]
+    fn test_local_functions_that_still_resolve_are_not_flagged() {
+        // The name falls back to a module-level function, a builtin, or a new variable.
+        for (old, new) in [
+            ("def helper(x):\n    return x\n\n\ndef run(x):\n    def helper(x):\n        return x + 1\n    return helper(x)\n",
+             "def helper(x):\n    return x\n\n\ndef run(x):\n    return helper(x)\n"),
+            ("def run(xs):\n    def sorted(xs):\n        return xs\n    return sorted(xs)\n",
+             "def run(xs):\n    return sorted(xs)\n"),
+            ("def run(x):\n    def fmt(v):\n        return str(v)\n    return fmt(x)\n",
+             "def run(x):\n    fmt = str\n    return fmt(x)\n"),
+        ] {
+            let (stale, sites) = local_warnings("m.py", old, new, Language::Python);
+            assert!(stale.is_empty() && sites.is_empty(), "{new}: {stale:?} {sites:?}");
+        }
+        // Adding parentheses around an arrow function's one parameter changes nothing.
+        let old = "export function Repl() {\n  const onRealm = realm => {\n    use(realm);\n  };\n  return onRealm(1);\n}\n";
+        let new = old.replacen("realm => {", "(realm) => {", 1);
+        let (_, sites) = local_warnings("r.jsx", old, &new, Language::Tsx);
+        assert!(sites.is_empty(), "{sites:?}");
+        // A call that was updated, or still fits, isn't stale.
+        let old = "def run(a):\n    def add(x):\n        return x + a\n    return add(1)\n";
+        let new = "def run(a):\n    def add(x, y=0):\n        return x + y + a\n    return add(1)\n";
+        let (_, sites) = local_warnings("u.py", old, new, Language::Python);
+        assert!(sites.iter().all(|s| s.2), "{sites:?}");
+        let new = "def run(a):\n    def add(x, y):\n        return x + y + a\n    return add(1, 2)\n";
+        let (_, sites) = local_warnings("u.py", old, new, Language::Python);
+        assert_eq!(sites, vec![("add".to_string(), 4, true)]);
+    }
+
+    #[test]
+    fn test_calls_in_string_interpolation_and_private_members() {
+        let stale = |path: &str, old: &str, new: &str, lang: Language| -> Vec<usize> {
+            let r = analyze_multi(&[cross_file::FileChange::new(path, old, new, lang)]).unwrap();
+            r.cross_file.signature_impacts.iter().flat_map(|s| s.call_sites.iter().filter(|c| !c.updated).map(|c| c.line)).collect()
+        };
+        // Called inside an f-string.
+        let old = "def to_ordinal(n):\n    return str(n)\n\n\ndef log(n):\n    print(f\"try {to_ordinal(n)} of 3\")\n";
+        let new = old.replacen("def to_ordinal(n):", "def to_ordinal():", 1);
+        assert_eq!(stale("u.py", old, &new, Language::Python), vec![6]);
+        // `{{` is a literal brace, not code.
+        let old = "def to_ordinal(n):\n    return str(n)\n\n\ndef log(n):\n    print(f\"{{to_ordinal(n)}}\")\n";
+        let new = old.replacen("def to_ordinal(n):", "def to_ordinal():", 1);
+        assert!(stale("u.py", old, &new, Language::Python).is_empty());
+        // A dict key inside an f-string isn't a use of the removed function with that name.
+        let old = "def tag_name(r):\n    return r\n\n\ndef show(release):\n    print(f\"{release['tag_name']} {release['x']}\")\n";
+        let new = "def show(release):\n    print(f\"{release['tag_name']} {release['x']}\")\n";
+        let r = analyze_multi(&[cross_file::FileChange::new("v.py", old, new, Language::Python)]).unwrap();
+        assert!(r.cross_file.broken_references.is_empty(), "{:?}", r.cross_file.broken_references);
+        // A `}` inside a string inside the code doesn't end the code early.
+        let old = "def wrap(s):\n    return s\n\n\ndef show(v):\n    print(f\"{v + '}' + wrap(v)}\")\n";
+        let new = old.replacen("def wrap(s):", "def wrap():", 1);
+        assert_eq!(stale("w.py", old, &new, Language::Python), vec![6]);
+        // Template literals nested inside `${ }` across lines don't hide the code after them.
+        let old = "function encode(s) {\n  return s;\n}\n\nexport function show(m, file, loc) {\n  const header = `${\n    m ? ` in ${\n        file ? `${m}${loc ? ` (${loc})` : \"\"}` : m\n      }` : \"\"\n  }`;\n  return encode(header);\n}\n";
+        let new = old.replacen("function encode(s) {", "function encode(s, mode) {", 1);
+        let r = analyze_multi(&[cross_file::FileChange::new("o.js", old, &new, Language::TypeScript)]).unwrap();
+        let sites: Vec<usize> = r.cross_file.signature_impacts.iter().flat_map(|s| s.call_sites.iter().map(|c| c.line)).collect();
+        assert_eq!(sites, vec![11], "{:?}", r.cross_file.signature_impacts);
+        // Called inside a template literal.
+        let old = "export function short(name: string, prefix: string): string {\n  return name;\n}\nexport const label = (n: string) => `${short(n, \"x\")}/rule`;\n";
+        let new = old.replacen("short(name: string, prefix: string)", "short(name: string)", 1);
+        assert_eq!(stale("n.ts", old, &new, Language::TypeScript), vec![4]);
+        // A private method called through `this.#`.
+        let old = "export class Queue {\n  #consume(now: number): void {\n    use(now);\n  }\n  run(now: number): void {\n    this.#consume(now);\n  }\n}\n";
+        let new = old.replacen("#consume(now: number): void", "#consume(now: number, slot: number): void", 1);
+        assert_eq!(stale("q.ts", old, &new, Language::TypeScript), vec![6]);
     }
 
     #[test]

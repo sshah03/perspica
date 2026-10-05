@@ -93,6 +93,10 @@ pub struct SignatureImpactEntry {
     /// The parameters before and after, for judging each call (not serialized).
     #[serde(skip)]
     pub params: Option<(Vec<crate::parser::Param>, Vec<crate::parser::Param>)>,
+    /// A function defined inside another one. Only that function can call it, so we don't
+    /// search the rest of the repo.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub local: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -327,6 +331,141 @@ pub(crate) fn detect_broken_references(
     broken
 }
 
+/// Local functions by enclosing function and name. A name defined twice in the same scope,
+/// like in an `if` and an `else`, is skipped since we can't tell which one a call means.
+fn unique_locals(locals: &[crate::parser::LocalFn]) -> HashMap<(&str, &str), &crate::parser::LocalFn> {
+    let mut seen: HashMap<(&str, &str), Option<&crate::parser::LocalFn>> = HashMap::new();
+    for l in locals {
+        seen.entry((l.scope_name.as_str(), l.name.as_str()))
+            .and_modify(|v| *v = None)
+            .or_insert(Some(l));
+    }
+    seen.into_iter().filter_map(|(k, v)| v.map(|v| (k, v))).collect()
+}
+
+/// Calls to local functions whose signature changed. We only look in the function that
+/// defines them, since nothing else can call them.
+pub(crate) fn local_signature_impacts(analyses: &[InternalAnalysis], next_id: &mut ManifestEntryId) -> Vec<SignatureImpactEntry> {
+    let mut impacts = Vec::new();
+    for a in analyses {
+        let new = unique_locals(&a.new_tree.local_fns);
+        if new.is_empty() { continue; }
+        let old = unique_locals(&a.old_tree.local_fns);
+        let mut changed: Vec<(&crate::parser::LocalFn, &crate::parser::LocalFn)> = new.iter()
+            .filter_map(|(k, n)| old.get(k).map(|o| (*o, *n)))
+            .filter(|(o, n)| crate::classify::breaks_callers(&o.params, &n.params, &a.path))
+            .collect();
+        if changed.is_empty() { continue; }
+        changed.sort_by_key(|(_, n)| n.span.start_line);
+        let masked = code_only(&a.new_source);
+        let added = added_lines(&a.result.hunks);
+        let bare = |q: Option<&str>| q.is_none();
+        for (o, n) in changed {
+            let mut call_sites = Vec::new();
+            for (line, text, open) in scan_calls_at(&a.new_source, &masked, &n.name, &bare) {
+                if line < n.scope.start_line || line > n.scope.end_line || line == n.span.start_line { continue; }
+                let args = call_arguments(&masked[open..], &a.path);
+                let end = line + args.as_ref().map_or(0, |x| x.lines);
+                let touched = (line..=end).any(|l| added.contains(&l));
+                let fits = matches!(&args, Some(x) if still_fits(&o.params, &n.params, x, named_args(&a.path), &a.path))
+                    || matches!(&args, Some(x) if loose_arity(&a.path) && !x.spread && leaves_out_new(&o.params, &n.params, x));
+                call_sites.push(CallSite { file: a.path.clone(), line, text, updated: touched || fits, in_diff: true });
+            }
+            impacts.push(SignatureImpactEntry {
+                id: { let v = *next_id; *next_id += 1; v },
+                name: n.name.clone(),
+                description: crate::classify::describe_signature_change(&o.params, &n.params, &None, &None)
+                    .unwrap_or_else(|| "signature changed".into()),
+                definition: Location { file: Some(a.path.clone()), line_start: n.span.start_line, line_end: n.span.end_line, side: Side::New },
+                call_sites,
+                exported: false,
+                params: Some((o.params.clone(), n.params.clone())),
+                local: true,
+            });
+        }
+    }
+    impacts
+}
+
+/// Builtins and globals that a name falls back to once a local function with that name is gone.
+const FALLBACK_NAMES: &[&str] = &[
+    "abs", "all", "any", "ascii", "bin", "bool", "bytes", "callable", "chr", "dict", "dir", "divmod", "enumerate",
+    "eval", "exec", "filter", "float", "format", "frozenset", "getattr", "globals", "hasattr", "hash", "help", "hex",
+    "id", "input", "int", "isinstance", "issubclass", "iter", "len", "list", "locals", "map", "max", "min", "next",
+    "object", "oct", "open", "ord", "pow", "print", "property", "range", "repr", "reversed", "round", "set", "setattr",
+    "slice", "sorted", "str", "sum", "super", "tuple", "type", "vars", "zip",
+    "alert", "clearInterval", "clearTimeout", "console", "decodeURI", "encodeURI", "fetch", "isNaN", "parseFloat",
+    "parseInt", "queueMicrotask", "require", "setInterval", "setTimeout", "structuredClone",
+];
+
+/// References to local functions that were removed or renamed, in the function they were in.
+/// We skip a name if it still means something else in the file, like another definition, a
+/// variable, a parameter, an import or a builtin.
+pub(crate) fn local_broken_references(analyses: &[InternalAnalysis], next_id: &mut ManifestEntryId) -> Vec<BrokenReferenceEntry> {
+    let mut broken = Vec::new();
+    for a in analyses.iter().filter(|a| !crate::roles::is_changelog_path(&a.path)) {
+        let old = unique_locals(&a.old_tree.local_fns);
+        if old.is_empty() { continue; }
+        let new = unique_locals(&a.new_tree.local_fns);
+        let mut gone: Vec<(&(&str, &str), &&crate::parser::LocalFn)> = old.iter().filter(|(k, _)| !new.contains_key(*k)).collect();
+        if gone.is_empty() { continue; }
+        gone.sort_by_key(|(_, o)| o.span.start_line);
+        let item_names = |t: &SemanticTree| -> HashSet<String> {
+            t.items.iter().flat_map(|i| {
+                let mut v: Vec<String> = i.name().map(|n| bare_name(n).to_string()).into_iter().collect();
+                if let SemanticItem::Class { methods, .. } = i { v.extend(methods.iter().filter_map(|m| m.name().map(str::to_string))); }
+                v
+            }).collect()
+        };
+        let (old_items, new_items) = (item_names(&a.old_tree), item_names(&a.new_tree));
+        let lines = a.new_source.lines().count();
+        for ((scope_name, name), o) in gone {
+            let (scope_name, name) = (*scope_name, *name);
+            if FALLBACK_NAMES.contains(&name) || old_items.contains(name) || new_items.contains(name) { continue; }
+            // Skip it if it was defined in another scope before, or is defined anywhere now.
+            if a.old_tree.local_fns.iter().filter(|l| l.name == name).count() > 1 || a.new_tree.local_fns.iter().any(|l| l.name == name) { continue; }
+            if declares_name(&a.new_source, name) || import_of(&a.new_source, &a.path, name).is_some() { continue; }
+            // Find where the enclosing function is now.
+            let (from, to) = if scope_name.is_empty() {
+                (1, lines)
+            } else {
+                let spans: Vec<(usize, usize)> = a.new_tree.items.iter()
+                    .flat_map(|i| match i {
+                        SemanticItem::Class { methods, .. } => methods.iter().collect::<Vec<_>>(),
+                        _ => vec![i],
+                    })
+                    .filter(|i| i.name().map(bare_name) == Some(scope_name))
+                    .map(|i| (i.span().start_line, i.span().end_line))
+                    .chain(a.new_tree.local_fns.iter().filter(|l| l.name == scope_name).map(|l| (l.span.start_line, l.span.end_line)))
+                    .collect();
+                match spans.as_slice() { [one] => *one, _ => continue }
+            };
+            // Treat it as renamed if exactly one new local function in the same scope takes the same number of parameters.
+            let renames: Vec<&str> = new.iter()
+                .filter(|((s, n), l)| *s == scope_name && !old.contains_key(&(*s, *n)) && l.params.len() == o.params.len())
+                .map(|((_, n), _)| *n)
+                .collect();
+            let renamed_to = match renames.as_slice() { [one] => Some(one.to_string()), _ => None };
+            let origin = if scope_name.is_empty() { a.path.clone() } else { format!("{scope_name} in {}", a.path) };
+            let refs = scan_references_in(&a.new_source, name, None, &a.path, &a.path).into_iter()
+                .filter(|(line, _)| (from..=to).contains(line));
+            for (line, text) in refs.take(5) {
+                broken.push(BrokenReferenceEntry {
+                    id: { let v = *next_id; *next_id += 1; v },
+                    symbol_name: name.to_string(),
+                    renamed_from: renamed_to.clone(),
+                    reference_file: a.path.clone(),
+                    reference_location: Location { file: Some(a.path.clone()), line_start: line, line_end: line, side: Side::New },
+                    reason: broken_reason(name, renamed_to.as_deref(), &origin),
+                    line_text: text,
+                    in_diff: true,
+                });
+            }
+        }
+    }
+    broken
+}
+
 pub fn broken_reason(name: &str, renamed_to: Option<&str>, origin: &str) -> String {
     match renamed_to {
         Some(new) => format!("still uses `{name}`, renamed to `{new}` in {origin}"),
@@ -423,6 +562,7 @@ pub(crate) fn detect_signature_impacts(
                 call_sites,
                 exported,
                 params,
+                local: false,
             });
         }
     }
@@ -943,8 +1083,9 @@ pub fn code_only(source: &str) -> String {
     while i < chars.len() {
         let c = chars[i];
         let next = chars.get(i + 1).copied();
-        // Line comments.
-        if (c == '/' && next == Some('/')) || (c == '#' && next != Some('[') && next != Some('!') && next != Some('{')) {
+        // Line comments. A `#` right after a dot is a JS private member (`this.#queue`), not a comment.
+        let private_member = c == '#' && i > 0 && chars[i - 1] == '.';
+        if (c == '/' && next == Some('/')) || (c == '#' && !private_member && next != Some('[') && next != Some('!') && next != Some('{')) {
             while i < chars.len() && chars[i] != '\n' { out.push(' '); i += 1; }
             continue;
         }
@@ -959,10 +1100,22 @@ pub fn code_only(source: &str) -> String {
         if (c == '"' || c == '\'' || c == '`') && !lifetime {
             let triple = next == Some(c) && chars.get(i + 2) == Some(&c) && c != '`';
             let q = if triple { 3 } else { 1 };
+            // Python f-strings have code inside `{ }` and JavaScript template literals inside `${ }`.
+            let prefix: String = chars[..i].iter().rev().take_while(|p| p.is_ascii_alphabetic()).collect::<String>().to_ascii_lowercase();
+            let fstring = c != '`' && prefix.contains('f') && prefix.len() <= 2 && prefix.chars().all(|p| matches!(p, 'f' | 'r' | 'b'));
             for _ in 0..q { out.push(c); }
             i += q;
             while i < chars.len() {
                 if chars[i] == '\\' && i + 1 < chars.len() { out.push(' '); out.push(blank(chars[i + 1])); i += 2; continue; }
+                let opens = (c == '`' && chars[i] == '$' && chars.get(i + 1) == Some(&'{'))
+                    || (fstring && chars[i] == '{' && chars.get(i + 1) != Some(&'{'));
+                if fstring && chars[i] == '{' && chars.get(i + 1) == Some(&'{') { out.push_str("  "); i += 2; continue; }
+                if opens {
+                    let start = if chars[i] == '$' { 2 } else { 1 };
+                    for k in 0..start { out.push(chars[i + k]); }
+                    i = interpolation(&chars, i + start, &mut out);
+                    continue;
+                }
                 let closes = if triple { chars[i] == c && chars.get(i + 1) == Some(&c) && chars.get(i + 2) == Some(&c) } else { chars[i] == c };
                 if closes { for _ in 0..q { out.push(c); } i += q; break; }
                 // Ordinary quotes end at the line (unterminated or mismatched).
@@ -976,6 +1129,67 @@ pub fn code_only(source: &str) -> String {
         i += 1;
     }
     out
+}
+
+fn blank_char(c: char) -> char {
+    if c == '\n' { '\n' } else { ' ' }
+}
+
+/// Keeps the code inside an f-string's `{ }` or a template literal's `${ }`, up to and including
+/// the closing brace. `i` starts just past the opening brace. Strings inside it are still blanked.
+fn interpolation(chars: &[char], mut i: usize, out: &mut String) -> usize {
+    let mut depth = 1;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == '`' {
+            out.push('`');
+            i = template(chars, i + 1, out);
+            continue;
+        }
+        // A quote only starts a string if it closes on the same line, so a stray `'` in a regex can't
+        // swallow the rest of the code.
+        if ch == '"' || ch == '\'' {
+            let end = (i + 1..chars.len()).take_while(|&k| chars[k] != '\n').find(|&k| chars[k] == ch && chars[k - 1] != '\\');
+            if let Some(end) = end {
+                out.push(ch);
+                for &c in &chars[i + 1..end] { out.push(blank_char(c)); }
+                out.push(ch);
+                i = end + 1;
+                continue;
+            }
+        }
+        if ch == '{' { depth += 1; }
+        if ch == '}' {
+            depth -= 1;
+            if depth == 0 { out.push('}'); return i + 1; }
+        }
+        out.push(ch);
+        i += 1;
+    }
+    i
+}
+
+/// Blanks the text of a template literal but keeps the code inside `${ }`, up to and including
+/// the closing backtick. `i` starts just past the opening backtick.
+fn template(chars: &[char], mut i: usize, out: &mut String) -> usize {
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == '\\' && i + 1 < chars.len() {
+            out.push(' ');
+            out.push(blank_char(chars[i + 1]));
+            i += 2;
+            continue;
+        }
+        if ch == '`' { out.push('`'); return i + 1; }
+        if ch == '$' && chars.get(i + 1) == Some(&'{') {
+            out.push_str("${");
+            i = interpolation(chars, i + 2, out);
+            continue;
+        }
+        out.push(blank_char(ch));
+        i += 1;
+    }
+    i
 }
 
 /// `(name: Type …` / `(name?: Type …`: a parameter list with type annotations,

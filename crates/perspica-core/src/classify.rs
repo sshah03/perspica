@@ -623,7 +623,7 @@ pub(crate) fn breaks_callers(old: &[Param], new: &[Param], path: &str) -> bool {
     })
 }
 
-fn describe_signature_change(
+pub(crate) fn describe_signature_change(
     old_params: &[Param],
     new_params: &[Param],
     old_ret: &Option<String>,

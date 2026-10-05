@@ -433,8 +433,9 @@ fn enrich_with_repo_references(multi: &mut MultiFileResult, target: &git::Target
         .map(|v| (v.name.clone(), v.renamed_to.clone(), v.origin.clone(), v.owner.clone()))
         .collect();
     // Exported functions, and private ones in languages where they reach the rest of a package.
-    let reaches_out = |s: &perspica_core::cross_file::SignatureImpactEntry| s.exported
-        || s.definition.file.as_deref().is_some_and(|f| f.ends_with(".go") || f.ends_with(".rs") || f.ends_with(".py") || f.ends_with(".c"));
+    // Local functions are only called from the function they're in, and that's already checked.
+    let reaches_out = |s: &perspica_core::cross_file::SignatureImpactEntry| !s.local && (s.exported
+        || s.definition.file.as_deref().is_some_and(|f| f.ends_with(".go") || f.ends_with(".rs") || f.ends_with(".py") || f.ends_with(".c")));
     let sig_names: Vec<String> = multi.cross_file.signature_impacts.iter()
         .filter(|s| reaches_out(s))
         .map(|s| perspica_core::cross_file::call_name(&s.name).to_string())
@@ -458,7 +459,17 @@ fn enrich_with_repo_references(multi: &mut MultiFileResult, target: &git::Target
             && Language::from_path(path) != Language::Unknown && perspica_core::cross_file::looks_like_definition(text, name))
         .map(|(name, ..)| name.as_str())
         .collect();
-    multi.cross_file.broken_references.retain(|b| !ambiguous.contains(b.symbol_name.as_str()));
+    // In the method's own file, `this.name` or `self.name` still means the removed method,
+    // even if something else in the repo has the same name.
+    let origin_of: std::collections::HashMap<&str, &str> = vanished.iter().map(|v| (v.0.as_str(), v.2.as_str())).collect();
+    let own_member = |b: &perspica_core::cross_file::BrokenReferenceEntry| {
+        origin_of.get(b.symbol_name.as_str()) == Some(&b.reference_file.as_str())
+            && ["this.", "self."].iter().any(|q| {
+                let pat = format!("{q}{}", b.symbol_name);
+                b.line_text.match_indices(&pat).any(|(i, _)| !b.line_text[i + pat.len()..].starts_with(|c: char| c.is_alphanumeric() || c == '_'))
+            })
+    };
+    multi.cross_file.broken_references.retain(|b| !ambiguous.contains(b.symbol_name.as_str()) || own_member(b));
     multi.cross_file.vanished.retain(|v| !ambiguous.contains(v.name.as_str()));
     let mut next_id = max_id(multi) + 1;
     let mut per_symbol: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();

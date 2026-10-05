@@ -1,4 +1,4 @@
-use crate::languages::LanguageSupport;
+use crate::languages::{FunctionDef, LanguageSupport};
 use crate::manifest::Span;
 use crate::parser::{hash_str, Field, Param, SemanticItem, SemanticTree};
 
@@ -12,6 +12,17 @@ impl LanguageSupport for ScalaSupport {
     // Everything is public unless marked otherwise.
     fn is_exported(&self, node: &tree_sitter::Node, _name: &str, source: &str) -> bool {
         !has_modifier(node, source, &["private", "protected"])
+    }
+
+    fn function_kinds(&self) -> &'static [&'static str] {
+        &["function_definition"]
+    }
+
+    fn function_def(&self, node: &tree_sitter::Node, source: &str) -> Option<FunctionDef> {
+        let SemanticItem::Function { name, params, .. } = extract_function(node, source)? else { return None };
+        // A def directly in a class, object or trait body is a method.
+        let method = node.parent().is_some_and(|p| p.kind() == "template_body");
+        Some(FunctionDef { name, params, bare: !method })
     }
 
     fn extract_semantic_tree(&self, tree: &tree_sitter::Tree, source: &str) -> SemanticTree {

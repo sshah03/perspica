@@ -1,4 +1,4 @@
-use crate::languages::LanguageSupport;
+use crate::languages::{FunctionDef, LanguageSupport};
 use crate::manifest::Span;
 use crate::parser::{hash_str, Field, Param, SemanticItem, SemanticTree};
 
@@ -30,6 +30,17 @@ impl LanguageSupport for RustSupport {
             }
         }
         false
+    }
+
+    fn function_kinds(&self) -> &'static [&'static str] {
+        &["function_item"]
+    }
+
+    fn function_def(&self, node: &tree_sitter::Node, source: &str) -> Option<FunctionDef> {
+        let SemanticItem::Function { name, params, .. } = extract_function(node, source)? else { return None };
+        // A function in an `impl` or `trait` block is a method.
+        let method = node.parent().and_then(|l| l.parent()).is_some_and(|p| matches!(p.kind(), "impl_item" | "trait_item"));
+        Some(FunctionDef { name, params, bare: !method })
     }
 
     fn extract_semantic_tree(&self, tree: &tree_sitter::Tree, source: &str) -> SemanticTree {

@@ -1,4 +1,4 @@
-use crate::languages::LanguageSupport;
+use crate::languages::{FunctionDef, LanguageSupport};
 use crate::manifest::Span;
 use crate::parser::{hash_str, Field, Param, SemanticItem, SemanticTree};
 
@@ -53,6 +53,36 @@ impl LanguageSupport for TypeScriptSupport {
             }
         }
         false
+    }
+
+    fn function_kinds(&self) -> &'static [&'static str] {
+        &["function_declaration", "generator_function_declaration", "variable_declarator", "method_definition"]
+    }
+
+    fn function_def(&self, node: &tree_sitter::Node, source: &str) -> Option<FunctionDef> {
+        match node.kind() {
+            "function_declaration" | "generator_function_declaration" => {
+                let SemanticItem::Function { name, params, .. } = extract_function(node, source)? else { return None };
+                Some(FunctionDef { name, params, bare: true })
+            }
+            // `const handle = (e) => { ... }`
+            "variable_declarator" => {
+                let name = node.child_by_field_name("name").filter(|n| n.kind() == "identifier")?;
+                let value = node.child_by_field_name("value").filter(|v| matches!(v.kind(), "arrow_function" | "function_expression" | "function"))?;
+                // `x => x + 1` has one bare parameter and no parentheses.
+                let params = match value.child_by_field_name("parameter") {
+                    Some(p) => vec![Param { name: node_text(&p, source), type_annotation: None, optional: false }],
+                    None => extract_params(&value, source),
+                };
+                Some(FunctionDef { name: node_text(&name, source), params, bare: true })
+            }
+            // Methods are never called by their name alone, but they still contain local functions.
+            "method_definition" => {
+                let name = node.child_by_field_name("name").map(|n| node_text(&n, source))?;
+                Some(FunctionDef { name, params: extract_params(node, source), bare: false })
+            }
+            _ => None,
+        }
     }
 
     fn extract_semantic_tree(&self, tree: &tree_sitter::Tree, source: &str) -> SemanticTree {
