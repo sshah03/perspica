@@ -63,30 +63,37 @@ pub struct IntelInput<'a> {
     pub author_context: Option<&'a str>,
     /// The user's own prompts from the coding-agent sessions that made the change.
     pub requirements: &'a [crate::sessions::Requirement],
+    /// Characters of changed code to send, or None to send all of it.
+    pub budget: Option<usize>,
 }
 
 #[derive(Deserialize)]
 struct LlmResponse {
     groups: Vec<LlmGroup>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     summary: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     concerns: Vec<String>,
+}
+
+/// Models sometimes write `null` for an empty list or string.
+fn null_as_default<'de, D: serde::Deserializer<'de>, T: Default + Deserialize<'de>>(d: D) -> Result<T, D::Error> {
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
 }
 
 #[derive(Deserialize)]
 struct LlmSubGroup {
     label: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     entry_ids: Vec<u32>,
 }
 
 #[derive(Deserialize)]
 struct LlmGroup {
     label: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     entry_ids: Vec<u32>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     sub_groups: Vec<LlmSubGroup>,
     #[serde(default)]
     risk: Option<String>,
@@ -157,7 +164,7 @@ pub async fn run_analysis(input: &IntelInput<'_>, provider: &dyn LlmProvider) ->
 /// The full prompt. `extra` is appended context (deep mode adds file structures etc.).
 pub fn build_prompt(input: &IntelInput<'_>, extra: Option<&str>) -> String {
     let changes = build_entry_listing(input);
-    let context = build_rich_context(input.results, input.sources);
+    let context = build_rich_context(input.results, input.sources, input.budget);
     let author = input.author_context
         .filter(|c| !c.trim().is_empty())
         .map(|c| format!("AUTHOR CONTEXT (PR description / commit messages; may be incomplete):\n{}\n\n", truncate(c, 3000)))
@@ -452,11 +459,13 @@ pub fn parse_and_validate(response: &str, input: &IntelInput<'_>) -> Result<Inte
         groups.push(g);
     }
 
-    let concerns = parsed.concerns.into_iter().map(|c| strip_id_refs(&c)).filter(|c| !c.is_empty()).collect();
+    // The ids the model was shown. Any other `#123` is a real issue or PR number.
+    let shown: HashSet<u32> = entries.iter().map(|e| e.id).chain(units.iter().map(|u| u.id)).collect();
+    let concerns = parsed.concerns.into_iter().map(|c| strip_id_refs(&c, &shown)).filter(|c| !c.is_empty()).collect();
     for g in &mut groups {
-        g.review_note = g.review_note.take().map(|n| strip_id_refs(&n));
+        g.review_note = g.review_note.take().map(|n| strip_id_refs(&n, &shown));
     }
-    Ok(IntelResult { groups, summary: strip_id_refs(&parsed.summary), concerns })
+    Ok(IntelResult { groups, summary: strip_id_refs(&parsed.summary, &shown), concerns })
 }
 
 /// Keep an origin only when it's supported: a "requested"/"mixed" group needs a
@@ -481,8 +490,9 @@ fn validate_origin(g: &LlmGroup, reqs: &[crate::sessions::Requirement]) -> (Opti
     }
 }
 
-/// Remove "(#12)" / "#12" entry-id references the model sometimes leaks into prose.
-fn strip_id_refs(text: &str) -> String {
+/// Remove "(#12)" / "#12" entry-id references the model sometimes leaks into prose. Numbers that
+/// aren't ids it was shown, or that follow a word like "issue" or "PR", are real references and stay.
+fn strip_id_refs(text: &str, ids: &HashSet<u32>) -> String {
     let mut out = String::with_capacity(text.len());
     let chars: Vec<char> = text.chars().collect();
     let mut i = 0;
@@ -500,6 +510,16 @@ fn strip_id_refs(text: &str) -> String {
                 j += 1;
             }
             if paren && chars.get(j) == Some(&')') { j += 1; }
+            let run: String = chars[start..j].iter().collect();
+            let all_ids = run.split(|c: char| !c.is_ascii_digit()).filter(|n| !n.is_empty())
+                .all(|n| n.parse::<u32>().is_ok_and(|n| ids.contains(&n)));
+            let before = out.trim_end().rsplit(|c: char| !c.is_alphanumeric()).next().unwrap_or("").to_ascii_lowercase();
+            let named = ["issue", "issues", "pr", "prs", "pull", "fixes", "fix", "fixed", "closes", "close", "resolves", "see"].contains(&before.as_str());
+            if !all_ids || named {
+                out.extend(&chars[i..j]);
+                i = j;
+                continue;
+            }
             // Drop the space before a removed reference.
             if out.ends_with(' ') { out.pop(); }
             i = j;
@@ -530,9 +550,16 @@ fn mechanical_group(entries: &[Entry]) -> Option<IntentGroup> {
     })
 }
 
-/// Build rich context with a char budget: imports, small function bodies, then hunks.
-pub fn build_rich_context(results: &[DiffResult], sources: &[(String, String, String)]) -> String {
-    let mut budget: i64 = 16000; // ~4000 tokens
+/// How many characters of changed code the whole change has, with no budget.
+pub fn context_chars(results: &[DiffResult], sources: &[(String, String, String)]) -> usize {
+    build_rich_context(results, sources, None).len()
+}
+
+/// Build rich context within a char budget, or all of it with None. Small function bodies come
+/// first, then hunks. A quarter of the budget is kept for the hunks.
+pub fn build_rich_context(results: &[DiffResult], sources: &[(String, String, String)], limit: Option<usize>) -> String {
+    let mut budget: i64 = limit.map_or(i64::MAX, |l| l as i64);
+    let reserve: i64 = limit.map_or(0, |l| (l / 4) as i64);
     let mut sections = Vec::new();
 
     // 1. Small function bodies (<50 lines), before and/or after.
@@ -553,7 +580,7 @@ pub fn build_rich_context(results: &[DiffResult], sources: &[(String, String, St
             let count = end.saturating_sub(start);
             if count == 0 || count > 50 { continue; }
             let entry = format!("--- {path}:{} {name} ({version})\n{}\n\n", loc.line_start, lines[start..end].join("\n"));
-            if budget - (entry.len() as i64) < 4000 { break 'outer; }
+            if budget - (entry.len() as i64) < reserve { break 'outer; }
             budget -= entry.len() as i64;
             bodies.push_str(&entry);
         }
@@ -598,7 +625,13 @@ fn build_hunks_budgeted(results: &[DiffResult], sources: &[(String, String, Stri
                 }
                 total += line.len() + 1;
                 if total > budget {
-                    out.push("[truncated]".into());
+                    // Say what's missing, so the model doesn't guess about it.
+                    let line_no = change.new_span.as_ref().or(change.old_span.as_ref()).map_or(0, |s| s.start_line);
+                    let mut missing = vec![format!("{path} from line {line_no}")];
+                    missing.extend(results.iter().enumerate().skip(i + 1)
+                        .filter(|(_, r)| !r.review.generated && r.hunks.iter().any(|h| h.noise.is_none()))
+                        .map(|(k, _)| sources.get(k).map_or("?".to_string(), |s| s.0.clone())));
+                    out.push(format!("[truncated to stay within the size limit. Not shown: {}. Don't make claims about code you can't see. Say it wasn't shown instead.]", missing.join(", ")));
                     return out.join("\n");
                 }
                 out.push(line);
@@ -651,7 +684,7 @@ mod tests {
     use super::*;
 
     fn input_with<'a>(results: &'a [DiffResult], cf: &'a CrossFileManifest) -> IntelInput<'a> {
-        IntelInput { results, sources: &[], cross_file: cf, author_context: None, requirements: &[] }
+        IntelInput { results, sources: &[], cross_file: cf, author_context: None, requirements: &[], budget: None }
     }
 
     #[test]
@@ -662,7 +695,7 @@ mod tests {
         let r = perspica_core::analyze_multi(&[perspica_core::cross_file::FileChange::new("a.ts", old, new, perspica_core::Language::TypeScript)]).unwrap();
         let results: Vec<DiffResult> = r.file_results.into_iter().map(|(_, r)| r).collect();
         assert!(!results[0].manifest.extracted_functions.is_empty(), "{:?}", results[0].manifest);
-        let context = build_rich_context(&results, &[("a.ts".into(), old.into(), new.into())]);
+        let context = build_rich_context(&results, &[("a.ts".into(), old.into(), new.into())], Some(16_000));
         assert!(context.contains("square (extracted)") && context.contains("const b = a + 1;"), "{context}");
         // The call site should keep its surrounding lines.
         assert!(context.contains("+   const c = square(x);") && context.contains("    log(c);"), "{context}");
@@ -686,11 +719,23 @@ mod tests {
     }
 
     #[test]
+    fn null_lists_are_empty() {
+        let r: LlmResponse = serde_json::from_str(r#"{"groups":[{"label":"G","entry_ids":[1],"sub_groups":null,"risk":null}],"summary":null,"concerns":null}"#).unwrap();
+        assert!(r.groups[0].sub_groups.is_empty() && r.summary.is_empty() && r.concerns.is_empty());
+    }
+
+    #[test]
     fn strips_entry_ids() {
-        assert_eq!(strip_id_refs("foo (#2) is dead code"), "foo is dead code");
-        assert_eq!(strip_id_refs("see #5 and #6, then"), "see and then");
-        assert_eq!(strip_id_refs("issue #bar stays"), "issue #bar stays");
-        assert_eq!(strip_id_refs("Call graph complexity (#34–79): cycles"), "Call graph complexity: cycles");
-        assert_eq!(strip_id_refs("added (#98-#106) without"), "added without");
+        let ids: HashSet<u32> = (1..=110).collect();
+        let strip = |t: &str| strip_id_refs(t, &ids);
+        assert_eq!(strip("foo (#2) is dead code"), "foo is dead code");
+        assert_eq!(strip("used by #5 and #6, then"), "used by and then");
+        assert_eq!(strip("issue #bar stays"), "issue #bar stays");
+        assert_eq!(strip("Call graph complexity (#34–79): cycles"), "Call graph complexity: cycles");
+        assert_eq!(strip("added (#98-#106) without"), "added without");
+        // Real issue and PR numbers stay.
+        assert_eq!(strip("a regression test covers issue #3179."), "a regression test covers issue #3179.");
+        assert_eq!(strip("the timeout fix (#4890) isn't mentioned"), "the timeout fix (#4890) isn't mentioned");
+        assert_eq!(strip("follows PR #12 closely"), "follows PR #12 closely");
     }
 }

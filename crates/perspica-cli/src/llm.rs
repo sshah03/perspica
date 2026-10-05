@@ -89,6 +89,8 @@ pub trait LlmProvider: Send + Sync {
     /// Suggested models for this provider, for the viewer's picker. Any model
     /// id the provider accepts can still be typed in.
     fn model_options(&self) -> Vec<ModelOption> { vec![] }
+    /// Characters of changed code to send by default. Local models have small context windows.
+    fn context_budget(&self) -> usize { 100_000 }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -107,7 +109,7 @@ impl ModelOption {
 /// Default Claude model for intent grouping.
 pub const DEFAULT_CLAUDE_MODEL: &str = "claude-opus-5-5";
 
-fn claude_models() -> Vec<ModelOption> {
+pub fn claude_models() -> Vec<ModelOption> {
     vec![
         ModelOption::new("claude-opus-5-5", "Claude Opus 5.5", "Strong grouping and grounded concerns (default)"),
         ModelOption::new("claude-sonnet-5-5", "Claude Sonnet 5.5", "Faster and cheaper; good for most diffs"),
@@ -518,6 +520,7 @@ impl LlmProvider for OllamaProvider {
         Box::new(OllamaProvider { model: model.to_string(), installed: self.installed.clone() })
     }
     fn model_options(&self) -> Vec<ModelOption> { self.installed.clone() }
+    fn context_budget(&self) -> usize { 16_000 }
 }
 
 /// A pulled model, from Ollama's `/api/tags`.

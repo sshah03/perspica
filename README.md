@@ -23,6 +23,8 @@ It's built for reviewing work done with coding agents. When the change came from
 
 <sub>Reviewing [colinhacks/zod#6587](https://github.com/colinhacks/zod/pull/6587) (intent, checks, split view), [pallets/click#3767](https://github.com/pallets/click/pull/3767) (reading order, analysis, terminal) and [charmbracelet/bubbletea#1801](https://github.com/charmbracelet/bubbletea/pull/1801) (noise). The agent-session example is illustrative. [Full-quality video (MP4)](docs/media/perspica-demo.mp4).</sub>
 
+**[See it on real pull requests](https://sshah03.github.io/perspica/)** from ripgrep, Flask, Spark and more. Nothing to install.
+
 ## Install
 
 ```bash
@@ -55,6 +57,7 @@ perspica --git main...feature             # a range (merge-base, like a PR)
 perspica --git HEAD~3                     # the working tree against a commit
 perspica old.ts new.ts                    # two files
 perspica --json                           # machine-readable output
+perspica --pr 123 --format html           # the viewer as one file to share, with any saved analysis
 ```
 
 Everything above works on its own. The optional LLM analysis (`-s`, or **Analyze…** in the viewer) runs through Claude Code, an API key or Ollama; see [LLM analysis](#llm-analysis) for setup.
@@ -100,7 +103,7 @@ Optional. `-s` in the terminal, or **Analyze…** in the viewer (with a model pi
 
 If none is found, **Analyze…** in the viewer shows these steps, and *Check again* picks up a Claude Code login or Ollama without restarting. When there are several, the order is `--api-key` / `--provider` or `PERSPICA_API_KEY` (and `PERSPICA_PROVIDER`), then `ANTHROPIC_AUTH_TOKEN` (gateways), `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, Claude Code, Ollama; `--provider ollama` picks the local model over the rest. Prefer the environment to `--api-key`, which leaves the key in your shell history.
 
-The default Claude model is `claude-opus-5-5`; `--model claude-sonnet-5-5` is faster, `claude-haiku-4-5` is a quick first pass. What's sent: the list of classified changes and the changed code, never whole files (Thorough may also read definitions and files under 200 lines from the changed files). Analyses are saved per diff in `.git/perspica/`, so reloading or running again doesn't pay for the same analysis twice; `--fresh` reruns.
+The default Claude model is `claude-opus-5-5`; `--model claude-sonnet-5-5` is faster, `claude-haiku-4-5` is a quick first pass. What's sent: the list of classified changes and the changed code, never whole files (Thorough may also read definitions and files under 200 lines from the changed files). Analyses are saved per diff in `.git/perspica/`, so reloading or running again doesn't pay for the same analysis twice; `--fresh` reruns. Up to 100,000 characters of changed code are sent (16,000 to a local model). For a bigger change, **Analyze…** says how big it is and offers to send all of it, and `--full-context` does the same in the terminal; otherwise the model is told which files it can't see.
 
 ## Privacy
 
@@ -126,7 +129,8 @@ Arguments:
 
 Options:
   -l, --language <LANGUAGE>  Override language detection
-  -f, --format <FORMAT>      Output format: tty (default), json, web [default: tty]
+  -f, --format <FORMAT>      Output format: tty (default), json, web, html (the viewer saved as one file, see --out) [default: tty]
+      --out <OUT>            Where --format html writes the page [default: perspica-review.html]
       --json                 Shorthand for --format json
       --web                  Open results in browser
       --port <PORT>          Port for web viewer (the next free port is used if taken) [default: 7890]
@@ -144,6 +148,7 @@ Options:
       --model <MODEL>        Model to use instead of the provider's default
       --no-sessions          Don't read the Claude Code or Codex sessions behind your change (your prompts are shown, and sent with -s). Never read for other people's changes
       --fresh                Run the LLM analysis again even if a saved one matches this diff
+      --full-context         Send all of the changed code to the LLM, however large. By default perspica sends up to 100,000 characters (16,000 for local models)
   -h, --help                 Print help
   -V, --version              Print version
 ```

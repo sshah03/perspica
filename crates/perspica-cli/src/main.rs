@@ -33,9 +33,13 @@ struct Cli {
     #[arg(short, long)]
     language: Option<String>,
 
-    /// Output format: tty (default), json, web
+    /// Output format: tty (default), json, web, html (the viewer saved as one file, see --out)
     #[arg(short, long, default_value = "tty")]
     format: String,
+
+    /// Where --format html writes the page
+    #[arg(long, default_value = "perspica-review.html")]
+    out: PathBuf,
 
     /// Shorthand for --format json
     #[arg(long)]
@@ -110,6 +114,11 @@ struct Cli {
     /// Run the LLM analysis again even if a saved one matches this diff
     #[arg(long)]
     fresh: bool,
+
+    /// Send all of the changed code to the LLM, however large. By default perspica sends up to
+    /// 100,000 characters (16,000 for local models)
+    #[arg(long)]
+    full_context: bool,
 }
 
 /// Multi-file analysis output.
@@ -354,7 +363,7 @@ fn main() {
             eprintln!("Using the saved analysis of this diff by {} from {}; --fresh to run it again.", s.model, ago(s.saved_at));
             saved::apply(&mut multi, s);
             reused = true;
-        } else if !wants_llm && format == "web" {
+        } else if !wants_llm && (format == "web" || format == "html") {
             saved::apply(&mut multi, s);
         }
     }
@@ -362,7 +371,7 @@ fn main() {
 
     if wants_llm {
         match &provider {
-            Some(p) => rt.block_on(run_llm(&mut multi, &**p, cli.deep)),
+            Some(p) => rt.block_on(run_llm(&mut multi, &**p, cli.deep, cli.full_context)),
             // The viewer explains the setup when Analyze is clicked.
             None if format == "web" => {}
             None => eprintln!("{}\nShowing the analysis without it.\n", rt.block_on(llm::setup()).hint()),
@@ -386,6 +395,14 @@ fn main() {
 
     match format {
         "json" => render_json::render_multi(&multi),
+        "html" => {
+            // A page is made to be shared, so leave out the prompts from your own agent sessions.
+            multi.source.sessions = Default::default();
+            if let Err(e) = std::fs::write(&cli.out, web::export_html(&multi)) {
+                fail(format!("could not write {}: {e}", cli.out.display()));
+            }
+            eprintln!("Wrote {}", cli.out.display());
+        }
         "web" => rt.block_on(web::serve(multi, cli.port, provider, detect, !cli.no_open, key)),
         _ => render_tty::render_multi(&multi, !cli.no_color, cli.show_noise),
     }
@@ -599,7 +616,7 @@ fn max_id(multi: &MultiFileResult) -> u32 {
         .unwrap_or(0)
 }
 
-async fn run_llm(multi: &mut MultiFileResult, provider: &dyn llm::LlmProvider, deep: bool) {
+async fn run_llm(multi: &mut MultiFileResult, provider: &dyn llm::LlmProvider, deep: bool, full: bool) {
     use std::io::IsTerminal;
     let label = format!("Analyzing with {}{}", provider.name(), if deep { " (thorough)" } else { "" });
     let tty = std::io::stderr().is_terminal();
@@ -616,12 +633,18 @@ async fn run_llm(multi: &mut MultiFileResult, provider: &dyn llm::LlmProvider, d
     });
 
     let sources = multi.file_sources();
+    let budget = provider.context_budget();
+    let chars = intel::context_chars(&multi.results, &sources);
+    if !full && chars > budget {
+        eprintln!("\rThis change has {chars} characters of changed code. perspica sends the first {budget}; add --full-context to send all of it.");
+    }
     let input = intel::IntelInput {
         results: &multi.results,
         sources: &sources,
         cross_file: &multi.cross_file,
         author_context: multi.source.author_context.as_deref(),
         requirements: &multi.source.sessions.requirements,
+        budget: (!full).then_some(budget),
     };
     let result = if deep {
         match deep::deep_analyze(&input, provider).await {

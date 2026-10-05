@@ -98,6 +98,31 @@ async fn local_only(allowed: Arc<Vec<String>>, req: Request, next: Next) -> Resp
 // keep running a cached copy of the old one.
 const NO_CACHE: (header::HeaderName, &str) = (header::CACHE_CONTROL, "no-cache");
 
+/// The viewer as one self-contained page, with the result embedded, for `--format html`.
+pub fn export_html(result: &MultiFileResult) -> String {
+    let mut v = serde_json::to_value(result).unwrap_or_default();
+    // Only the model names, so the page can say which model wrote the analysis.
+    v["capabilities"] = serde_json::json!({ "models": llm::claude_models() });
+    // `</script>` inside a string would end the script tag early.
+    let data = serde_json::to_string(&v).unwrap_or_default().replace("</", "<\\/").replace("<!--", "<\\u0021--");
+    let favicon = format!("data:image/svg+xml,{}", include_str!("../web/favicon.svg").replace('#', "%23").replace('"', "'").replace('\n', " "));
+    let title = match (&result.source.repo, &result.source.pr_title) {
+        (Some(repo), Some(t)) => format!("{repo}: {t} · perspica"),
+        _ => format!("{} · perspica", result.source.label),
+    };
+    include_str!("../web/index.html")
+        .replace("<title>perspica</title>", &format!("<title>{}</title>", html_escape(&title)))
+        .replace("href=\"/favicon.svg\"", &format!("href=\"{favicon}\""))
+        .replace("<link rel=\"stylesheet\" href=\"/style.css\">", &format!("<style>\n{}\n</style>", include_str!("../web/style.css")))
+        .replace("<script src=\"/app.js\"></script>", &format!(
+            "<script id=\"perspica-data\" type=\"application/json\">{data}</script>\n<script>\n{}\n</script>",
+            include_str!("../web/app.js").replace("</script", "<\\/script")))
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
 async fn index_handler() -> impl IntoResponse {
     ([NO_CACHE], Html(include_str!("../web/index.html")))
 }
@@ -124,16 +149,18 @@ async fn api_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::Val
 
 /// What the Analyze button can do, or, without a provider, what the user can do to set one up.
 async fn capabilities(state: &AppState) -> serde_json::Value {
-    let (entries, units) = {
+    let (entries, units, chars) = {
         let result = state.result.read().await;
         let sources = result.file_sources();
-        intel::llm_item_counts(&intel::IntelInput {
+        let (entries, units) = intel::llm_item_counts(&intel::IntelInput {
             results: &result.results,
             sources: &sources,
             cross_file: &result.cross_file,
             author_context: None,
             requirements: &result.source.sessions.requirements,
-        })
+            budget: None,
+        });
+        (entries, units, intel::context_chars(&result.results, &sources))
     };
     let provider = state.provider.read().await;
     let setup = match &*provider {
@@ -148,6 +175,9 @@ async fn capabilities(state: &AppState) -> serde_json::Value {
         "llm_setup": setup,
         "llm_entries": entries,
         "llm_units": units,
+        // The dialog offers to send everything when the change is bigger than the budget.
+        "context_chars": chars,
+        "context_budget": provider.as_ref().map(|p| p.context_budget()),
     })
 }
 
@@ -171,6 +201,9 @@ struct AnalyzeRequest {
     /// "standard" (one request) or "thorough" (the model may read definitions first).
     #[serde(default)]
     depth: Option<String>,
+    /// Send all of the changed code, not just the provider's budget.
+    #[serde(default)]
+    full: bool,
 }
 
 async fn analyze_handler(State(state): State<Arc<AppState>>, Json(req): Json<AnalyzeRequest>) -> impl IntoResponse {
@@ -201,6 +234,7 @@ async fn analyze(state: Arc<AppState>, req: AnalyzeRequest) -> (StatusCode, Json
             cross_file: &result.cross_file,
             author_context: result.source.author_context.as_deref(),
             requirements: &result.source.sessions.requirements,
+            budget: (!req.full).then_some(provider.context_budget()),
         };
         if deep_mode {
             deep::deep_analyze(&input, provider).await

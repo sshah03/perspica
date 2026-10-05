@@ -86,10 +86,11 @@ const NOISE_LABEL = { formatting: 'formatting only', comment: 'comments only', r
 // --- Init ---
 async function init() {
     applyBodyClasses();
-    let resp;
+    // A saved page carries its data. Otherwise ask the local server.
+    const embedded = document.getElementById('perspica-data');
+    S.static = !!embedded;
     try {
-        resp = await fetch('/api/diff');
-        S.data = await resp.json();
+        S.data = embedded ? JSON.parse(embedded.textContent) : await (await fetch('/api/diff')).json();
     } catch (e) {
         document.getElementById('diff-scroll').innerHTML =
             `<div class="section"><div class="section-note">Could not load the diff (${esc(String(e))}). Is perspica still running?</div></div>`;
@@ -404,7 +405,8 @@ function renderHeader() {
     const btn = document.getElementById('analyze-btn');
     const cap = d.capabilities || {};
     // Shown without a provider too: it opens the setup instructions, so the feature can be found.
-    btn.classList.remove('hidden');
+    // A saved page has no server to run it.
+    btn.classList.toggle('hidden', !!S.static);
     if (!S.running) btn.textContent = hasLlmGroups() ? 'Re-analyze…' : 'Analyze…';
     btn.title = cap.llm ? `Group changes by intent, rate risk and summarize with ${cap.llm}` : 'Group changes by intent, rate risk and summarize with an LLM (needs a one-time setup)';
     renderProgress();
@@ -457,7 +459,7 @@ function renderOverview() {
     if (d.llm_error) source = `<span class="error">analysis failed: ${esc(truncate(d.llm_error, 160))}</span>`;
     else if (hasLlmGroups()) source = `${esc(modelLabel(d.llm_model))}${d.llm_saved_at ? ` · ${esc(ago(d.llm_saved_at))}` : ''}`;
     let cta = '';
-    if (!hasLlmGroups() && !d.llm_error && !run) {
+    if (!hasLlmGroups() && !d.llm_error && !run && !S.static) {
         cta = `<div class="ov-cta"><button class="link-btn" data-action="analyze">Analyze…</button> for a written summary, intent groups and risk${cap.llm ? '' : ' (with an LLM: a one-time setup)'}.</div>`;
     }
 
@@ -550,7 +552,7 @@ function renderCheck() {
     const haveModel = hasLlmGroups();
     if (!all.length) {
         return `<div class="check-card empty"><div class="ov-label">Before merging</div>
-            <div class="check-empty"><span class="ok-mark">✓</span> Nothing found: no stale references, missed call sites or unused code.${haveModel ? '' : ' Analyze… adds the model’s notes.'}</div></div>`;
+            <div class="check-empty"><span class="ok-mark">✓</span> Nothing found: no stale references, missed call sites or unused code.${haveModel || S.static ? '' : ' Analyze… adds the model’s notes.'}</div></div>`;
     }
     const byDone = (a, b) => (!!S.checked[a.key]) - (!!S.checked[b.key]);
     const box = (x) => `<input type="checkbox" data-check="${esc(x.key)}"${S.checked[x.key] ? ' checked' : ''} title="Mark as checked" aria-label="Mark as checked">`;
@@ -1535,6 +1537,13 @@ function startAnalysis() {
         ? `<select id="an-model" class="field">${models.map(m => `<option value="${esc(m.id)}"${m.id === model ? ' selected' : ''}>${esc(m.label)} · ${esc(m.note)}</option>`).join('')}${models.some(m => m.id === cap.model) ? '' : `<option value="${esc(cap.model)}" selected>${esc(cap.model)} (from --model)</option>`}</select>`
         : `<input id="an-model" class="field mono" value="${esc(model || '')}" spellcheck="false" aria-label="Model">`;
     const reqs = S.data.source?.sessions?.requirements?.length || 0;
+    // When it's bigger than what's sent by default, say how big and offer to send all of it.
+    const over = cap.context_budget && cap.context_chars > cap.context_budget;
+    const tokens = n => `about ${Math.round(n / 4000)}K tokens`;
+    const sizeNote = over ? `<div class="size-note">
+            <p>This change has <b>${cap.context_chars.toLocaleString()}</b> characters of changed code. By default ${esc(cap.llm)} gets the first ${cap.context_budget.toLocaleString()} (${tokens(cap.context_budget)}), and the model is told what it can't see.</p>
+            <label class="check"><input type="checkbox" id="an-full"> Send all of it (${tokens(cap.context_chars)})</label>
+        </div>` : '';
     const option = (value, title, desc) => `<label class="choice"><input type="radio" name="an-depth" value="${value}"${depth === value ? ' checked' : ''}><span><b>${title}</b><span class="choice-desc">${desc}</span><span class="choice-time" data-time="${value}"></span></span></label>`;
     showDialog({
         title: hasLlmGroups() ? 'Re-analyze this change' : 'Analyze this change',
@@ -1545,6 +1554,7 @@ function startAnalysis() {
                 ${option('standard', 'Standard', 'One request with the change list and the changed code.')}
                 ${option('thorough', 'Thorough', 'The model first reads definitions and small files it asks for from the changed files, then answers. Better on unfamiliar code; slower and uses more tokens.')}
             </div>
+            ${sizeNote}
             <details class="sent"><summary>What gets sent to ${esc(cap.llm)}</summary><ul>
                 <li>the classified changes (names, locations) and the changed code, never whole files${depth === 'thorough' ? '' : ''}</li>
                 <li>with Thorough: definitions and files under 200 lines it asks for, only from the changed files</li>
@@ -1556,8 +1566,9 @@ function startAnalysis() {
             { label: 'Analyze', primary: true, onClick: () => {
                 const m = document.getElementById('an-model')?.value.trim() || cap.model;
                 const dp = document.querySelector('input[name="an-depth"]:checked')?.value || 'standard';
+                const full = !!document.getElementById('an-full')?.checked;
                 store.set('analysis', { model: m, depth: dp });
-                runAnalysis({ model: m, depth: dp });
+                runAnalysis({ model: m, depth: dp, full });
             } },
         ],
     });
@@ -1591,7 +1602,7 @@ function setFaviconBusy(on) {
     link.href = 'data:image/svg+xml,' + encodeURIComponent(svg);
 }
 
-async function runAnalysis({ model, depth }) {
+async function runAnalysis({ model, depth, full }) {
     const btn = document.getElementById('analyze-btn');
     setFaviconBusy(true);
     const cap = S.data.capabilities || {};
@@ -1603,7 +1614,7 @@ async function runAnalysis({ model, depth }) {
     tick();
     const timer = setInterval(tick, 1000);
     try {
-        const resp = await fetch('/api/analyze', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model, depth }) });
+        const resp = await fetch('/api/analyze', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model, depth, full: !!full }) });
         const result = await resp.json().catch(() => ({ error: `HTTP ${resp.status}` }));
         if (!resp.ok || result.error) throw new Error(result.error || `HTTP ${resp.status}`);
         S.data.intent_groups = result.groups;
@@ -1707,7 +1718,7 @@ function setupListeners() {
     document.getElementById('mode-toggle').addEventListener('click', e => { const b = e.target.closest('[data-mode]'); if (b) setMode(b.dataset.mode); });
     document.getElementById('view-toggle').addEventListener('click', e => { const b = e.target.closest('[data-view]'); if (b) setView(b.dataset.view); });
     document.getElementById('noise-toggle').addEventListener('change', e => setHideNoise(e.target.checked));
-    document.getElementById('analyze-btn').addEventListener('click', startAnalysis);
+    document.getElementById('analyze-btn').addEventListener('click', () => { if (!S.static) startAnalysis(); });
     document.getElementById('wrap-toggle').addEventListener('change', e => setWrap(e.target.checked));
     document.getElementById('theme-toggle').addEventListener('click', () => { toggleTheme(); closeViewMenu(); });
     document.getElementById('help-btn').addEventListener('click', () => document.getElementById('shortcut-modal').classList.toggle('hidden'));
@@ -1738,7 +1749,7 @@ function setupListeners() {
             const act = a.dataset.action;
             if (act === 'toggle-overview') { S.overviewCollapsed = !S.overviewCollapsed; store.set('overviewCollapsed', S.overviewCollapsed); document.getElementById('overview').classList.toggle('collapsed', S.overviewCollapsed); }
             else if (act === 'toggle-noise') setHideNoise(!S.hideNoise);
-            else if (act === 'analyze') startAnalysis();
+            else if (act === 'analyze' && !S.static) startAnalysis();
             else if (act === 'mode-intent') setMode('intent');
             else if (act === 'mode-flow') setMode('flow');
             else if (act === 'toggle-check') { S.checkOpen = !S.checkOpen; renderOverview(); }

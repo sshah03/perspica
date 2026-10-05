@@ -384,6 +384,8 @@ body.sidebar-collapsed #sidebar { display: none; }
 .setup .cmd { display: flex; align-items: center; gap: 4px; margin-top: 6px; padding: 5px 6px 5px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-1); }
 .setup .cmd code { flex: 1; font-family: var(--font-mono); font-size: var(--font-size-sm); overflow-x: auto; white-space: nowrap; }
 .setup-note { color: var(--risk-med); font-size: var(--font-size-sm); }
+.size-note { display: grid; gap: 6px; padding: 8px 10px; font-size: var(--font-size-sm); color: var(--text-1); border: 1px solid var(--warn-border); background: var(--warn-bg); border-radius: var(--radius); }
+.size-note .check { display: flex; gap: 6px; align-items: center; color: var(--text-0); cursor: pointer; }
 .sent { font-size: var(--font-size-sm); color: var(--text-2); }
 .sent summary { cursor: pointer; color: var(--text-2); }
 .sent ul { margin-top: 4px; }
