@@ -471,6 +471,8 @@ pub fn catch_all(p: &Param, path: &str) -> Option<bool> {
         "py" if p.name.starts_with('*') => Some(false),
         "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "mts" | "cts" if p.name.starts_with("...") => Some(false),
         "go" if ty.starts_with("...") => Some(false),
+        "cs" if ty.starts_with("params ") => Some(false),
+        "kt" | "kts" if ty.starts_with("vararg ") => Some(false),
         "c" | "h" | "java" | "scala" if p.name == "..." || ty.ends_with("...") || ty.ends_with('*') && ty.trim_end_matches('*').ends_with(':') => Some(false),
         _ => None,
     }

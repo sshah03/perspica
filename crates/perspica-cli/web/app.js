@@ -1975,8 +1975,8 @@ const IC = {
 };
 
 // --- Syntax highlighting (lazy, whole-file context) ---
-const LANG_MAP = { TypeScript: 'typescript', Tsx: 'typescript', Python: 'python', Rust: 'rust', Go: 'go', Java: 'java', C: 'c', Scala: 'scala' };
-const EXT_MAP = { js: 'javascript', mjs: 'javascript', cjs: 'javascript', json: 'json', css: 'css', html: 'xml', xml: 'xml', svg: 'xml', md: 'markdown', yml: 'yaml', yaml: 'yaml', sh: 'bash', toml: 'ini', ini: 'ini', sql: 'sql', rb: 'ruby', kt: 'kotlin', swift: 'swift', cpp: 'cpp', hpp: 'cpp', cs: 'csharp', php: 'php' };
+const LANG_MAP = { TypeScript: 'typescript', Tsx: 'typescript', Python: 'python', Rust: 'rust', Go: 'go', Java: 'java', C: 'c', Scala: 'scala', CSharp: 'csharp', Kotlin: 'kotlin' };
+const EXT_MAP = { js: 'javascript', mjs: 'javascript', cjs: 'javascript', json: 'json', css: 'css', html: 'xml', xml: 'xml', svg: 'xml', md: 'markdown', yml: 'yaml', yaml: 'yaml', sh: 'bash', toml: 'ini', ini: 'ini', sql: 'sql', rb: 'ruby', kt: 'kotlin', kts: 'kotlin', swift: 'swift', cpp: 'cpp', hpp: 'cpp', cs: 'csharp', php: 'php' };
 const MAX_HIGHLIGHT_CHARS = 400_000;
 
 function fileLang(fi) {

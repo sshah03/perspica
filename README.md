@@ -15,7 +15,7 @@ perspica reads a diff the way a careful reviewer would. It parses both sides, wo
 
 None of that needs a model. perspica parses both versions with tree-sitter and follows the calls between them, so it's one local binary that answers in a few hundred milliseconds on a typical PR, gives the same answer every time, and needs no API key. An LLM is an optional extra: it groups the changes by intent, rates the risk of each group and writes a summary, and nothing leaves your machine unless you ask for it.
 
-It understands **TypeScript and JavaScript** (including TSX and JSX), **Python**, **Rust**, **Go**, **Java**, **Scala** and **C**. Files in other languages still show up, as ordinary line diffs.
+It understands **TypeScript and JavaScript** (including TSX and JSX), **Python**, **Rust**, **Go**, **Java**, **Kotlin**, **Scala**, **C#** and **C**. Files in other languages still show up, as ordinary line diffs.
 
 It's built for reviewing work done with coding agents. When the change came from your Claude Code or Codex session, perspica shows what you asked for in your own words and, with an LLM, marks which parts you asked for and which the agent decided on its own.
 
@@ -110,7 +110,7 @@ The default Claude model is `claude-opus-5-5`; `--model claude-sonnet-5-5` is fa
 
 ## Languages and file roles
 
-The semantic analysis covers TypeScript and JavaScript, Python, Rust, Go, Java, Scala and C. Every other file is shown as a line diff, with syntax highlighting where available, whitespace-only changes collapsed and its role (test, docs, generated…).
+The semantic analysis covers TypeScript and JavaScript, Python, Rust, Go, Java, Kotlin, Scala, C# and C. Every other file is shown as a line diff, with syntax highlighting where available, whitespace-only changes collapsed and its role (test, docs, generated…).
 
 File roles come from paths and codegen markers; override them in `.gitattributes` with `linguist-generated`, `linguist-vendored`, `linguist-documentation`, or `perspica-role=source|test|docs|generated|vendored`.
 

@@ -192,6 +192,8 @@ fn parse_language(lang_str: &str) -> Language {
         "java" => Language::Java,
         "c" => Language::C,
         "scala" => Language::Scala,
+        "csharp" | "c#" | "cs" => Language::CSharp,
+        "kotlin" | "kt" => Language::Kotlin,
         _ => Language::Unknown,
     }
 }
@@ -456,7 +458,8 @@ fn enrich_with_repo_references(multi: &mut MultiFileResult, target: &git::Target
     // of the same name, say) can't be told apart from it by name: drop it.
     let ambiguous: std::collections::HashSet<&str> = hits.iter()
         .filter(|(name, path, _, text)| !in_diff.contains(path.as_str()) && vanished.iter().any(|v| &v.0 == name)
-            && Language::from_path(path) != Language::Unknown && perspica_core::cross_file::looks_like_definition(text, name))
+            && Language::from_path(path) != Language::Unknown && (perspica_core::cross_file::looks_like_definition(text, name)
+                || (perspica_core::cross_file::overloads(path) && perspica_core::cross_file::defines_function(text, name, path))))
         .map(|(name, ..)| name.as_str())
         .collect();
     // In the method's own file, `this.name` or `self.name` still means the removed method,
@@ -471,9 +474,18 @@ fn enrich_with_repo_references(multi: &mut MultiFileResult, target: &git::Target
     };
     multi.cross_file.broken_references.retain(|b| !ambiguous.contains(b.symbol_name.as_str()) || own_member(b));
     multi.cross_file.vanished.retain(|v| !ambiguous.contains(v.name.as_str()));
+    let file_private: std::collections::HashSet<String> = multi.cross_file.vanished.iter()
+        .filter(|v| v.file_private).map(|v| v.name.clone()).collect();
     let mut next_id = max_id(multi) + 1;
     let mut per_symbol: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    let mut sources: std::collections::HashMap<String, Option<String>> = std::collections::HashMap::new();
+    // Read the files the checks below may need in one go. A git process per file adds up.
+    let mut wanted: Vec<&str> = hits.iter()
+        .map(|(_, path, ..)| path.as_str())
+        .filter(|p| !in_diff.contains(p) && Language::from_path(p) != Language::Unknown)
+        .collect();
+    wanted.sort_unstable();
+    wanted.dedup();
+    let mut sources = git::read_new_many(target, &wanted);
     for (name, path, line, text) in &hits {
         if in_diff.contains(path.as_str()) || ambiguous.contains(name.as_str()) {
             continue; // already scanned precisely by the core, or not a stale name after all
@@ -488,14 +500,16 @@ fn enrich_with_repo_references(multi: &mut MultiFileResult, target: &git::Target
         if per_symbol.get(name.as_str()).copied().unwrap_or(0) >= MAX_PER_SYMBOL {
             continue;
         }
-        if let Some((_, renamed_to, origin, owner)) = vanished.iter().find(|v| &v.0 == name) {
+        // Something private to its own file isn't used anywhere else.
+        if let Some((_, renamed_to, origin, owner)) = vanished.iter().find(|v| &v.0 == name).filter(|_| !file_private.contains(name)) {
             // Same rule as the core: a method's name only counts on its own type.
             if perspica_core::cross_file::scan_references_in(text, name, owner.as_deref(), origin, path).is_empty() {
                 continue;
             }
             // A file that declares the name itself (a variable, parameter, field) is using its own.
             let source = sources.entry(path.clone()).or_insert_with(|| git::read_new(target, path));
-            if source.as_deref().is_some_and(|src| ((perspica_core::cross_file::declares_name(src, name) || perspica_core::cross_file::imports_name_from_elsewhere(src, path, name, origin))
+            if source.as_deref().is_some_and(|src| ((perspica_core::cross_file::declares_name(src, name) || perspica_core::cross_file::imports_name_from_elsewhere(src, path, name, origin)
+                    || (perspica_core::cross_file::overloads(path) && perspica_core::cross_file::defines_function(src, name, path)))
                     && !perspica_core::cross_file::qualified_mention(text, name))
                 || (path.ends_with(".go") && perspica_core::cross_file::go_package_named(src, name) && perspica_core::cross_file::go_package_mention(text, name))) {
                 continue;
@@ -522,16 +536,22 @@ fn enrich_with_repo_references(multi: &mut MultiFileResult, target: &git::Target
             let callee_sig = if callee != perspica_core::parser::bare_name(&impact.name) { callee.to_string() } else { impact.name.clone() };
             let accept = |q: Option<&str>| perspica_core::cross_file::call_qualifier_ok_from(q, &def, &callee_sig, path);
             if callee != name { continue; }
-            // A file that imports this name from another module calls a different function.
+            // A file that imports this name from another module calls a different function. In C# and
+            // Kotlin, so does one with its own method of that name.
             if perspica_core::cross_file::unqualified_call(text, name) {
                 let source = sources.entry(path.clone()).or_insert_with(|| git::read_new(target, path));
-                if source.as_deref().is_some_and(|src| perspica_core::cross_file::imports_it_elsewhere(src, path, &def, name)) { continue; }
+                if source.as_deref().is_some_and(|src| perspica_core::cross_file::imports_it_elsewhere(src, path, &def, name)
+                    || (perspica_core::cross_file::overloads(path) && perspica_core::cross_file::defines_function(src, name, path))) { continue; }
             }
-            let masked = perspica_core::cross_file::code_only(text);
-            let Some((_, _, open)) = perspica_core::cross_file::scan_calls_at(text, &masked, name, &accept).into_iter().next() else { continue };
+            let masked = perspica_core::cross_file::code_only_in(text, path);
+            let Some((_, _, open)) = perspica_core::cross_file::scan_calls_at(text, &masked, name, &accept, path).into_iter().next() else { continue };
+            let args = perspica_core::cross_file::call_arguments(&masked[open..], path);
+            if let (Some((old, _)), Some(a)) = (&impact.params, &args) {
+                if perspica_core::cross_file::other_overload(old, a, &def) { continue; }
+            }
             // A call on one line that still fits the new signature has nothing to update.
-            let fits = match (&impact.params, perspica_core::cross_file::call_arguments(&masked[open..], path)) {
-                (Some((old, new)), Some(args)) => perspica_core::cross_file::still_fits(old, new, &args, perspica_core::cross_file::named_args(&def), &def),
+            let fits = match (&impact.params, &args) {
+                (Some((old, new)), Some(args)) => perspica_core::cross_file::still_fits(old, new, args, perspica_core::cross_file::named_args(&def), &def),
                 _ => false,
             };
             impact.call_sites.push(CallSite { file: path.clone(), line: *line, text: text.clone(), updated: fits, in_diff: false });

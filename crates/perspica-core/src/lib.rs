@@ -24,6 +24,8 @@ pub enum Language {
     Java,
     C,
     Scala,
+    CSharp,
+    Kotlin,
     /// Not parsed: shown as a plain diff with no classification.
     Unknown,
 }
@@ -39,6 +41,8 @@ impl Language {
             "java" => Language::Java,
             "c" | "h" => Language::C,
             "scala" | "sc" => Language::Scala,
+            "cs" => Language::CSharp,
+            "kt" | "kts" => Language::Kotlin,
             _ => Language::Unknown,
         }
     }
@@ -122,7 +126,10 @@ pub fn analyze_multi(files: &[cross_file::FileChange]) -> Result<cross_file::Mul
         a.result.manifest.dead_code.clear();
     }
     let vanished = cross_file::vanished_names(&analyses, &moves).into_iter()
-        .map(|(name, renamed_to, origin, owner)| cross_file::VanishedSymbol { name, renamed_to, origin, owner })
+        .map(|(name, renamed_to, origin, owner)| {
+            let file_private = cross_file::file_private(&analyses, &name, &origin);
+            cross_file::VanishedSymbol { name, renamed_to, origin, owner, file_private }
+        })
         .collect();
     let mut broken_references = cross_file::detect_broken_references(&analyses, &moves, &mut next_id);
     let mut signature_impacts = cross_file::detect_signature_impacts(&analyses, &mut next_id);
@@ -961,6 +968,124 @@ mod tests {
         let m: Vec<(&str, Vec<bool>)> = methods.iter().map(|m| match m { parser::SemanticItem::Function { name, params, .. } => (name.as_str(), params.iter().map(|p| p.optional).collect()), _ => panic!() }).collect();
         assert_eq!(m, [("normalize", vec![false, true]), ("given Show[User]", vec![])]);
         assert_eq!(fields(6), ["Limit", "Id"]);
+    }
+
+    #[test]
+    fn test_csharp_items() {
+        let src = "using System.Text;\nusing Json = System.Text.Json;\n\nnamespace Acme.Tools\n{\n    public record Point(int X, int Y = 0);\n\n    public class Greeter : IGreeter\n    {\n        private readonly string _name;\n        public int Count { get; set; }\n        public Greeter(string name) { _name = name; }\n        public string Greet(string who, int times = 1, params string[] extra) => who;\n        public static string Shout(this string s, ref int n) => s;\n        private enum Mode { Quiet, Loud }\n    }\n\n    file class Helpers { }\n}\n";
+        let lang = languages::get_language_support(Language::CSharp);
+        let tree = parser::parse(src, &*lang).unwrap();
+        let names: Vec<String> = tree.items.iter().filter_map(|i| i.name().map(str::to_string)).collect();
+        assert_eq!(names, ["System.Text", "System.Text.Json", "Point", "Greeter", "Helpers"], "{names:?}");
+        assert!(matches!(&tree.items[1], parser::SemanticItem::Import { symbols, .. } if symbols == &["Json"]));
+        let fields = |i: usize| match &tree.items[i] { parser::SemanticItem::Class { fields, .. } => fields.iter().map(|f| f.name.clone()).collect::<Vec<_>>(), _ => vec![] };
+        assert_eq!(fields(2), ["X", "Y"]);
+        assert_eq!(fields(3), ["_name", "Mode"]);
+        let methods = match &tree.items[3] { parser::SemanticItem::Class { methods, .. } => methods, _ => panic!() };
+        let m: Vec<(&str, Vec<(&str, bool)>)> = methods.iter().map(|m| match m {
+            parser::SemanticItem::Function { name, params, .. } => (name.as_str(), params.iter().map(|p| (p.type_annotation.as_deref().unwrap_or(""), p.optional)).collect()),
+            _ => panic!(),
+        }).collect();
+        assert_eq!(m, [
+            ("Count", vec![]),
+            ("Greeter", vec![("string", false)]),
+            ("Greet", vec![("string", false), ("int", true), ("params string[]", false)]),
+            // The `this` of an extension method isn't passed in the parentheses.
+            ("Shout", vec![("ref int", false)]),
+        ]);
+        assert!(tree.meta[3].exported && !tree.meta[4].exported);
+    }
+
+    #[test]
+    fn test_kotlin_items() {
+        let src = "package acme.tools\n\nimport kotlin.math.max\nimport acme.util.*\n\ntypealias Handler = (Int) -> Unit\n\ndata class Point(val x: Int, val y: Int = 0)\n\nclass Greeter(private val name: String) {\n    val count: Int = 0\n    fun greet(who: String, times: Int = 1, vararg extra: String): String = who\n    companion object {\n        fun create(): Greeter = Greeter(\"x\")\n    }\n    enum class Mode { QUIET, LOUD }\n}\n\nprivate fun String.shout(n: Int): String = this\nval answer = 42\n";
+        let lang = languages::get_language_support(Language::Kotlin);
+        let tree = parser::parse(src, &*lang).unwrap();
+        let names: Vec<String> = tree.items.iter().filter_map(|i| i.name().map(str::to_string)).collect();
+        assert_eq!(names, ["kotlin.math", "acme.util", "Handler", "Point", "Greeter", "shout", "answer"], "{names:?}");
+        assert!(matches!(&tree.items[0], parser::SemanticItem::Import { symbols, .. } if symbols == &["max"]));
+        assert!(matches!(&tree.items[1], parser::SemanticItem::Import { symbols, .. } if symbols.is_empty()));
+        let fields = |i: usize| match &tree.items[i] { parser::SemanticItem::Class { fields, .. } => fields.iter().map(|f| f.name.clone()).collect::<Vec<_>>(), _ => vec![] };
+        assert_eq!(fields(3), ["x", "y"]);
+        assert_eq!(fields(4), ["name", "count", "Mode"]);
+        let methods = match &tree.items[4] { parser::SemanticItem::Class { methods, .. } => methods, _ => panic!() };
+        let m: Vec<(&str, Vec<(&str, bool)>)> = methods.iter().map(|m| match m {
+            parser::SemanticItem::Function { name, params, .. } => (name.as_str(), params.iter().map(|p| (p.type_annotation.as_deref().unwrap_or(""), p.optional)).collect()),
+            _ => panic!(),
+        }).collect();
+        // The companion's functions belong to the class.
+        assert_eq!(m, [("greet", vec![("String", false), ("Int", true), ("vararg String", false)]), ("create", vec![])]);
+        assert!(matches!(&tree.items[5], parser::SemanticItem::Function { return_type: Some(r), params, .. } if r == "String" && params.len() == 1));
+        assert!(!tree.meta[5].exported && tree.meta[6].exported);
+    }
+
+    #[test]
+    fn test_csharp_and_kotlin_call_sites() {
+        let stale = |path: &str, old: &str, new: &str, lang: Language| -> Vec<usize> {
+            let r = analyze_multi(&[cross_file::FileChange::new(path, old, new, lang)]).unwrap();
+            r.cross_file.signature_impacts.iter().flat_map(|s| s.call_sites.iter().filter(|c| !c.updated).map(|c| c.line)).collect()
+        };
+        // A renamed parameter only breaks the call that passes it by name.
+        let old = "class A\n{\n    public static int Scale(int value, int factor = 2) => value * factor;\n\n    public static int Run(int v)\n    {\n        var a = Scale(v);\n        var b = Scale(v, factor: 3);\n        return a + b;\n    }\n}\n";
+        let new = old.replacen("int factor = 2", "int multiplier = 2", 1);
+        assert_eq!(stale("A.cs", old, &new, Language::CSharp), vec![8]);
+        // Extra arguments still fit `params`.
+        let old = "class A\n{\n    static void Log(string msg, params object[] args) { }\n    static void Run() { Log(\"a\", 1, 2); }\n}\n";
+        let new = old.replacen("static void Log(string msg, params object[] args)", "static void Log(string msg, bool loud = false, params object[] args)", 1);
+        assert!(stale("A.cs", old, &new, Language::CSharp).is_empty());
+        // Called inside an interpolated string.
+        let old = "class A\n{\n    static string Name(int id) => \"x\";\n    static string Show(int id) => $\"user {Name(id)}\";\n}\n";
+        let new = old.replacen("static string Name(int id)", "static string Name(int id, bool full)", 1);
+        assert_eq!(stale("A.cs", old, &new, Language::CSharp), vec![4]);
+        // A local function.
+        let old = "class A\n{\n    int Run(int a)\n    {\n        int Add(int x) => x + a;\n        return Add(1);\n    }\n}\n";
+        let new = old.replacen("int Add(int x)", "int Add(int x, int y)", 1);
+        let r = analyze_multi(&[cross_file::FileChange::new("A.cs", old, &new, Language::CSharp)]).unwrap();
+        let sites: Vec<(String, usize, bool)> = r.cross_file.signature_impacts.iter().filter(|s| s.local)
+            .flat_map(|s| s.call_sites.iter().map(|c| (s.name.clone(), c.line, c.updated))).collect();
+        assert_eq!(sites, vec![("Add".to_string(), 6, false)]);
+
+        // A lambda after the parentheses is the last argument.
+        let old = "fun retry(times: Int, block: () -> Unit) {\n    block()\n}\n\nfun main() {\n    retry(3) { println(\"hi\") }\n    retry(times = 2, block = {})\n}\n";
+        let new = old.replacen("fun retry(times: Int, block: () -> Unit)", "fun retry(count: Int, block: () -> Unit)", 1);
+        assert_eq!(stale("a.kt", old, &new, Language::Kotlin), vec![7]);
+        let new = old.replacen("fun retry(times: Int, block: () -> Unit)", "fun retry(times: Int, delay: Long, block: () -> Unit)", 1);
+        assert_eq!(stale("a.kt", old, &new, Language::Kotlin), vec![6, 7]);
+        // Called inside a string template, and through `vararg`.
+        let old = "fun label(id: Int): String = \"x\"\n\nfun show(id: Int) = println(\"user ${label(id)}\")\n";
+        let new = old.replacen("fun label(id: Int)", "fun label(id: Int, full: Boolean)", 1);
+        assert_eq!(stale("b.kt", old, &new, Language::Kotlin), vec![3]);
+        let old = "fun log(msg: String, vararg args: Any) {}\n\nfun main() { log(\"a\", 1, 2) }\n";
+        let new = old.replacen("fun log(msg: String, vararg args: Any)", "fun log(msg: String, loud: Boolean = false, vararg args: Any)", 1);
+        assert!(stale("c.kt", old, &new, Language::Kotlin).is_empty());
+    }
+
+    #[test]
+    fn test_csharp_and_kotlin_definitions_and_overloads() {
+        let stale = |files: &[cross_file::FileChange]| -> Vec<(String, usize)> {
+            analyze_multi(files).unwrap().cross_file.signature_impacts.iter()
+                .flat_map(|s| s.call_sites.iter().filter(|c| !c.updated).map(|c| (c.file.clone(), c.line))).collect()
+        };
+        let cs = |p: &str, o: &str, n: &str| cross_file::FileChange::new(p, o, n, Language::CSharp);
+        // A declaration with its brace on the next line isn't a call. Neither is a bare call in a
+        // file with its own method of that name, or a call that only fits another overload.
+        let old = "class Series\n{\n    public void DeleteEpisode(Episode e)\n    {\n    }\n}\n";
+        let new = old.replacen("DeleteEpisode(Episode e)", "DeleteEpisode(Episode e, string reason)", 1);
+        let other = "class Provider\n{\n    void Run(Episode e, Series s)\n    {\n        DeleteEpisode(e, \"x\");\n        s.DeleteEpisode(e);\n        s.DeleteEpisode();\n    }\n\n    private void DeleteEpisode(Episode e, string reason)\n    {\n    }\n}\n";
+        let found = stale(&[cs("Series.cs", old, &new), cs("Provider.cs", other, &format!("{other}// touched\n"))]);
+        assert_eq!(found, vec![("Provider.cs".to_string(), 6)], "{found:?}");
+        // Kotlin `fun` with its parameters on the next lines, and an extension function.
+        let kt = |p: &str, o: &str, n: &str| cross_file::FileChange::new(p, o, n, Language::Kotlin);
+        let old = "class Dns {\n    fun update(state: Int) {\n        update(\n            state, 1L)\n    }\n\n    private tailrec fun update(\n        state: Int,\n        n: Long,\n    ) {}\n}\n\nfun String.shout(n: Int) = this\n";
+        let new = old.replacen("fun update(state: Int) {", "fun update(state: Int, q: Int) {", 1);
+        assert_eq!(stale(&[kt("Dns.kt", old, &new)]), Vec::<(String, usize)>::new());
+        // A private top-level function removed from one file isn't the `lint` another file calls.
+        let old = "package a\n\nprivate fun Project.lint(x: Int) {}\n\nfun use() { lint.apply {} }\n";
+        let new = "package a\n\nfun use() { lint.apply {} }\n";
+        let user = "package a.lint\n\nfun check() = lint()\n";
+        let r = analyze_multi(&[kt("a.kt", old, new), kt("b.kt", user, &format!("{user}// touched\n"))]).unwrap();
+        assert!(r.cross_file.broken_references.is_empty(), "{:?}", r.cross_file.broken_references);
+        assert!(r.cross_file.vanished.iter().all(|v| v.file_private));
     }
 
     #[test]

@@ -693,6 +693,22 @@ pub fn read_new(target: &Target, path: &str) -> Option<String> {
     }
 }
 
+/// `read_new` for many files with one git process. Files it can't read map to None. A working
+/// tree is read from disk later as needed, so it gives back nothing here.
+pub fn read_new_many(target: &Target, paths: &[&str]) -> std::collections::HashMap<String, Option<String>> {
+    let rev = match target {
+        Target::Range(_, b) => b.clone(),
+        Target::Staged => String::new(),
+        Target::WorkingTree(_) | Target::Branch { .. } => return std::collections::HashMap::new(),
+    };
+    let specs: Vec<String> = paths.iter().map(|p| format!("{rev}:{p}")).collect();
+    let spec_refs: Vec<&str> = specs.iter().map(String::as_str).collect();
+    let Ok(mut blobs) = cat_file_batch(&spec_refs) else { return std::collections::HashMap::new() };
+    paths.iter().zip(&specs)
+        .map(|(p, s)| (p.to_string(), blobs.remove(s).map(|b| String::from_utf8_lossy(&b).into_owned())))
+        .collect()
+}
+
 /// Parse a unified diff string into DiffHunks that match our data model.
 pub fn parse_unified_diff(raw: &str) -> Vec<perspica_core::manifest::DiffHunk> {
     use perspica_core::manifest::{Change, ChangeKind, DiffHunk, LineRange, Span};

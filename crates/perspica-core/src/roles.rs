@@ -69,9 +69,11 @@ pub fn is_generated_path(path: &str) -> bool {
         file,
         "Cargo.lock" | "package-lock.json" | "yarn.lock" | "pnpm-lock.yaml" | "poetry.lock" | "Pipfile.lock"
             | "go.sum" | "composer.lock" | "Gemfile.lock" | "bun.lockb" | "bun.lock" | "uv.lock" | "flake.lock"
+            | "packages.lock.json" | "gradle.lockfile"
     ) || [
         ".min.js", ".min.css", ".map", ".snap", ".pb.go", "_pb2.py", "_pb2_grpc.py", ".pb.h", ".pb.cc",
         ".generated.ts", ".g.dart", ".freezed.dart", "_generated.go", ".designer.cs",
+        ".Designer.cs", ".g.cs", ".g.i.cs", "ModelSnapshot.cs",
     ].iter().any(|ext| file.ends_with(ext))
         || [".rlib", ".rmeta", ".o", ".d", ".pyc", ".class"].iter().any(|ext| file.ends_with(ext))
         || path.starts_with("target/debug/") || path.starts_with("target/release/")
@@ -93,14 +95,17 @@ fn has_generated_marker(content: &str) -> bool {
 pub fn is_test_path(path: &str) -> bool {
     let file = file_name(path);
     let stem = file.split('.').next().unwrap_or(file);
-    let dir_hit = segments(path)
-        .take(path.split('/').count().saturating_sub(1))
-        .any(|s| matches!(s, "test" | "tests" | "__tests__" | "spec" | "specs" | "testdata" | "__mocks__" | "e2e"));
+    let dirs: Vec<&str> = segments(path).take(path.split('/').count().saturating_sub(1)).collect();
+    let dir_hit = dirs.iter().any(|s| matches!(*s, "test" | "tests" | "__tests__" | "spec" | "specs" | "testdata" | "__mocks__" | "e2e"))
+        // C# test projects like `Foo.Tests/`, and Kotlin source sets like `src/commonTest/`.
+        || dirs.iter().any(|s| s.contains('.') && [".Tests", ".Test", ".UnitTests", ".IntegrationTests", ".FunctionalTests", ".Specs"].iter().any(|e| s.ends_with(e)))
+        || dirs.windows(2).any(|w| w[0] == "src" && w[1].ends_with("Test") && w[1].starts_with(|c: char| c.is_ascii_lowercase()));
     dir_hit
         || file.ends_with("_test.go")
         || (file.ends_with(".py") && (stem.starts_with("test_") || stem.ends_with("_test") || stem == "conftest"))
         || [".test.", ".spec.", "_spec."].iter().any(|m| file.contains(m))
         || (file.ends_with(".java") || file.ends_with(".kt")) && (stem.ends_with("Test") || stem.ends_with("Tests") || stem.ends_with("IT"))
+        || file.ends_with(".cs") && (stem.ends_with("Test") || stem.ends_with("Tests"))
         || file.ends_with(".scala") && (stem.ends_with("Test") || stem.ends_with("Tests") || stem.ends_with("Spec") || stem.ends_with("Suite"))
         || path.contains("src/test/")
 }
@@ -125,7 +130,7 @@ pub fn is_docs_path(path: &str) -> bool {
 }
 
 fn is_code_ext(file: &str) -> bool {
-    [".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".java", ".c", ".h", ".kt", ".swift", ".rb", ".scala"].iter().any(|e| file.ends_with(e))
+    [".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".java", ".c", ".h", ".kt", ".kts", ".cs", ".swift", ".rb", ".scala"].iter().any(|e| file.ends_with(e))
 }
 
 #[cfg(test)]
@@ -143,6 +148,12 @@ mod tests {
             ("src/test/java/com/x/FooTest.java", FileRole::Test),
             ("core/src/main/scala/x/FooSpec.scala", FileRole::Test),
             ("core/src/main/scala/x/Foo.scala", FileRole::Source),
+            ("test/Shared.Tests/ParserTests.cs", FileRole::Test),
+            ("src/Newtonsoft.Json.Tests/Linq/JArrayAssert.cs", FileRole::Test),
+            ("src/Acme.Core/Parser.cs", FileRole::Source),
+            ("src/Acme.Core/Form1.Designer.cs", FileRole::Generated),
+            ("library/src/commonTest/kotlin/x/Helpers.kt", FileRole::Test),
+            ("library/src/commonMain/kotlin/x/Helpers.kt", FileRole::Source),
             ("README.md", FileRole::Docs),
             ("docs/guide/setup.md", FileRole::Docs),
             ("docs/conf.py", FileRole::Source),

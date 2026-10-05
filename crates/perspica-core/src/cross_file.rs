@@ -37,6 +37,9 @@ pub struct VanishedSymbol {
     /// For a method, the type it belonged to: only `Owner.name` / `self.name` mentions can refer to it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
+    /// Only its own file can use it, like a private top-level Kotlin function.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub file_private: bool,
 }
 
 /// A name that no longer exists: (name, what it became, file it was defined in, owner type for methods).
@@ -293,6 +296,17 @@ pub(crate) fn vanished_names(analyses: &[InternalAnalysis], moves: &[CrossFileMo
     out
 }
 
+/// A private top-level Kotlin function or `file` C# type, which only its own file can use.
+pub(crate) fn file_private(analyses: &[InternalAnalysis], name: &str, origin: &str) -> bool {
+    overloads(origin) && old_item(analyses, name, origin).is_some_and(|(_, m)| !m.exported)
+}
+
+/// The top-level item called `name` in the old version of `origin`.
+fn old_item<'a>(analyses: &'a [InternalAnalysis], name: &str, origin: &str) -> Option<(&'a SemanticItem, &'a crate::parser::ItemMeta)> {
+    let a = analyses.iter().find(|a| a.path == origin)?;
+    a.old_tree.items.iter().zip(&a.old_tree.meta).find(|(i, _)| i.name() == Some(name))
+}
+
 /// Stale references to vanished names in the new versions of the changed files.
 pub(crate) fn detect_broken_references(
     analyses: &[InternalAnalysis],
@@ -301,18 +315,25 @@ pub(crate) fn detect_broken_references(
 ) -> Vec<BrokenReferenceEntry> {
     let mut broken = Vec::new();
     for (name, renamed_to, origin, owner) in vanished_names(analyses, moves) {
-        // A changelog names old things on purpose.
-        for a in analyses.iter().filter(|a| !crate::roles::is_changelog_path(&a.path)) {
+        let private = file_private(analyses, &name, &origin);
+        // A Kotlin or C# function is only called, so `name.x` is something else.
+        let function = overloads(&origin) && old_item(analyses, &name, &origin).is_some_and(|(i, _)| matches!(i, SemanticItem::Function { .. }));
+        // A changelog names old things on purpose. Config and docs mention names for other reasons.
+        for a in analyses.iter().filter(|a| !crate::roles::is_changelog_path(&a.path) && crate::Language::from_path(&a.path) != crate::Language::Unknown) {
+            // A private one can only be used in its own file.
+            if private && a.path != origin { continue; }
             // Most files never mention the name, so find references first and only then run the other checks.
             let found = scan_references_in(&a.new_source, &name, owner.as_deref(), &origin, &a.path);
             if found.is_empty() { continue; }
             // `const name = …`, `name := …`, a `name` parameter or field: this file's own name explains its
             // bare mentions, not a qualified call like `opts.name()` (a method can't be the local).
-            let declares = declares_name(&a.new_source, &name) || imports_name_from_elsewhere(&a.new_source, &a.path, &name, &origin);
+            let declares = declares_name(&a.new_source, &name) || imports_name_from_elsewhere(&a.new_source, &a.path, &name, &origin)
+                || (overloads(&a.path) && defines_function(&a.new_source, &name, &a.path));
             // In Go, `name.X` in a file that is or imports package `name` is the package (`stacktrace.Take`).
             let go_pkg = a.path.ends_with(".go") && go_package_named(&a.new_source, &name);
             let refs = found.into_iter()
                 .filter(|(_, text)| !(go_pkg && go_package_mention(text, &name)))
+                .filter(|(_, text)| !(function && find_identifier(text, &name).is_some_and(|at| text[at + name.len()..].starts_with('.'))))
                 .filter(|(_, text)| !declares || qualified_mention(text, &name));
             for (line, text) in refs.take(5) {
                 broken.push(BrokenReferenceEntry {
@@ -357,12 +378,12 @@ pub(crate) fn local_signature_impacts(analyses: &[InternalAnalysis], next_id: &m
             .collect();
         if changed.is_empty() { continue; }
         changed.sort_by_key(|(_, n)| n.span.start_line);
-        let masked = code_only(&a.new_source);
+        let masked = code_only_in(&a.new_source, &a.path);
         let added = added_lines(&a.result.hunks);
         let bare = |q: Option<&str>| q.is_none();
         for (o, n) in changed {
             let mut call_sites = Vec::new();
-            for (line, text, open) in scan_calls_at(&a.new_source, &masked, &n.name, &bare) {
+            for (line, text, open) in scan_calls_at(&a.new_source, &masked, &n.name, &bare, &a.path) {
                 if line < n.scope.start_line || line > n.scope.end_line || line == n.span.start_line { continue; }
                 let args = call_arguments(&masked[open..], &a.path);
                 let end = line + args.as_ref().map_or(0, |x| x.lines);
@@ -501,10 +522,12 @@ pub(crate) fn detect_signature_impacts(
                     None => sig.name.clone(),
                 }
             });
-            let old = find_function(&a.old_tree, &old_name)
-                .or_else(|| analyses.iter().find_map(|o| find_function(&o.old_tree, &old_name)))
+            // With overloads, the one whose signature changed. Methods pair up in order.
+            let nth = functions_named(&a.new_tree, &sig.name).iter().position(|(_, s)| s.start_line == sig.location.line_start).unwrap_or(0);
+            let old = find_function(&a.old_tree, &old_name, nth)
+                .or_else(|| analyses.iter().find_map(|o| find_function(&o.old_tree, &old_name, nth)))
                 .map(|p| p.to_vec());
-            let new = find_function(&a.new_tree, &sig.name).map(|p| p.to_vec());
+            let new = find_function(&a.new_tree, &sig.name, nth).map(|p| p.to_vec());
             // Without both versions there's nothing to judge a call against: don't guess.
             let (Some(old), Some(new)) = (old, new) else { continue };
             // Only changes that can break an existing call (e.g. not a new optional param).
@@ -540,12 +563,15 @@ pub(crate) fn detect_signature_impacts(
                 }
                 let added = added_lines(&b.result.hunks);
                 let accept = |q: Option<&str>| call_qualifier_ok_from(q, &a.path, &callee_sig, &b.path);
-                let masked = masks[bi].get_or_init(|| code_only(&b.new_source));
+                let masked = masks[bi].get_or_init(|| code_only_in(&b.new_source, &b.path));
                 let elsewhere = b.path != a.path && imports_it_elsewhere(&b.new_source, &b.path, &a.path, callee);
-                for (line, text, open) in scan_calls_at(&b.new_source, masked, callee, &accept) {
+                // In C# and Kotlin a bare call in a file with its own method of that name calls that one.
+                let own = b.path != a.path && overloads(&b.path) && defines_function(&b.new_source, callee, &b.path);
+                for (line, text, open) in scan_calls_at(&b.new_source, masked, callee, &accept, &b.path) {
                     if b.path == a.path && line == sig.location.line_start { continue; }
-                    if elsewhere && unqualified_call(&text, callee) { continue; }
+                    if (elsewhere || own) && unqualified_call(&text, callee) { continue; }
                     let args = call_arguments(&masked[open..], &b.path);
+                    if matches!((&params, &args), (Some((o, _)), Some(x)) if other_overload(o, x, &a.path)) { continue; }
                     // The whole call counts, not just its first line: `f(\n  new_arg,\n)`.
                     let end = line + args.as_ref().map_or(0, |a| a.lines);
                     let touched = (line..=end).any(|l| added.contains(&l));
@@ -572,6 +598,16 @@ pub(crate) fn detect_signature_impacts(
 /// Languages where a caller can pass an argument by name (`f(x=1)`), so parameter names matter.
 pub fn named_args(path: &str) -> bool {
     path.ends_with(".py") || path.ends_with(".scala") || path.ends_with(".sc")
+}
+
+/// Languages that pick between overloads of a name by the arguments.
+pub fn overloads(path: &str) -> bool {
+    path.ends_with(".cs") || path.ends_with(".kt") || path.ends_with(".kts")
+}
+
+/// A call that doesn't fit the old signature either is a call to some other overload.
+pub fn other_overload(old: &[crate::parser::Param], args: &CallArgs, def_path: &str) -> bool {
+    overloads(def_path) && !still_fits(old, old, args, false, def_path)
 }
 
 /// JavaScript, TypeScript and Python import what they call: a file that uses imports but doesn't
@@ -700,15 +736,17 @@ pub struct CallArgs {
 pub fn call_arguments(from: &str, path: &str) -> Option<CallArgs> {
     let py = path.ends_with(".py");
     let go = path.ends_with(".go");
+    let cs = path.ends_with(".cs");
+    let kt = path.ends_with(".kt") || path.ends_with(".kts");
     let mut chars = from.char_indices();
     if chars.next()?.1 != '(' { return None; }
-    let (mut depth, mut start, mut lines, mut closed) = (0usize, 1usize, 0usize, false);
+    let (mut depth, mut start, mut lines, mut closed, mut end) = (0usize, 1usize, 0usize, false, 0usize);
     let mut args: Vec<&str> = Vec::new();
     for (i, c) in chars {
         match c {
             '(' | '[' | '{' => depth += 1,
             ')' | ']' | '}' if depth > 0 => depth -= 1,
-            ')' => { args.push(&from[start..i]); closed = true; break; }
+            ')' => { args.push(&from[start..i]); closed = true; end = i + 1; break; }
             ',' if depth == 0 => { args.push(&from[start..i]); start = i + 1; }
             '\n' => lines += 1,
             _ => {}
@@ -718,11 +756,15 @@ pub fn call_arguments(from: &str, path: &str) -> Option<CallArgs> {
     if !closed { return None; }
     if args.last().is_none_or(|a| a.trim().is_empty()) { args.pop(); }
     let mut out = CallArgs { positional: 0, keywords: Vec::new(), spread: false, lines };
+    // Kotlin passes a lambda after the parentheses as the last argument.
+    if kt && from[end..].trim_start_matches([' ', '\t']).starts_with('{') { out.positional += 1; }
     for a in args {
         let a = a.trim();
-        if a.starts_with("...") || (py && a.starts_with('*')) || (go && a.ends_with("...")) { out.spread = true; continue; }
-        // `name=value` (Python keyword), not `a == b` or `a => b`.
-        let kw = a.find('=').filter(|&i| i > 0 && !a[i..].starts_with("==") && !a[i..].starts_with("=>") && !a[..i].ends_with(['!', '<', '>', '=']));
+        if a.starts_with("...") || ((py || kt) && a.starts_with('*')) || (go && a.ends_with("...")) { out.spread = true; continue; }
+        // `name=value` (Python keyword), not `a == b` or `a => b`. C# writes `name: value`.
+        let kw = if cs { a.find(':').filter(|&i| i > 0 && !a[i..].starts_with("::")) } else {
+            a.find('=').filter(|&i| i > 0 && !a[i..].starts_with("==") && !a[i..].starts_with("=>") && !a[..i].ends_with(['!', '<', '>', '=']))
+        };
         match kw.map(|i| a[..i].trim()).filter(|k| k.chars().all(|c| c.is_alphanumeric() || c == '_')) {
             Some(k) if !k.is_empty() => out.keywords.push(k.to_string()),
             _ => out.positional += 1,
@@ -773,22 +815,32 @@ fn renamed_types(mut p: crate::parser::Param, renames: &HashMap<String, String>)
     p
 }
 
-/// Parameters of the function or `Class.method` named `name`.
-fn find_function<'t>(tree: &'t SemanticTree, name: &str) -> Option<&'t [crate::parser::Param]> {
+/// Parameters of the function or `Class.method` named `name`. With overloads, the `nth` one,
+/// or the first if there aren't that many.
+fn find_function<'t>(tree: &'t SemanticTree, name: &str, nth: usize) -> Option<&'t [crate::parser::Param]> {
+    let all = functions_named(tree, name);
+    all.get(nth).or(all.first()).map(|(p, _)| *p)
+}
+
+/// Every function or `Class.method` named `name`, in order.
+fn functions_named<'t>(tree: &'t SemanticTree, name: &str) -> Vec<(&'t [crate::parser::Param], &'t crate::manifest::Span)> {
+    let mut out = Vec::new();
     for item in &tree.items {
         match item {
-            SemanticItem::Function { name: n, params, .. } if n == name => return Some(params),
+            SemanticItem::Function { name: n, params, span, .. } if n == name => out.push((params.as_slice(), span)),
             SemanticItem::Class { name: c, methods, .. } => {
                 for m in methods {
-                    if let SemanticItem::Function { name: n, params, .. } = m {
-                        if format!("{c}.{n}") == name { return Some(params); }
+                    if let SemanticItem::Function { name: n, params, span, .. } = m {
+                        if name.len() == c.len() + 1 + n.len() && name.starts_with(c.as_str()) && name[c.len()..].starts_with('.') && name.ends_with(n.as_str()) {
+                            out.push((params.as_slice(), span));
+                        }
                     }
                 }
             }
             _ => {}
         }
     }
-    None
+    out
 }
 
 /// Drop dead-code entries for items referenced from another changed file.
@@ -825,22 +877,24 @@ pub fn scan_references(source: &str, name: &str, owner: Option<&str>, origin: &s
     scan_references_in(source, name, owner, origin, "")
 }
 
-/// `scan_references` for the file at `path`: in Scala and Java, a method's own file can call it
-/// bare (`name(` is `this.name(`).
+/// `scan_references` for the file at `path`. In Scala, Java, C# and Kotlin a method's own file can call it
+/// bare, since `name(` is `this.name(`.
 pub fn scan_references_in(source: &str, name: &str, owner: Option<&str>, origin: &str, path: &str) -> Vec<(usize, String)> {
-    let implicit_this = path == origin && (path.ends_with(".scala") || path.ends_with(".sc") || path.ends_with(".java"));
+    let implicit_this = path == origin && [".scala", ".sc", ".java", ".cs", ".kt", ".kts"].iter().any(|e| path.ends_with(e));
     if !source.contains(name) {
         return vec![];
     }
     // Code only: a name in a string (`if name == "old_name":` in a deprecation shim, a message)
     // isn't a use of it. Python's `__all__` lists exports as strings, so it's kept.
-    let masked = code_only(source);
+    let masked = code_only_in(source, path);
     let originals: Vec<&str> = source.lines().collect();
     let mut out = Vec::new();
     for (i, m) in masked.lines().enumerate() {
         let original = originals.get(i).copied().unwrap_or("");
         let l = if original.contains("__all__") { original } else { m };
         if looks_like_comment(original.trim_start()) { continue; }
+        // `package a.name` and `namespace A.Name` name a package, not the symbol.
+        if overloads(path) && ["package ", "namespace "].iter().any(|k| original.trim_start().starts_with(k)) { continue; }
         let mut offset = 0;
         while let Some(pos) = find_identifier(&l[offset..], name) {
             let at = offset + pos;
@@ -887,7 +941,7 @@ pub fn reference_ok(q: Option<&str>, owner: Option<&str>, origin: &str, name: &s
 pub fn distinctive(name: &str) -> bool {
     const COMMON: &[&str] = &["toString", "valueOf", "hashCode", "readLine", "readAll", "getName", "setName", "getValue", "setValue",
         "getType", "isEmpty", "addAll", "forEach", "toJSON", "to_string", "to_owned", "as_str", "as_ref", "into_iter", "is_empty",
-        "is_some", "is_none", "unwrap_or", "and_then", "get_mut", "__init__", "__call__", "__enter__", "__exit__", "__repr__", "__str__"];
+        "is_some", "is_none", "unwrap_or", "and_then", "get_mut", "ToString", "GetHashCode", "GetType", "__init__", "__call__", "__enter__", "__exit__", "__repr__", "__str__"];
     let compound = name.contains('_') || name.chars().skip(1).any(|c| c.is_uppercase());
     name.trim_matches('_').len() >= 6 && compound && !COMMON.contains(&name)
 }
@@ -1001,7 +1055,7 @@ pub fn looks_like_definition(line: &str, name: &str) -> bool {
     if matches!(last_word, "class" | "object" | "trait" | "struct" | "enum" | "interface" | "type" | "typedef" | "impl" | "record"
         | "val" | "var" | "let" | "const" | "static" | "lazy") { return true; }
     if !rest.starts_with('(') { return false; }
-    if matches!(last_word, "fn" | "function" | "def" | "func" | "sub" | "proc") { return true; }
+    if matches!(last_word, "fn" | "function" | "def" | "func" | "sub" | "proc" | "fun") { return true; }
     if before.starts_with("func (") && before.ends_with(')') { return true; }
     let qualified = before.ends_with('.') || before.ends_with("::");
     let control = ["return", "if", "else", "while", "for", "switch", "case", "await", "new", "yield", "=", "(", ",", "!", "&&", "||", "=>"]
@@ -1040,7 +1094,7 @@ pub fn scan_calls(source: &str, name: &str, accept: &dyn Fn(Option<&str>) -> boo
 }
 
 /// Like `scan_calls`, on an already-masked source, also giving the byte offset of each call's `(`.
-pub fn scan_calls_at(source: &str, masked: &str, name: &str, accept: &dyn Fn(Option<&str>) -> bool) -> Vec<(usize, String, usize)> {
+pub fn scan_calls_at(source: &str, masked: &str, name: &str, accept: &dyn Fn(Option<&str>) -> bool, path: &str) -> Vec<(usize, String, usize)> {
     if !source.contains(name) {
         return vec![];
     }
@@ -1058,9 +1112,7 @@ pub fn scan_calls_at(source: &str, masked: &str, name: &str, accept: &dyn Fn(Opt
             let after = &l[at + name.len()..];
             let rest = after.trim_start();
             let before = &l[..at];
-            let is_decl = ["fn", "function", "def", "func", "class"].iter().any(|kw| before.trim_end().ends_with(kw))
-                || looks_like_signature(rest);
-            if rest.starts_with('(') && !is_decl && accept(qualifier(before)) {
+            if rest.starts_with('(') && !is_declaration(before, rest, path) && accept(qualifier(before)) {
                 let open = base + at + name.len() + (after.len() - rest.len());
                 out.push((i + 1, t.chars().take(160).collect(), open));
                 break;
@@ -1071,11 +1123,72 @@ pub fn scan_calls_at(source: &str, masked: &str, name: &str, accept: &dyn Fn(Opt
     out
 }
 
+/// Whether the name between `before` and `rest` on a line is being defined rather than called.
+fn is_declaration(before: &str, rest: &str, path: &str) -> bool {
+    let b = before.trim_end();
+    ["fn", "function", "def", "func", "class"].iter().any(|kw| b.ends_with(kw))
+        || looks_like_signature(rest)
+        || ((path.ends_with(".kt") || path.ends_with(".kts")) && kotlin_fun(b))
+        || (path.ends_with(".cs") && csharp_return_type(b))
+}
+
+/// `fun name(`, `fun <T> name(` and `fun String.name(`.
+fn kotlin_fun(before: &str) -> bool {
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    before.match_indices("fun").any(|(i, _)| {
+        let after = &before[i + 3..];
+        !before[..i].ends_with(word) && (after.is_empty() || after.starts_with(' '))
+            && !after.contains(['(', ')', '=', '{', '}', ';'])
+    })
+}
+
+/// C# writes the return type right before a method's name, like `void Run(`, `Task<int> Get(`
+/// or `string[] Split(`. A call comes after a keyword or an operator instead.
+fn csharp_return_type(before: &str) -> bool {
+    const KEYWORDS: &[&str] = &["return", "await", "new", "else", "yield", "throw", "case", "in", "is", "as", "not", "and", "or",
+        "when", "out", "ref", "goto", "typeof", "nameof", "sizeof", "default", "lock", "using", "fixed", "checked", "unchecked",
+        "from", "select", "where", "let", "on", "equals", "by", "into", "orderby", "join", "do", "var", "params", "stackalloc"];
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    match before.chars().last() {
+        // A generic type, not `a > b` or `x => f(`.
+        Some('>') => before.matches('<').count() >= before.matches('>').count(),
+        Some(']') => true,
+        // `int? Find(`, not `a ? f() : b`.
+        Some('?') => before[..before.len() - 1].ends_with(|c: char| word(c) || c == '>'),
+        Some(c) if word(c) => !KEYWORDS.contains(&before.rsplit(|c: char| !word(c)).next().unwrap_or("")),
+        _ => false,
+    }
+}
+
+/// Whether `source` defines a function or method called `name`, in C# or Kotlin.
+pub fn defines_function(source: &str, name: &str, path: &str) -> bool {
+    if !source.contains(name) { return false; }
+    let masked = code_only_in(source, path);
+    let found = masked.lines().any(|l| {
+        let mut offset = 0;
+        while let Some(pos) = find_identifier(&l[offset..], name) {
+            let at = offset + pos;
+            let rest = l[at + name.len()..].trim_start();
+            if (rest.starts_with('(') || rest.starts_with('<')) && is_declaration(&l[..at], rest, path) { return true; }
+            offset = at + name.len();
+        }
+        false
+    });
+    found
+}
+
 /// `source` with the contents of string literals and comments replaced by
 /// spaces (newlines kept), so positions and line numbers still line up.
 /// Handles "…", '…', `…`, triple-quoted strings, //, /* */ and # comments.
 /// A `'` after `&`, `<` or a word character is a Rust lifetime, not a quote.
 pub fn code_only(source: &str) -> String {
+    code_only_in(source, "")
+}
+
+/// `code_only` for the file at `path`. In Kotlin `"${x}"` and `"$x"` are code, and in C# `$"{x}"` is.
+pub fn code_only_in(source: &str, path: &str) -> String {
+    let kt = path.ends_with(".kt") || path.ends_with(".kts");
+    let cs = path.ends_with(".cs");
     let chars: Vec<char> = source.chars().collect();
     let mut out = String::with_capacity(source.len());
     let mut i = 0;
@@ -1102,13 +1215,20 @@ pub fn code_only(source: &str) -> String {
             let q = if triple { 3 } else { 1 };
             // Python f-strings have code inside `{ }` and JavaScript template literals inside `${ }`.
             let prefix: String = chars[..i].iter().rev().take_while(|p| p.is_ascii_alphabetic()).collect::<String>().to_ascii_lowercase();
-            let fstring = c != '`' && prefix.contains('f') && prefix.len() <= 2 && prefix.chars().all(|p| matches!(p, 'f' | 'r' | 'b'));
+            let fstring = c != '`' && prefix.contains('f') && prefix.len() <= 2 && prefix.chars().all(|p| matches!(p, 'f' | 'r' | 'b'))
+                || cs && c == '"' && chars[..i].iter().rev().take_while(|p| matches!(p, '$' | '@')).any(|p| *p == '$');
+            let dollar = kt && c == '"';
             for _ in 0..q { out.push(c); }
             i += q;
             while i < chars.len() {
                 if chars[i] == '\\' && i + 1 < chars.len() { out.push(' '); out.push(blank(chars[i + 1])); i += 2; continue; }
-                let opens = (c == '`' && chars[i] == '$' && chars.get(i + 1) == Some(&'{'))
+                let opens = ((c == '`' || dollar) && chars[i] == '$' && chars.get(i + 1) == Some(&'{'))
                     || (fstring && chars[i] == '{' && chars.get(i + 1) != Some(&'{'));
+                if dollar && chars[i] == '$' && chars.get(i + 1).is_some_and(|n| n.is_alphabetic() || *n == '_') {
+                    out.push('$'); i += 1;
+                    while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') { out.push(chars[i]); i += 1; }
+                    continue;
+                }
                 if fstring && chars[i] == '{' && chars.get(i + 1) == Some(&'{') { out.push_str("  "); i += 2; continue; }
                 if opens {
                     let start = if chars[i] == '$' { 2 } else { 1 };

@@ -32,7 +32,7 @@ const BUILTIN_METHODS: &[&str] = &[
     "slice", "splice", "concat", "entries", "set", "has", "delete", "then", "catch", "finally", "toString", "trim",
     "startsWith", "endsWith", "match", "test", "apply", "call", "bind",
 ];
-/// Methods of the standard interfaces and traits in Go, Rust and Java (`String()`, `Error()`,
+/// Methods of the standard interfaces and traits in Go, Rust, Java and C# (`String()`, `Error()`,
 /// `fmt`, `clone`, `next`, `toString`…). Nearly every type has them, so on a receiver of unknown
 /// type one changed type defining it says nothing about which runs.
 const INTERFACE_METHODS: &[&str] = &[
@@ -43,6 +43,7 @@ const INTERFACE_METHODS: &[&str] = &[
     "next", "deref", "deref_mut", "as_ref", "as_mut", "borrow", "borrow_mut", "to_string", "to_owned", "write", "read",
     "flush", "len", "is_empty", "iter", "into_iter",
     "toString", "equals", "hashCode", "compareTo", "close",
+    "ToString", "Equals", "GetHashCode", "CompareTo", "Dispose", "DisposeAsync", "GetEnumerator", "MoveNext",
 ];
 /// Names defined in more places than this are too ambiguous to link by name.
 const MAX_DEFS_PER_NAME: usize = 4;

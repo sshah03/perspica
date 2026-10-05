@@ -143,6 +143,48 @@ fn test_add_dependency_scala() {
 }
 
 #[test]
+fn test_rename_detection_csharp() {
+    let v = json("rename_simple_cs", "cs");
+    let renames = manifest(&v)["renames"].as_array().unwrap();
+    assert_eq!(renames.len(), 1, "{renames:?}");
+    assert_eq!(renames[0]["new_name"], "Text.NormalizeInput");
+}
+
+#[test]
+fn test_signature_change_csharp() {
+    let v = json("signature_change_cs", "cs");
+    assert!(!manifest(&v)["signature_changes"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn test_add_dependency_csharp() {
+    let v = json("add_dependency_cs", "cs");
+    let deps = manifest(&v)["dependency_changes"].as_array().unwrap();
+    assert!(deps.iter().any(|d| d["change_type"] == "added" && d["name"] == "System.Globalization"), "{deps:?}");
+}
+
+#[test]
+fn test_rename_detection_kotlin() {
+    let v = json("rename_simple_kt", "kt");
+    let renames = manifest(&v)["renames"].as_array().unwrap();
+    assert_eq!(renames.len(), 1, "{renames:?}");
+    assert_eq!(renames[0]["new_name"], "Text.normalizeInput");
+}
+
+#[test]
+fn test_signature_change_kotlin() {
+    let v = json("signature_change_kt", "kt");
+    assert!(!manifest(&v)["signature_changes"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn test_add_dependency_kotlin() {
+    let v = json("add_dependency_kt", "kt");
+    let deps = manifest(&v)["dependency_changes"].as_array().unwrap();
+    assert!(deps.iter().any(|d| d["change_type"] == "added" && d["name"] == "java.time"), "{deps:?}");
+}
+
+#[test]
 fn test_hunks_are_linked_to_manifest() {
     let v = json("mixed_changes", "ts");
     let hunks = v["results"][0]["hunks"].as_array().unwrap();
