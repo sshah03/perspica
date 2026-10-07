@@ -8,7 +8,7 @@ homepage.workspace = true
 authors.workspace = true
 keywords.workspace = true
 categories = ["development-tools", "parser-implementations"]
-readme = "../../README.md"
+readme = "README.md"
 # The real-PR tests read fixtures from the workspace, which the package doesn't ship.
 exclude = ["tests/real_prs.rs"]
 description = "Semantic diff engine: AST-aware change classification, noise detection, reading order and test reach"
