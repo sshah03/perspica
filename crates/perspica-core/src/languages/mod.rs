@@ -7,6 +7,8 @@ pub mod c_lang;
 pub mod scala;
 pub mod csharp;
 pub mod kotlin;
+pub mod php;
+pub mod ruby;
 
 use crate::parser::{Param, SemanticTree};
 use crate::Language;
@@ -56,6 +58,8 @@ pub fn get_language_support(language: Language) -> Box<dyn LanguageSupport> {
         Language::Scala => Box::new(scala::ScalaSupport),
         Language::CSharp => Box::new(csharp::CSharpSupport),
         Language::Kotlin => Box::new(kotlin::KotlinSupport),
+        Language::Php => Box::new(php::PhpSupport),
+        Language::Ruby => Box::new(ruby::RubySupport),
         Language::Unknown => Box::new(typescript::TypeScriptSupport { tsx: false }), // unused: Unknown is never parsed
     }
 }

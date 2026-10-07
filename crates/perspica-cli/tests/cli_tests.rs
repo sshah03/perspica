@@ -185,6 +185,48 @@ fn test_add_dependency_kotlin() {
 }
 
 #[test]
+fn test_rename_detection_php() {
+    let v = json("rename_simple_php", "php");
+    let renames = manifest(&v)["renames"].as_array().unwrap();
+    assert_eq!(renames.len(), 1, "{renames:?}");
+    assert_eq!(renames[0]["new_name"], "Text.normalizeInput");
+}
+
+#[test]
+fn test_signature_change_php() {
+    let v = json("signature_change_php", "php");
+    assert!(!manifest(&v)["signature_changes"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn test_add_dependency_php() {
+    let v = json("add_dependency_php", "php");
+    let deps = manifest(&v)["dependency_changes"].as_array().unwrap();
+    assert!(deps.iter().any(|d| d["change_type"] == "added" && d["name"] == "Carbon"), "{deps:?}");
+}
+
+#[test]
+fn test_rename_detection_ruby() {
+    let v = json("rename_simple_rb", "rb");
+    let renames = manifest(&v)["renames"].as_array().unwrap();
+    assert_eq!(renames.len(), 1, "{renames:?}");
+    assert_eq!(renames[0]["new_name"], "Text.normalize_input");
+}
+
+#[test]
+fn test_signature_change_ruby() {
+    let v = json("signature_change_rb", "rb");
+    assert!(!manifest(&v)["signature_changes"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn test_add_dependency_ruby() {
+    let v = json("add_dependency_rb", "rb");
+    let deps = manifest(&v)["dependency_changes"].as_array().unwrap();
+    assert!(deps.iter().any(|d| d["change_type"] == "added" && d["name"] == "time"), "{deps:?}");
+}
+
+#[test]
 fn test_hunks_are_linked_to_manifest() {
     let v = json("mixed_changes", "ts");
     let hunks = v["results"][0]["hunks"].as_array().unwrap();
