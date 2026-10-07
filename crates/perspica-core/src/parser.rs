@@ -129,6 +129,10 @@ pub enum SemanticItem {
         source: String,
         symbols: Vec<String>,
         span: crate::manifest::Span,
+        /// The names it brings into the file, as (imported name, local name). The imported name is
+        /// "default" or "*" for a default or namespace import. Only filled in for JavaScript and TypeScript.
+        #[serde(default)]
+        bindings: Vec<(String, String)>,
     },
     Variable {
         name: String,

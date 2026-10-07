@@ -302,7 +302,7 @@ fn extract_use(node: &tree_sitter::Node, source: &str) -> Option<SemanticItem> {
         _ => (squash(node_text(&arg, source)), vec![]),
     };
 
-    Some(SemanticItem::Import {
+    Some(SemanticItem::Import { bindings: vec![],
         source: source_path,
         symbols,
         span: node_span(node),

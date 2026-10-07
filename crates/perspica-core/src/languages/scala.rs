@@ -214,7 +214,7 @@ fn extract_import(node: &tree_sitter::Node, source: &str) -> Option<SemanticItem
         symbols.push(last);
         path.join(".")
     };
-    Some(SemanticItem::Import { source: source_module, symbols, span: node_span(node) })
+    Some(SemanticItem::Import { bindings: vec![], source: source_module, symbols, span: node_span(node) })
 }
 
 /// `given Show[User] = …` is anonymous: name it by what it provides.

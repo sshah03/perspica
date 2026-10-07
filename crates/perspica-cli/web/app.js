@@ -62,9 +62,10 @@ const KIND = {
     cross_move: { ic: '⇄', label: 'Moved across files', one: 'cross-file move', many: 'cross-file moves', cat: 'structure' },
     broken:     { ic: '✗', label: 'Stale reference', one: 'stale reference', many: 'stale references', cat: 'attention' },
     call_sites: { ic: '!', label: 'Call sites not updated', one: 'stale call site group', many: 'stale call site groups', cat: 'attention' },
+    swapped:    { ic: '⇢', label: 'Import source changed', one: 'import from a new source', many: 'imports from a new source', cat: 'attention' },
 };
 const CATEGORIES = [
-    { key: 'attention', label: 'Possible breakage', note: 'Found in the code: stale references, calls not updated, code left unused.' },
+    { key: 'attention', label: 'Possible breakage', note: 'Found in the code: stale references, calls not updated, imports from a new source, code left unused.' },
     { key: 'api', label: 'API & signature changes', note: 'Callers depend on these. Check compatibility.' },
     { key: 'deps', label: 'Dependencies & imports' },
     { key: 'logic', label: 'Logic changes' },
@@ -218,6 +219,9 @@ function derive() {
     }
     for (const x of cf.broken_references || []) {
         add({ id: x.id, kind: 'broken', text: x.reason, ...at(x.reference_location), path: x.reference_file, code: x.line_text, inDiff: x.in_diff });
+    }
+    for (const x of cf.swapped_imports || []) {
+        add({ id: x.id, kind: 'swapped', text: x.reason, ...at(x.location), path: x.file, sites: x.uses.map(u => ({ file: x.file, line: u.line, text: u.text })) });
     }
     for (const x of cf.signature_impacts || []) {
         const stale = x.call_sites.filter(c => !c.updated);
@@ -529,12 +533,12 @@ function checkItems() {
     const d = S.data;
     const facts = [], notes = [];
     for (const e of E.values()) {
-        if (!['broken', 'call_sites', 'dead_code'].includes(e.kind)) continue;
-        const site = e.kind === 'call_sites' ? e.sites[0] : null;
+        if (!['broken', 'call_sites', 'dead_code', 'swapped'].includes(e.kind)) continue;
+        const site = e.kind === 'call_sites' || e.kind === 'swapped' ? e.sites[0] : null;
         const path = site ? site.file : e.path, line = site ? site.line : e.line;
-        const more = e.kind === 'call_sites' && e.sites.length > 1 ? ` +${e.sites.length - 1} more` : '';
+        const more = site && e.sites.length > 1 ? ` +${e.sites.length - 1} more` : '';
         const code = site ? site.text : e.code;
-        const label = e.kind === 'broken' ? 'Stale reference' : e.kind === 'call_sites' ? 'Call not updated' : 'Now unused';
+        const label = e.kind === 'broken' ? 'Stale reference' : e.kind === 'call_sites' ? 'Call not updated' : e.kind === 'swapped' ? 'Import source changed' : 'Now unused';
         facts.push({ key: `e:${e.kind}:${e.text}`, ic: KIND[e.kind].ic, kind: e.kind, label, text: e.text, path, line, more, code, notInDiff: e.inDiff === false || site?.in_diff === false });
     }
     (d.concerns || []).forEach(c => notes.push({ key: 'c:' + c, text: c }));
@@ -557,10 +561,11 @@ function renderCheck() {
     const byDone = (a, b) => (!!S.checked[a.key]) - (!!S.checked[b.key]);
     const box = (x) => `<input type="checkbox" data-check="${esc(x.key)}"${S.checked[x.key] ? ' checked' : ''} title="Mark as checked" aria-label="Mark as checked">`;
     const factRow = (x) => `<div class="check-row${S.checked[x.key] ? ' done' : ''}">${box(x)}
-        <div class="check-body"><div class="check-text"><span class="ic k-${x.kind}">${x.ic}</span>${esc(x.text)}</div>
+        <div class="check-body"><div class="check-text"><span class="ic k-${x.kind}">${x.ic}</span>${richText(x.text)}</div>
             <div class="check-where">${locLink(x.path, x.line)}${x.more}${x.notInDiff ? ' · not in this diff' : ''}</div></div></div>`;
     const noteRow = (x) => `<div class="check-row note${S.checked[x.key] ? ' done' : ''}">${box(x)}<div class="check-body"><div class="check-text">${richText(x.text)}</div></div></div>`;
-    const breaks = facts.filter(x => x.kind !== 'dead_code').sort(byDone);
+    const breaks = facts.filter(x => x.kind === 'broken' || x.kind === 'call_sites').sort(byDone);
+    const behavior = facts.filter(x => x.kind === 'swapped').sort(byDone);
     const cleanup = facts.filter(x => x.kind === 'dead_code').sort(byDone);
     const sortedNotes = [...notes].sort(byDone);
     const NOTES_SHOWN = 2;
@@ -569,6 +574,7 @@ function renderCheck() {
     return `<div class="check-card">
         <div class="ov-label">Before merging <span class="muted">· ${open ? `${open} open` : 'all checked'}</span></div>
         ${group('Likely to break', 'found in the code', breaks)}${breaks.map(factRow).join('')}${breaks.length ? '</div>' : ''}
+        ${group('Behavior may change', 'same name, new source', behavior)}${behavior.map(factRow).join('')}${behavior.length ? '</div>' : ''}
         ${group('Cleanup', 'left unused by this change', cleanup)}${cleanup.map(factRow).join('')}${cleanup.length ? '</div>' : ''}
         ${group('Model notes', 'unverified', sortedNotes, 'notes')}${shownNotes.map(noteRow).join('')}
             ${sortedNotes.length > NOTES_SHOWN ? `<button class="link-btn more" data-action="toggle-check">${S.checkOpen ? 'Show fewer' : `${sortedNotes.length - NOTES_SHOWN} more`}</button>` : ''}${sortedNotes.length ? '</div>' : ''}

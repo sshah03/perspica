@@ -199,7 +199,7 @@ fn extract_import(node: &tree_sitter::Node, source: &str) -> Option<SemanticItem
         Some((m, s)) if !wildcard => (m.to_string(), vec![s.to_string()]),
         _ => (path, vec![]),
     };
-    Some(SemanticItem::Import { source: module, symbols, span: node_span(node) })
+    Some(SemanticItem::Import { bindings: vec![], source: module, symbols, span: node_span(node) })
 }
 
 fn child_of_kind<'t>(node: &tree_sitter::Node<'t>, kind: &str) -> Option<tree_sitter::Node<'t>> {

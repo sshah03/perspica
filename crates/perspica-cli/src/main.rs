@@ -448,7 +448,9 @@ fn enrich_with_repo_references(multi: &mut MultiFileResult, target: &git::Target
     const MAX_HITS: usize = 3000;
     const MAX_PER_SYMBOL: usize = 10;
     let in_diff: std::collections::HashSet<&str> = multi.files.iter().map(|f| f.new_path.as_str()).collect();
+    // A name an import brought in only exists in its own file, which the core already checked.
     let vanished: Vec<perspica_core::cross_file::Vanished> = multi.cross_file.vanished.iter()
+        .filter(|v| !v.import_name)
         .map(|v| (v.name.clone(), v.renamed_to.clone(), v.origin.clone(), v.owner.clone()))
         .collect();
     // Exported functions, and private ones in languages where they reach the rest of a package.

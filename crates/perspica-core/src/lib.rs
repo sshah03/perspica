@@ -128,13 +128,15 @@ pub fn analyze_multi(files: &[cross_file::FileChange]) -> Result<cross_file::Mul
     let vanished = cross_file::vanished_names(&analyses, &moves).into_iter()
         .map(|(name, renamed_to, origin, owner)| {
             let file_private = cross_file::file_private(&analyses, &name, &origin);
-            cross_file::VanishedSymbol { name, renamed_to, origin, owner, file_private }
+            let import_name = cross_file::import_name(&analyses, &name, &origin);
+            cross_file::VanishedSymbol { name, renamed_to, origin, owner, file_private, import_name }
         })
         .collect();
     let mut broken_references = cross_file::detect_broken_references(&analyses, &moves, &mut next_id);
     let mut signature_impacts = cross_file::detect_signature_impacts(&analyses, &mut next_id);
     // Functions defined inside other functions, checked in their own scope.
     broken_references.extend(cross_file::local_broken_references(&analyses, &mut next_id));
+    let swapped_imports = cross_file::detect_swapped_imports(&analyses, files, &moves, &mut next_id);
     signature_impacts.extend(cross_file::local_signature_impacts(&analyses, &mut next_id));
 
     // Annotate hunks with manifest links and noise.
@@ -154,7 +156,8 @@ pub fn analyze_multi(files: &[cross_file::FileChange]) -> Result<cross_file::Mul
         for r in &a.result.manifest.renames {
             let pair = bare_pair(&r.old_name, &r.new_name);
             if !identifier(&pair.0) || !identifier(&pair.1) { continue; }
-            if is_member(&r.old_name) { local_renames[fi].push(pair) } else { ctx.renames.push(pair) }
+            // A member's or an import's new name only matters in its own file.
+            if is_member(&r.old_name) || r.kind == manifest::SymbolKind::Import { local_renames[fi].push(pair) } else { ctx.renames.push(pair) }
         }
     }
     for m in &moves {
@@ -206,7 +209,7 @@ pub fn analyze_multi(files: &[cross_file::FileChange]) -> Result<cross_file::Mul
 
     Ok(cross_file::MultiDiffResult {
         file_results: analyses.into_iter().map(|a| (a.path, a.result)).collect(),
-        cross_file: cross_file::CrossFileManifest { moves, broken_references, signature_impacts, vanished, reading_order, test_reach, graph_debug },
+        cross_file: cross_file::CrossFileManifest { moves, broken_references, signature_impacts, vanished, reading_order, test_reach, graph_debug, swapped_imports },
     })
 }
 
@@ -1610,7 +1613,68 @@ mod tests {
         let r = analyze_multi(&[cross_file::FileChange::new("pool.js", old, new, Language::TypeScript)]).unwrap();
         let r = &r.file_results[0].1;
         assert_eq!(r.review.mechanical_lines, 0, "{:?}", r.hunks);
-        assert_eq!(r.manifest.logic_changes.len(), 1, "{:?}", r.manifest);
+        // A require is an import, so the new name shows up as a dependency change.
+        assert!(r.manifest.renames.is_empty() && r.manifest.logic_changes.is_empty(), "{:?}", r.manifest);
+        assert_eq!(r.manifest.dependency_changes[0].symbols_added, ["kQueued"], "{:?}", r.manifest);
+        // `const x = require(…)` and `require(…).a` are imports too. Other declarations aren't.
+        let lang = languages::get_language_support(Language::TypeScript);
+        let tree = parser::parse("const assert = require('node:assert')\nconst { a: b, c, ...rest } = require('./m')\nconst kUrl = require('./symbols').kUrl\nconst n = compute('x')\n", &*lang).unwrap();
+        let imports: Vec<(String, Vec<String>)> = tree.items.iter().filter_map(|i| match i {
+            parser::SemanticItem::Import { source, symbols, .. } => Some((source.clone(), symbols.clone())),
+            _ => None,
+        }).collect();
+        assert_eq!(imports, [("node:assert".into(), vec![]), ("./m".into(), vec!["a".into(), "c".into()]), ("./symbols".into(), vec!["kUrl".into()])]);
+        assert!(matches!(tree.items[3], parser::SemanticItem::Variable { .. }));
+    }
+
+    #[test]
+    fn test_import_names_renamed_or_dropped() {
+        let js = |old: &str, new: &str| analyze_multi(&[cross_file::FileChange::new("a.js", old, new, Language::TypeScript)]).unwrap();
+        // A new local name for the same import is a rename, and its uses are mechanical. Same for require.
+        for (old_line, new_line) in [("import fsp from 'fs/promises'", "import fsPromises from 'fs/promises'"), ("const fsp = require('fs/promises')", "const fsPromises = require('fs/promises')")] {
+            let old = format!("{old_line}\n\nexport async function load(p) {{\n  return fsp.readFile(p)\n}}\n");
+            let new = old.replace(old_line, new_line).replace("fsp.readFile", "fsPromises.readFile");
+            let r = js(&old, &new);
+            let f = &r.file_results[0].1;
+            assert_eq!(f.manifest.renames.iter().map(|e| (e.old_name.as_str(), e.new_name.as_str())).collect::<Vec<_>>(), [("fsp", "fsPromises")]);
+            assert_eq!(f.review.mechanical_lines, f.review.changed_lines, "{new_line}");
+        }
+        // A dropped import whose name is still used is stale. Globals and names still imported aren't.
+        let old = "import chalk from 'chalk'\nimport { URL } from 'url'\nimport { join } from 'path'\n\nexport function show(p) {\n  return chalk.red(new URL(join(p)).href)\n}\n";
+        let new = "import { join } from 'node:path'\n\nexport function show(p) {\n  return chalk.red(new URL(join(p)).href)\n}\n";
+        let r = js(old, new);
+        let broken: Vec<(&str, usize)> = r.cross_file.broken_references.iter().map(|b| (b.symbol_name.as_str(), b.reference_location.line_start)).collect();
+        assert_eq!(broken, [("chalk", 4)]);
+        assert!(r.cross_file.vanished.iter().all(|v| v.import_name && v.file_private));
+    }
+
+    #[test]
+    fn test_imports_from_a_new_source() {
+        let js = |path: &str, old: &str, new: &str| {
+            let mut f = cross_file::FileChange::new(path, old, new, Language::TypeScript);
+            f.old_path = path.replace("src/", "lib/");
+            analyze_multi(&[f]).unwrap().cross_file.swapped_imports
+        };
+        // The same name from another package, still used.
+        let old = "const fetch = require('node-fetch')\n\nasync function get(u) {\n  return fetch(u)\n}\n";
+        let new = old.replace("const fetch = require('node-fetch')", "const { fetch } = require('undici')");
+        let swapped = js("src/a.js", old, &new);
+        assert_eq!(swapped.len(), 1);
+        assert_eq!(swapped[0].reason, "`fetch` now comes from `undici`, not `node-fetch`");
+        assert_eq!(swapped[0].uses.iter().map(|u| u.line).collect::<Vec<_>>(), [4]);
+        // `node:`, an extension, or a relative path from a moved file is the same module.
+        let old = "import { readFile } from 'fs/promises'\nimport { parse } from '../lib/yaml'\n\nexport async function load(p) {\n  return parse(await readFile(p))\n}\n";
+        let new = old.replace("'fs/promises'", "'node:fs/promises'").replace("'../lib/yaml'", "'../lib/yaml.js'");
+        assert!(js("src/a.js", old, &new).is_empty());
+        // So is a path alias for the same file, and a default import that became a named one.
+        let old = "import api from './data/api'\n\nexport function load() {\n  return api.get()\n}\n";
+        let new = old.replace("import api from './data/api'", "import { api } from '@src/taxonomy/data/api'");
+        assert!(js("src/taxonomy/page.js", old, &new).is_empty());
+        // And a path from the project's base folder. A different package still counts.
+        let old = "import { Button } from '../components/Button'\nimport merge from 'lodash.merge'\n\nexport const page = () => merge(Button)\n";
+        let new = old.replace("'../components/Button'", "'components/Button'").replace("'lodash.merge'", "'lodash/merge'");
+        let swapped = js("src/pages/home.js", old, &new);
+        assert_eq!(swapped.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["merge"]);
     }
 
     #[test]

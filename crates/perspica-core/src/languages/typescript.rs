@@ -122,12 +122,11 @@ fn extract_item(node: &tree_sitter::Node, source: &str) -> Option<SemanticItem> 
                 content_hash: hash_str(&node_text(node, source)),
             })
         }
-        "lexical_declaration" => extract_variable(node, source),
+        "lexical_declaration" | "variable_declaration" => require_import(node, source).or_else(|| extract_variable(node, source)),
         "import_statement" => extract_import(node, source),
         "class_declaration" => extract_class(node, source),
         "type_alias_declaration" | "interface_declaration" | "enum_declaration" => extract_typedef(node, source),
         "abstract_class_declaration" => extract_class(node, source),
-        "variable_declaration" => extract_variable(node, source),
         _ => {
             let text = node_text(node, source);
             if text.trim().is_empty() {
@@ -235,9 +234,61 @@ fn is_function_value(node: &tree_sitter::Node) -> bool {
     matches!(node.kind(), "arrow_function" | "function_expression" | "function" | "generator_function")
 }
 
+/// `const { a, b } = require('x')`, `const x = require('x')` and `const a = require('x').a`
+/// are imports, like their `import` forms.
+fn require_import(node: &tree_sitter::Node, source: &str) -> Option<SemanticItem> {
+    let mut cursor = node.walk();
+    let decls: Vec<_> = node.named_children(&mut cursor).filter(|c| c.kind() == "variable_declarator").collect();
+    let [decl] = decls.as_slice() else { return None };
+    let mut value = decl.child_by_field_name("value")?;
+    let mut symbols = Vec::new();
+    let mut member = None;
+    if value.kind() == "member_expression" {
+        member = Some(node_text(&value.child_by_field_name("property")?, source));
+        symbols.extend(member.clone());
+        value = value.child_by_field_name("object")?;
+    }
+    if value.kind() != "call_expression" || value.child_by_field_name("function").map(|f| node_text(&f, source)).as_deref() != Some("require") {
+        return None;
+    }
+    let args = value.child_by_field_name("arguments")?;
+    let mut c = args.walk();
+    let arg_nodes: Vec<_> = args.named_children(&mut c).collect();
+    let [module] = arg_nodes.as_slice() else { return None };
+    if module.kind() != "string" { return None; }
+    let module = node_text(module, source).trim_matches(|c| c == '"' || c == '\'' || c == '`').to_string();
+    // The names taken from the module. `{ a: b }` takes a, like `import { a as b }`.
+    let pattern = decl.child_by_field_name("name")?;
+    let mut bindings = Vec::new();
+    match pattern.kind() {
+        "object_pattern" => {
+            let mut pc = pattern.walk();
+            for p in pattern.named_children(&mut pc) {
+                match p.kind() {
+                    "shorthand_property_identifier_pattern" => {
+                        let n = node_text(&p, source);
+                        symbols.push(n.clone());
+                        bindings.push((n.clone(), n));
+                    }
+                    "pair_pattern" => {
+                        let (Some(k), Some(v)) = (p.child_by_field_name("key"), p.child_by_field_name("value")) else { continue };
+                        symbols.push(node_text(&k, source));
+                        if v.kind() == "identifier" { bindings.push((node_text(&k, source), node_text(&v, source))); }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        "identifier" => bindings.push((member.unwrap_or_else(|| "default".into()), node_text(&pattern, source))),
+        _ => {}
+    }
+    Some(SemanticItem::Import { source: module, symbols, span: node_span(node), bindings })
+}
+
 fn extract_import(node: &tree_sitter::Node, source: &str) -> Option<SemanticItem> {
     let mut source_module = String::new();
     let mut symbols = Vec::new();
+    let mut bindings = Vec::new();
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -249,17 +300,27 @@ fn extract_import(node: &tree_sitter::Node, source: &str) -> Option<SemanticItem
         if child.kind() == "import_clause" {
             let mut inner = child.walk();
             for ic in child.children(&mut inner) {
-                if ic.kind() == "named_imports" {
-                    let mut imp = ic.walk();
-                    for spec in ic.children(&mut imp) {
-                        if spec.kind() == "import_specifier" {
-                            symbols.push(
-                                spec.child_by_field_name("name")
+                match ic.kind() {
+                    "identifier" => bindings.push(("default".to_string(), node_text(&ic, source))),
+                    "namespace_import" => {
+                        let mut ns = ic.walk();
+                        let local = ic.named_children(&mut ns).find(|n| n.kind() == "identifier").map(|n| node_text(&n, source));
+                        if let Some(local) = local { bindings.push(("*".to_string(), local)); }
+                    }
+                    "named_imports" => {
+                        let mut imp = ic.walk();
+                        for spec in ic.children(&mut imp) {
+                            if spec.kind() == "import_specifier" {
+                                let name = spec.child_by_field_name("name")
                                     .map(|n| node_text(&n, source))
-                                    .unwrap_or_else(|| node_text(&spec, source)),
-                            );
+                                    .unwrap_or_else(|| node_text(&spec, source));
+                                let local = spec.child_by_field_name("alias").map(|n| node_text(&n, source)).unwrap_or_else(|| name.clone());
+                                bindings.push((name.clone(), local));
+                                symbols.push(name);
+                            }
                         }
                     }
+                    _ => {}
                 }
             }
         }
@@ -278,6 +339,7 @@ fn extract_import(node: &tree_sitter::Node, source: &str) -> Option<SemanticItem
         source: source_module,
         symbols,
         span: node_span(node),
+        bindings,
     })
 }
 
