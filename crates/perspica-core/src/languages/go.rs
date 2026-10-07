@@ -316,7 +316,7 @@ fn extract_import(node: &tree_sitter::Node, source: &str) -> Option<SemanticItem
     } else {
         symbols.clear();
     }
-    Some(SemanticItem::Import {
+    Some(SemanticItem::Import { bindings: vec![],
         source: source_path,
         symbols,
         span: node_span(node),

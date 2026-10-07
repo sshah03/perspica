@@ -26,6 +26,29 @@ pub struct CrossFileManifest {
     /// For each changed function, whether (and how) the changed tests reach it.
     #[serde(default)]
     pub test_reach: Vec<crate::flow::TestReach>,
+    /// Names a file still uses that now come from a different module or export.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub swapped_imports: Vec<SwappedImport>,
+}
+
+/// A name a file still uses that now comes from somewhere else, like `fetch` moving from
+/// `node-fetch` to `undici`. The code using it didn't change, but what it runs did.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwappedImport {
+    pub id: ManifestEntryId,
+    pub name: String,
+    pub file: String,
+    pub reason: String,
+    /// The import line, on the new side.
+    pub location: Location,
+    /// Lines that still use the name (at most 10).
+    pub uses: Vec<NameUse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NameUse {
+    pub line: usize,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +63,9 @@ pub struct VanishedSymbol {
     /// Only its own file can use it, like a private top-level Kotlin function.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub file_private: bool,
+    /// A name an import brought into its file. Nothing elsewhere in the repo can refer to it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub import_name: bool,
 }
 
 /// A name that no longer exists: (name, what it became, file it was defined in, owner type for methods).
@@ -283,6 +309,18 @@ pub(crate) fn vanished_names(analyses: &[InternalAnalysis], moves: &[CrossFileMo
                 out.push((old.to_string(), m.renamed_to.clone(), m.from_file.clone(), owner(&m.name)));
             }
         }
+        // A name an import brought in that's gone, while the file doesn't get it some other way.
+        let new_locals = import_locals(&a.new_tree);
+        let declared: HashSet<&str> = a.new_tree.items.iter()
+            .filter(|i| !matches!(i, SemanticItem::Import { .. }))
+            .filter_map(|i| i.name().map(bare_name))
+            .collect();
+        for name in import_locals(&a.old_tree) {
+            if name.len() < 2 || new_locals.contains(&name) || declared.contains(name.as_str()) || JS_GLOBALS.contains(&name.as_str()) { continue; }
+            if seen.insert(name.clone()) {
+                out.push((name, None, a.path.clone(), None));
+            }
+        }
         for l in &a.result.manifest.logic_changes {
             if l.description != "removed" || l.location.side != Side::Old { continue; }
             if !matches!(l.kind, SymbolKind::Function | SymbolKind::Class | SymbolKind::Type | SymbolKind::Variable) { continue; }
@@ -296,10 +334,132 @@ pub(crate) fn vanished_names(analyses: &[InternalAnalysis], moves: &[CrossFileMo
     out
 }
 
-/// A private top-level Kotlin function or `file` C# type, which only its own file can use.
+/// A private top-level Kotlin function or `file` C# type, or a name an import brought in.
+/// Only its own file can use it.
 pub(crate) fn file_private(analyses: &[InternalAnalysis], name: &str, origin: &str) -> bool {
-    overloads(origin) && old_item(analyses, name, origin).is_some_and(|(_, m)| !m.exported)
+    (overloads(origin) && old_item(analyses, name, origin).is_some_and(|(_, m)| !m.exported)) || import_name(analyses, name, origin)
 }
+
+/// Whether `name` was brought into `origin` by one of its imports.
+pub(crate) fn import_name(analyses: &[InternalAnalysis], name: &str, origin: &str) -> bool {
+    analyses.iter().find(|a| a.path == origin).is_some_and(|a| import_locals(&a.old_tree).contains(name))
+}
+
+/// The local names a file's imports bring in.
+fn import_locals(tree: &SemanticTree) -> HashSet<String> {
+    tree.items.iter()
+        .flat_map(|i| match i { SemanticItem::Import { bindings, .. } => bindings.as_slice(), _ => &[] })
+        .map(|(_, local)| local.clone())
+        .collect()
+}
+
+/// Imported names that now come from a different module or export, with the lines still using them.
+pub(crate) fn detect_swapped_imports(analyses: &[InternalAnalysis], files: &[FileChange], moves: &[CrossFileMoveEntry], next_id: &mut ManifestEntryId) -> Vec<SwappedImport> {
+    let mut out = Vec::new();
+    // Files this change renamed, without their extensions, so an import that follows a rename is the same module.
+    let renamed: HashMap<String, String> = files.iter()
+        .filter(|f| f.old_path != f.new_path)
+        .map(|f| (format!("./{}", strip_module_ext(&f.old_path)), format!("./{}", strip_module_ext(&f.new_path))))
+        .collect();
+    // Code this change moved to another file is the same code, imported from its new home.
+    let moved: HashSet<&str> = moves.iter().flat_map(|m| [m.name.as_str()].into_iter().chain(m.renamed_to.as_deref())).map(bare_name).collect();
+    for (a, f) in analyses.iter().zip(files) {
+        let old = import_sources(&a.old_tree);
+        let new = import_sources(&a.new_tree);
+        let import_lines: Vec<(usize, usize)> = a.new_tree.items.iter()
+            .filter(|i| matches!(i, SemanticItem::Import { .. }))
+            .map(|i| (i.span().start_line, i.span().end_line))
+            .collect();
+        let mut names: Vec<&String> = new.keys().collect();
+        names.sort();
+        for name in names {
+            let ((new_module, new_export), span) = &new[name];
+            let Some(((old_module, old_export), _)) = old.get(name) else { continue };
+            if moved.contains(name.as_str()) { continue; }
+            let old_key = module_key(old_module, &f.old_path);
+            let old_key = renamed.get(&old_key).cloned().unwrap_or(old_key);
+            let same_module = same_module_key(&old_key, &module_key(new_module, &f.new_path));
+            // `import X` and `import { X }` from the same module are nearly always the same thing.
+            let whole_or_own = |e: &str| e == "default" || e == "*" || e == name;
+            if same_module && (old_export == new_export || (whole_or_own(old_export) && whole_or_own(new_export))) { continue; }
+            let both_whole = |e: &str| e == "default" || e == "*";
+            let uses: Vec<NameUse> = scan_references_in(&a.new_source, name, None, &a.path, &a.path).into_iter()
+                .filter(|(line, _)| !import_lines.iter().any(|(s, e)| line >= s && line <= e))
+                .take(10)
+                .map(|(line, text)| NameUse { line, text })
+                .collect();
+            if uses.is_empty() { continue; }
+            let what = |module: &str, export: &str| if both_whole(export) || export == name { format!("`{module}`") } else { format!("`{export}` in `{module}`") };
+            let reason = format!("`{name}` now comes from {}, not {}", what(new_module, new_export), what(old_module, old_export));
+            out.push(SwappedImport {
+                id: { let v = *next_id; *next_id += 1; v },
+                name: name.clone(),
+                file: a.path.clone(),
+                reason,
+                location: Location { file: Some(a.path.clone()), line_start: span.start_line, line_end: span.end_line, side: Side::New },
+                uses,
+            });
+        }
+    }
+    out
+}
+
+type ImportSource = ((String, String), crate::manifest::Span);
+
+/// Each local name a file's imports bring in, with the module and export it comes from.
+fn import_sources(tree: &SemanticTree) -> HashMap<String, ImportSource> {
+    let mut out = HashMap::new();
+    for item in &tree.items {
+        let SemanticItem::Import { source, bindings, span, .. } = item else { continue };
+        for (export, local) in bindings {
+            out.insert(local.clone(), ((source.clone(), export.clone()), span.clone()));
+        }
+    }
+    out
+}
+
+/// A module as written in `file`, made comparable. `node:fs` is `fs`, and a relative path is
+/// resolved from the file's folder without its extension or a trailing `/index`, and starts with `./`.
+fn module_key(module: &str, file: &str) -> String {
+    let module = module.strip_prefix("node:").unwrap_or(module);
+    if !module.starts_with('.') { return module.to_string(); }
+    let mut parts: Vec<&str> = file.rsplit_once('/').map_or(vec![], |(dir, _)| dir.split('/').collect());
+    for seg in module.split('/') {
+        match seg { "." | "" => {} ".." => { parts.pop(); } s => parts.push(s) }
+    }
+    let path = parts.join("/");
+    format!("./{}", strip_module_ext(&path))
+}
+
+/// A module path without its extension or a trailing `/index`.
+fn strip_module_ext(path: &str) -> &str {
+    let path = [".js", ".mjs", ".cjs", ".jsx", ".ts", ".mts", ".cts", ".tsx"].iter().find_map(|e| path.strip_suffix(e)).unwrap_or(path);
+    path.strip_suffix("/index").unwrap_or(path)
+}
+
+/// Two module keys that name the same file. A path alias like `@src/data/api` or `~/data/api`,
+/// or a path from the project's base folder like `components/Button`, matches a resolved
+/// relative path that ends the same way.
+fn same_module_key(a: &str, b: &str) -> bool {
+    // What has to match the end of the relative path.
+    fn rest(m: &str) -> Option<&str> {
+        if m.starts_with(['@', '~', '#']) { return m.split_once('/').map(|(_, rest)| rest); }
+        (!m.starts_with(['.', '/']) && m.contains('/')).then_some(m)
+    }
+    let matches = |relative: &str, other: &str| relative.starts_with("./") && rest(other).is_some_and(|r| relative.ends_with(&format!("/{r}")));
+    a == b || matches(a, b) || matches(b, a)
+}
+
+/// Names JavaScript has without an import. Dropping the import of one of these is a cleanup, not a break.
+const JS_GLOBALS: &[&str] = &[
+    "URL", "URLSearchParams", "Buffer", "process", "console", "fetch", "Request", "Response", "Headers", "FormData",
+    "Blob", "File", "AbortController", "AbortSignal", "TextEncoder", "TextDecoder", "setTimeout", "setInterval",
+    "clearTimeout", "clearInterval", "setImmediate", "clearImmediate", "queueMicrotask", "structuredClone",
+    "performance", "crypto", "EventTarget", "Event", "WebSocket", "global", "globalThis", "Promise", "Map", "Set",
+    "WeakMap", "WeakSet", "Symbol", "JSON", "Math", "Date", "Error",
+    // Test runners can provide these as globals.
+    "describe", "it", "test", "expect", "vi", "jest", "beforeEach", "afterEach", "beforeAll", "afterAll", "suite", "bench",
+];
 
 /// The top-level item called `name` in the old version of `origin`.
 fn old_item<'a>(analyses: &'a [InternalAnalysis], name: &str, origin: &str) -> Option<(&'a SemanticItem, &'a crate::parser::ItemMeta)> {

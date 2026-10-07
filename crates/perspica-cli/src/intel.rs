@@ -269,6 +269,9 @@ fn all_entries(input: &IntelInput<'_>) -> Vec<Entry> {
     for x in &cf.broken_references {
         out.push(e(x.id, "stale_reference", fmt_loc(Some(&x.reference_location)), format!("{}: `{}`", x.reason, x.line_text), false));
     }
+    for x in &cf.swapped_imports {
+        out.push(e(x.id, "import_source_changed", fmt_loc(Some(&x.location)), format!("{}. The {} line(s) using it didn't change.", x.reason, x.uses.len()), false));
+    }
     for x in &cf.signature_impacts {
         let stale = x.call_sites.iter().filter(|c| !c.updated).count();
         if stale == 0 { continue; } // fully updated call sites are covered by the signature entry

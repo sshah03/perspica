@@ -91,6 +91,7 @@ pub fn classify(
     }
 
     classify_imports(old_tree, new_tree, &mut manifest, &mut id);
+    import_renames(old_tree, new_tree, &mut manifest, &mut id);
 
     for e in &diff_output.extractions {
         let original = &old_tree.items[e.old_idx];
@@ -322,7 +323,7 @@ fn classify_imports(
     fn collect(tree: &SemanticTree) -> BTreeMap<String, (BTreeSet<String>, Location)> {
         let mut map: BTreeMap<String, (BTreeSet<String>, Location)> = BTreeMap::new();
         for item in &tree.items {
-            let SemanticItem::Import { source, symbols, span } = item else { continue };
+            let SemanticItem::Import { source, symbols, span, .. } = item else { continue };
             let loc = Location::new(span.start_line, span.end_line);
             if source.is_empty() {
                 // Grouped import where every symbol is its own module (Go).
@@ -377,6 +378,34 @@ fn classify_imports(
                 internal: is_internal_module(module),
             });
         }
+    }
+}
+
+/// An imported name given a new local name, like `import fsp from 'fs/promises'` becoming
+/// `import fsPromises from 'fs/promises'`. Its uses in the file follow the rename.
+fn import_renames(old_tree: &SemanticTree, new_tree: &SemanticTree, manifest: &mut ChangeManifest, id: &mut impl FnMut() -> ManifestEntryId) {
+    type Locals = BTreeMap<(String, String), (Vec<String>, Location)>;
+    fn collect(tree: &SemanticTree) -> Locals {
+        let mut map = Locals::new();
+        for item in &tree.items {
+            let SemanticItem::Import { source, bindings, span, .. } = item else { continue };
+            for (imported, local) in bindings {
+                map.entry((source.clone(), imported.clone()))
+                    .or_insert_with(|| (Vec::new(), Location::new(span.start_line, span.end_line)))
+                    .0.push(local.clone());
+            }
+        }
+        map
+    }
+    let (old, new) = (collect(old_tree), collect(new_tree));
+    let old_locals: HashSet<&String> = old.values().flat_map(|(l, _)| l).collect();
+    let new_locals: HashSet<&String> = new.values().flat_map(|(l, _)| l).collect();
+    let identifier = |n: &str| !n.is_empty() && n.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$');
+    for (key, (new_l, loc)) in &new {
+        let Some((old_l, _)) = old.get(key) else { continue };
+        let ([o], [n]) = (old_l.as_slice(), new_l.as_slice()) else { continue };
+        if o == n || new_locals.contains(o) || old_locals.contains(n) || !identifier(o) || !identifier(n) { continue; }
+        manifest.renames.push(RenameEntry { id: id(), old_name: o.clone(), new_name: n.clone(), kind: SymbolKind::Import, locations: vec![loc.clone()] });
     }
 }
 

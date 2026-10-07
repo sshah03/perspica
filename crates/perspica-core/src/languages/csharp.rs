@@ -204,7 +204,7 @@ fn extract_using(node: &tree_sitter::Node, source: &str) -> Option<SemanticItem>
         .filter(|c| !is_name_field(node, c))
         .find(|c| matches!(c.kind(), "qualified_name" | "identifier" | "generic_name" | "alias_qualified_name"))
         .map(|n| node_text(&n, source))?;
-    Some(SemanticItem::Import { source: target, symbols: alias.into_iter().collect(), span: node_span(node) })
+    Some(SemanticItem::Import { bindings: vec![], source: target, symbols: alias.into_iter().collect(), span: node_span(node) })
 }
 
 fn is_name_field(parent: &tree_sitter::Node, child: &tree_sitter::Node) -> bool {

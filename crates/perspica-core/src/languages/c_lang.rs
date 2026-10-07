@@ -201,7 +201,7 @@ fn extract_include(node: &tree_sitter::Node, source: &str) -> Option<SemanticIte
                 .to_string()
         })?;
 
-    Some(SemanticItem::Import {
+    Some(SemanticItem::Import { bindings: vec![],
         source: path,
         symbols: vec![],
         span: node_span(node),
