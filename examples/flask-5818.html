@@ -1318,7 +1318,7 @@ function renderSidebar() {
         const unit = shows === 'files' ? 'file' : S.mode === 'flow' ? 'step' : 'group';
         const hint = shows === 'files' ? ''
             : S.mode === 'flow' ? 'Entry points first, then the changed functions they call.'
-            : hasLlmGroups() ? 'What each set of changes is for, riskiest first.'
+            : hasLlmGroups() ? 'What each set of changes is for, in the order to read them.'
             : 'Grouped by kind of change, most important first. <button class="link-btn" data-action="analyze">Analyze…</button> groups them by intent.';
         const caption = `<div class="toc-caption"><div><b>${modeName()}</b> · ${n} ${unit}${pl(n)}</div>${hint ? `<div class="hint">${hint}</div>` : ''}</div>`;
         el.innerHTML = caption + (shows === 'files' ? renderFileTree() : renderGroupList());
