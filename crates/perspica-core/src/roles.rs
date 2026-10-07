@@ -77,6 +77,9 @@ pub fn is_generated_path(path: &str) -> bool {
     ].iter().any(|ext| file.ends_with(ext))
         || [".rlib", ".rmeta", ".o", ".d", ".pyc", ".class"].iter().any(|ext| file.ends_with(ext))
         || path.starts_with("target/debug/") || path.starts_with("target/release/")
+        // Rails and Laravel write these themselves.
+        || path.ends_with("db/schema.rb") || path.ends_with("db/structure.sql") || file == "_ide_helper.php"
+        || ["sorbet/rbi/gems/", "sorbet/rbi/dsl/", "app/assets/builds/", "bootstrap/cache/"].iter().any(|d| path.starts_with(d) || path.contains(&format!("/{d}")))
         || segments(path).any(|s| matches!(s, ".fingerprint" | "__pycache__" | "dist" | "__generated__" | "__snapshots__"))
 }
 
@@ -106,6 +109,8 @@ pub fn is_test_path(path: &str) -> bool {
         || [".test.", ".spec.", "_spec."].iter().any(|m| file.contains(m))
         || (file.ends_with(".java") || file.ends_with(".kt")) && (stem.ends_with("Test") || stem.ends_with("Tests") || stem.ends_with("IT"))
         || file.ends_with(".cs") && (stem.ends_with("Test") || stem.ends_with("Tests"))
+        || file.ends_with(".php") && stem.ends_with("Test")
+        || file.ends_with("_test.rb")
         || file.ends_with(".scala") && (stem.ends_with("Test") || stem.ends_with("Tests") || stem.ends_with("Spec") || stem.ends_with("Suite"))
         || path.contains("src/test/")
 }
@@ -130,7 +135,7 @@ pub fn is_docs_path(path: &str) -> bool {
 }
 
 fn is_code_ext(file: &str) -> bool {
-    [".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".java", ".c", ".h", ".kt", ".kts", ".cs", ".swift", ".rb", ".scala"].iter().any(|e| file.ends_with(e))
+    [".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".java", ".c", ".h", ".kt", ".kts", ".cs", ".swift", ".rb", ".rake", ".php", ".scala"].iter().any(|e| file.ends_with(e))
 }
 
 #[cfg(test)]
@@ -154,6 +159,13 @@ mod tests {
             ("src/Acme.Core/Form1.Designer.cs", FileRole::Generated),
             ("library/src/commonTest/kotlin/x/Helpers.kt", FileRole::Test),
             ("library/src/commonMain/kotlin/x/Helpers.kt", FileRole::Source),
+            ("tests/Unit/InvoiceTest.php", FileRole::Test),
+            ("src/Invoice.php", FileRole::Source),
+            ("app/models/invoice.rb", FileRole::Source),
+            ("spec/models/invoice_spec.rb", FileRole::Test),
+            ("lib/billing/invoice_test.rb", FileRole::Test),
+            ("db/schema.rb", FileRole::Generated),
+            ("sorbet/rbi/gems/rack@3.0.rbi", FileRole::Generated),
             ("README.md", FileRole::Docs),
             ("docs/guide/setup.md", FileRole::Docs),
             ("docs/conf.py", FileRole::Source),

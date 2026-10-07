@@ -354,7 +354,7 @@ impl<'a> Graph<'a> {
         // Each type's constructor methods: Python's `__init__`, JavaScript's `constructor`.
         let mut constructors: HashMap<u64, Vec<usize>> = HashMap::new();
         for (i, n) in nodes.iter().enumerate() {
-            if n.kind == StepKind::Function && matches!(bare_name(&n.name), "__init__" | "constructor") {
+            if n.kind == StepKind::Function && matches!(bare_name(&n.name), "__init__" | "constructor" | "__construct") {
                 if let Some(o) = owner_hash(i) { constructors.entry(o).or_default().push(i); }
             }
         }
@@ -364,8 +364,8 @@ impl<'a> Graph<'a> {
             let mut targets: Vec<usize> = Vec::new();
             // Calls resolve to functions. A qualifier that names the callee's type (or the
             // caller's own type via `self`) settles it outright, however common the name.
-            // Scala calls parameterless methods without parentheses (`x.size`).
-            let member_calls = analyses[n.file].path.ends_with(".scala");
+            // Scala and Ruby call methods without parentheses (`x.size`, `total`).
+            let member_calls = analyses[n.file].path.ends_with(".scala") || crate::Language::from_path(&analyses[n.file].path) == crate::Language::Ruby;
             // Rust and Go can't call a method without a receiver: a bare `name(` is a free function.
             let bare_is_free = analyses[n.file].path.ends_with(".rs") || analyses[n.file].path.ends_with(".go");
             // Where a field can't share a method's name, `self.name` with no call is the method itself.

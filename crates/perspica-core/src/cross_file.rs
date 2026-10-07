@@ -874,7 +874,7 @@ fn leaves_out_new(old: &[crate::parser::Param], new: &[crate::parser::Param], ar
 /// The name a function is called by: a constructor (`Foo.__init__`, `Foo.constructor`) by its class.
 pub fn call_name(sig_name: &str) -> &str {
     match (owner_of(sig_name), bare_name(sig_name)) {
-        (Some(class), "__init__" | "__new__" | "constructor") => class,
+        (Some(class), "__init__" | "__new__" | "constructor" | "__construct") => class,
         (_, name) => name,
     }
 }
@@ -898,6 +898,9 @@ pub fn call_arguments(from: &str, path: &str) -> Option<CallArgs> {
     let go = path.ends_with(".go");
     let cs = path.ends_with(".cs");
     let kt = path.ends_with(".kt") || path.ends_with(".kts");
+    let rb = crate::Language::from_path(path) == crate::Language::Ruby;
+    // C#, PHP and Ruby write a named argument as `name: value`.
+    let colon = cs || rb || path.ends_with(".php");
     let mut chars = from.char_indices();
     if chars.next()?.1 != '(' { return None; }
     let (mut depth, mut start, mut lines, mut closed, mut end) = (0usize, 1usize, 0usize, false, 0usize);
@@ -920,9 +923,11 @@ pub fn call_arguments(from: &str, path: &str) -> Option<CallArgs> {
     if kt && from[end..].trim_start_matches([' ', '\t']).starts_with('{') { out.positional += 1; }
     for a in args {
         let a = a.trim();
-        if a.starts_with("...") || ((py || kt) && a.starts_with('*')) || (go && a.ends_with("...")) { out.spread = true; continue; }
+        if a.starts_with("...") || ((py || kt || rb) && a.starts_with('*')) || (go && a.ends_with("...")) { out.spread = true; continue; }
+        // Ruby passes a block with `&`, outside the arguments.
+        if rb && a.starts_with('&') { continue; }
         // `name=value` (Python keyword), not `a == b` or `a => b`. C# writes `name: value`.
-        let kw = if cs { a.find(':').filter(|&i| i > 0 && !a[i..].starts_with("::")) } else {
+        let kw = if colon { a.find(':').filter(|&i| i > 0 && !a[i..].starts_with("::")) } else {
             a.find('=').filter(|&i| i > 0 && !a[i..].starts_with("==") && !a[i..].starts_with("=>") && !a[..i].ends_with(['!', '<', '>', '=']))
         };
         match kw.map(|i| a[..i].trim()).filter(|k| k.chars().all(|c| c.is_alphanumeric() || c == '_')) {
@@ -940,6 +945,12 @@ pub fn call_arguments(from: &str, path: &str) -> Option<CallArgs> {
 /// rename can't break a call) if its type is, when both are written down.
 pub fn still_fits(old: &[crate::parser::Param], new: &[crate::parser::Param], args: &CallArgs, named_args: bool, def_path: &str) -> bool {
     if args.spread { return false; }
+    // Without keyword parameters, Ruby collects `key: value` arguments into one hash argument.
+    let keyword = |ps: &[crate::parser::Param]| ps.iter().any(|p| p.type_annotation.as_deref() == Some("keyword"));
+    if crate::Language::from_path(def_path) == crate::Language::Ruby && !args.keywords.is_empty() && !keyword(old) && !keyword(new) {
+        let hash = CallArgs { positional: args.positional + 1, keywords: vec![], spread: false, lines: args.lines };
+        return still_fits(old, new, &hash, named_args, def_path);
+    }
     // `*args` / `...rest` take extra positional arguments, `**kwargs` extra keywords.
     let rest_pos = new.iter().any(|p| crate::classify::catch_all(p, def_path) == Some(false));
     let rest_kw = new.iter().any(|p| crate::classify::catch_all(p, def_path) == Some(true));
@@ -1040,7 +1051,7 @@ pub fn scan_references(source: &str, name: &str, owner: Option<&str>, origin: &s
 /// `scan_references` for the file at `path`. In Scala, Java, C# and Kotlin a method's own file can call it
 /// bare, since `name(` is `this.name(`.
 pub fn scan_references_in(source: &str, name: &str, owner: Option<&str>, origin: &str, path: &str) -> Vec<(usize, String)> {
-    let implicit_this = path == origin && [".scala", ".sc", ".java", ".cs", ".kt", ".kts"].iter().any(|e| path.ends_with(e));
+    let implicit_this = path == origin && ([".scala", ".sc", ".java", ".cs", ".kt", ".kts"].iter().any(|e| path.ends_with(e)) || crate::Language::from_path(path) == crate::Language::Ruby);
     if !source.contains(name) {
         return vec![];
     }
@@ -1214,6 +1225,8 @@ pub fn looks_like_definition(line: &str, name: &str) -> bool {
     // A type or a binding of that name: `class Opt(`, `object Opt {`, `struct Opt`, `val Opt =`.
     if matches!(last_word, "class" | "object" | "trait" | "struct" | "enum" | "interface" | "type" | "typedef" | "impl" | "record"
         | "val" | "var" | "let" | "const" | "static" | "lazy") { return true; }
+    // Ruby's `def name` needs no parentheses, and `def self.name` defines one on the class.
+    if last_word == "def" || before.strip_suffix("self.").is_some_and(|b| b.trim_end().ends_with("def")) { return true; }
     if !rest.starts_with('(') { return false; }
     if matches!(last_word, "fn" | "function" | "def" | "func" | "sub" | "proc" | "fun") { return true; }
     if before.starts_with("func (") && before.ends_with(')') { return true; }
@@ -1289,6 +1302,7 @@ fn is_declaration(before: &str, rest: &str, path: &str) -> bool {
     ["fn", "function", "def", "func", "class"].iter().any(|kw| b.ends_with(kw))
         || looks_like_signature(rest)
         || ((path.ends_with(".kt") || path.ends_with(".kts")) && kotlin_fun(b))
+        || (b.strip_suffix("self.").is_some_and(|d| d.trim_end().ends_with("def")) && crate::Language::from_path(path) == crate::Language::Ruby)
         || (path.ends_with(".cs") && csharp_return_type(b))
 }
 
@@ -1349,6 +1363,7 @@ pub fn code_only(source: &str) -> String {
 pub fn code_only_in(source: &str, path: &str) -> String {
     let kt = path.ends_with(".kt") || path.ends_with(".kts");
     let cs = path.ends_with(".cs");
+    let rb = crate::Language::from_path(path) == crate::Language::Ruby;
     let chars: Vec<char> = source.chars().collect();
     let mut out = String::with_capacity(source.len());
     let mut i = 0;
@@ -1383,6 +1398,7 @@ pub fn code_only_in(source: &str, path: &str) -> String {
             while i < chars.len() {
                 if chars[i] == '\\' && i + 1 < chars.len() { out.push(' '); out.push(blank(chars[i + 1])); i += 2; continue; }
                 let opens = ((c == '`' || dollar) && chars[i] == '$' && chars.get(i + 1) == Some(&'{'))
+                    || (rb && c == '"' && chars[i] == '#' && chars.get(i + 1) == Some(&'{'))
                     || (fstring && chars[i] == '{' && chars.get(i + 1) != Some(&'{'));
                 if dollar && chars[i] == '$' && chars.get(i + 1).is_some_and(|n| n.is_alphabetic() || *n == '_') {
                     out.push('$'); i += 1;
@@ -1391,7 +1407,7 @@ pub fn code_only_in(source: &str, path: &str) -> String {
                 }
                 if fstring && chars[i] == '{' && chars.get(i + 1) == Some(&'{') { out.push_str("  "); i += 2; continue; }
                 if opens {
-                    let start = if chars[i] == '$' { 2 } else { 1 };
+                    let start = if matches!(chars[i], '$' | '#') { 2 } else { 1 };
                     for k in 0..start { out.push(chars[i + k]); }
                     i = interpolation(&chars, i + start, &mut out);
                     continue;
@@ -1484,10 +1500,12 @@ fn looks_like_signature(rest: &str) -> bool {
 
 /// The path segment or receiver directly before a call (`a::b::` → `b`, `x.` → `x`).
 fn qualifier(before: &str) -> Option<&str> {
-    let head = before.strip_suffix("::").or_else(|| before.strip_suffix('.'))?;
+    let head = before.strip_suffix("::").or_else(|| before.strip_suffix('.'))
+        .or_else(|| before.strip_suffix("?->")).or_else(|| before.strip_suffix("->"))?;
     if head.trim_end().ends_with("super()") { return Some("super"); }
     let start = head.rfind(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$')).map(|p| p + 1).unwrap_or(0);
-    Some(&head[start..])
+    // PHP's `$this->`, `static::` and `parent::`.
+    Some(match &head[start..] { "$this" => "this", "static" => "self", "parent" => "super", q => q })
 }
 
 /// Whether a call qualified by `q` can refer to `sig_name` defined in `def_path`.

@@ -498,7 +498,9 @@ pub fn catch_all(p: &Param, path: &str) -> Option<bool> {
     match ext {
         "py" if p.name.starts_with("**") => Some(true),
         "py" if p.name.starts_with('*') => Some(false),
-        "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "mts" | "cts" if p.name.starts_with("...") => Some(false),
+        "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "mts" | "cts" | "php" if p.name.starts_with("...") => Some(false),
+        "rb" | "rake" if p.name.starts_with("**") => Some(true),
+        "rb" | "rake" if p.name.starts_with('*') || p.name == "..." => Some(false),
         "go" if ty.starts_with("...") => Some(false),
         "cs" if ty.starts_with("params ") => Some(false),
         "kt" | "kts" if ty.starts_with("vararg ") => Some(false),

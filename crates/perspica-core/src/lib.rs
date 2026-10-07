@@ -26,6 +26,8 @@ pub enum Language {
     Scala,
     CSharp,
     Kotlin,
+    Php,
+    Ruby,
     /// Not parsed: shown as a plain diff with no classification.
     Unknown,
 }
@@ -43,12 +45,17 @@ impl Language {
             "scala" | "sc" => Language::Scala,
             "cs" => Language::CSharp,
             "kt" | "kts" => Language::Kotlin,
+            "php" => Language::Php,
+            "rb" | "rake" | "gemspec" | "ru" => Language::Ruby,
             _ => Language::Unknown,
         }
     }
 
     pub fn from_path(path: &str) -> Self {
         let file = path.rsplit('/').next().unwrap_or(path);
+        // Ruby files without an extension, and Laravel's Blade templates, which are HTML.
+        if matches!(file, "Gemfile" | "Rakefile" | "Guardfile" | "Podfile" | "Vagrantfile" | "Brewfile" | "Fastfile") { return Language::Ruby; }
+        if file.ends_with(".blade.php") { return Language::Unknown; }
         match file.rsplit_once('.') {
             Some((_, ext)) => Language::from_extension(&ext.to_ascii_lowercase()),
             None => Language::Unknown,
@@ -1089,6 +1096,65 @@ mod tests {
         let r = analyze_multi(&[kt("a.kt", old, new), kt("b.kt", user, &format!("{user}// touched\n"))]).unwrap();
         assert!(r.cross_file.broken_references.is_empty(), "{:?}", r.cross_file.broken_references);
         assert!(r.cross_file.vanished.iter().all(|v| v.file_private));
+    }
+
+    #[test]
+    fn test_php_items_and_call_sites() {
+        let src = "<?php\nnamespace App;\n\nuse App\\Models\\User;\n\nfinal class Greeter extends Base\n{\n    private const LIMIT = 3;\n    protected string $name;\n    public function __construct(private string $prefix = 'Hi') {}\n    public function greet(string $who, int $times = 1, string ...$extra): string { return $who; }\n}\n\nfunction helper(string $s): string { return $s; }\n";
+        let lang = languages::get_language_support(Language::Php);
+        let tree = parser::parse(src, &*lang).unwrap();
+        let names: Vec<String> = tree.items.iter().filter_map(|i| i.name().map(str::to_string)).collect();
+        assert_eq!(names, ["App\\Models", "Greeter", "helper"], "{names:?}");
+        let parser::SemanticItem::Class { methods, fields, .. } = &tree.items[1] else { panic!() };
+        assert_eq!(fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["LIMIT", "name", "prefix"]);
+        let parser::SemanticItem::Function { params, .. } = &methods[1] else { panic!() };
+        assert_eq!(params.iter().map(|p| (p.name.as_str(), p.optional)).collect::<Vec<_>>(), [("who", false), ("times", true), ("...extra", false)]);
+
+        let stale = |old: &str, new: &str| -> Vec<usize> {
+            let r = analyze_multi(&[cross_file::FileChange::new("src/Greeter.php", old, new, Language::Php)]).unwrap();
+            r.cross_file.signature_impacts.iter().flat_map(|s| s.call_sites.iter().filter(|c| !c.updated).map(|c| c.line)).collect()
+        };
+        // `$this->` calls its own method, and a named argument breaks only when its name changes.
+        let old = "<?php\nclass Greeter\n{\n    private function format(string $who, int $times = 1): string { return $who; }\n\n    public function run(string $w): string\n    {\n        $a = $this->format($w);\n        return $a . $this->format($w, times: 2);\n    }\n}\n";
+        let new = old.replacen("int $times = 1", "int $count = 1", 1);
+        assert_eq!(stale(old, &new), vec![9]);
+        let new = old.replacen("int $times = 1): string", "int $times = 1, bool $loud): string", 1);
+        assert_eq!(stale(old, &new), vec![8, 9]);
+    }
+
+    #[test]
+    fn test_ruby_items_and_call_sites() {
+        let src = "require \"json\"\n\nmodule Billing\n  class Invoice < ApplicationRecord\n    LIMIT = 3\n    attr_reader :total\n    before_save :compute_total\n\n    def initialize(customer, total = 0, *items, discount: 0, **opts, &block)\n    end\n\n    def self.build(attrs)\n    end\n\n    def compute_total\n    end\n  end\nend\n";
+        let lang = languages::get_language_support(Language::Ruby);
+        let tree = parser::parse(src, &*lang).unwrap();
+        let names: Vec<String> = tree.items.iter().filter_map(|i| i.name().map(str::to_string)).collect();
+        // A module that holds classes is a namespace.
+        assert_eq!(names, ["json", "Invoice"], "{names:?}");
+        let parser::SemanticItem::Class { methods, fields, .. } = &tree.items[1] else { panic!() };
+        assert_eq!(fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["LIMIT", "total"]);
+        assert_eq!(methods.iter().filter_map(|m| m.name()).collect::<Vec<_>>(), ["initialize", "build", "compute_total"]);
+        let parser::SemanticItem::Function { params, .. } = &methods[0] else { panic!() };
+        assert_eq!(params.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["customer", "total", "*items", "discount", "**opts"]);
+
+        let rb = |old: &str, new: &str| analyze_multi(&[cross_file::FileChange::new("app/models/invoice.rb", old, new, Language::Ruby)]).unwrap();
+        let stale = |r: &cross_file::MultiDiffResult| -> Vec<usize> { r.cross_file.signature_impacts.iter().flat_map(|s| s.call_sites.iter().filter(|c| !c.updated).map(|c| c.line)).collect() };
+        // A required keyword argument has to be passed by name, and `def name` isn't a call.
+        let old = "class Invoice\n  def discount_for(customer, rate: 0.1)\n    customer\n  end\n\n  def total\n    discount_for(@customer) + discount_for(@customer, rate: 0.2)\n  end\nend\n";
+        let new = old.replacen("rate: 0.1)", "rate: 0.1, currency:)", 1);
+        assert_eq!(stale(&rb(old, &new)), vec![7]);
+        // Without keyword parameters, `key: value` is one hash argument.
+        let old = "class Invoice\n  def notify(user, opts = {})\n    user\n  end\n\n  def send_all\n    notify(@user, quiet: true)\n  end\nend\n";
+        let new = old.replacen("def notify(user, opts = {})", "def notify(user, opts = {}, channel = :email)", 1);
+        assert!(stale(&rb(old, &new)).is_empty());
+        // A Rails callback still naming a renamed method by its symbol is stale.
+        let old = "class Invoice < ApplicationRecord\n  before_save :compute_total\n\n  def compute_total\n    1\n  end\nend\n";
+        let new = old.replace("def compute_total", "def calculate_total");
+        let r = rb(old, &new);
+        assert_eq!(r.cross_file.broken_references.iter().map(|b| (b.symbol_name.as_str(), b.reference_location.line_start)).collect::<Vec<_>>(), [("compute_total", 2)]);
+        // A call inside `"#{...}"` counts.
+        let old = "class Invoice\n  def label(id)\n    id\n  end\n\n  def show\n    \"invoice #{label(@id)}\"\n  end\nend\n";
+        let new = old.replacen("def label(id)", "def label(id, full)", 1);
+        assert_eq!(stale(&rb(old, &new)), vec![7]);
     }
 
     #[test]

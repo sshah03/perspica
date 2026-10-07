@@ -666,6 +666,8 @@ fn walk_tokens_with<'t>(
         if !skip {
             if n.child_count() == 0 {
                 let text = &source[n.byte_range()];
+                // PHP calls its identifiers `name`, and Ruby its capitalized ones `constant`.
+                let kind = if matches!(kind, "name" | "constant") { "identifier" } else { kind };
                 text.hash(&mut w.norm);
                 if in_member == 0 { text.hash(&mut w.shell); }
                 if in_body { text.hash(&mut body_hash); }

@@ -203,6 +203,8 @@ fn parse_language(lang_str: &str) -> Language {
         "scala" => Language::Scala,
         "csharp" | "c#" | "cs" => Language::CSharp,
         "kotlin" | "kt" => Language::Kotlin,
+        "php" => Language::Php,
+        "ruby" | "rb" => Language::Ruby,
         _ => Language::Unknown,
     }
 }
