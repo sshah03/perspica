@@ -17,7 +17,7 @@ name = "perspica"
 path = "src/main.rs"
 
 [dependencies]
-perspica-core = { path = "../perspica-core", version = "0.1.6" }
+perspica-core = { path = "../perspica-core", version = "0.1.7" }
 clap = { version = "4", features = ["derive"] }
 colored = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "process"] }
