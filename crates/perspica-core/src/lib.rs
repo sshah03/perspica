@@ -1646,6 +1646,10 @@ mod tests {
         let broken: Vec<(&str, usize)> = r.cross_file.broken_references.iter().map(|b| (b.symbol_name.as_str(), b.reference_location.line_start)).collect();
         assert_eq!(broken, [("chalk", 4)]);
         assert!(r.cross_file.vanished.iter().all(|v| v.import_name && v.file_private));
+        // Several dropped imports come out in the same order every run.
+        let old = "import zeta from 'z'\nimport alpha from 'a'\nimport mid from 'm'\n\nexport const f = () => zeta + alpha + mid\n";
+        let r = js(old, "export const f = () => zeta + alpha + mid\n");
+        assert_eq!(r.cross_file.vanished.iter().map(|v| v.name.as_str()).collect::<Vec<_>>(), ["alpha", "mid", "zeta"]);
     }
 
     #[test]
