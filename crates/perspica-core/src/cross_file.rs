@@ -345,8 +345,8 @@ pub(crate) fn import_name(analyses: &[InternalAnalysis], name: &str, origin: &st
     analyses.iter().find(|a| a.path == origin).is_some_and(|a| import_locals(&a.old_tree).contains(name))
 }
 
-/// The local names a file's imports bring in.
-fn import_locals(tree: &SemanticTree) -> HashSet<String> {
+/// The local names a file's imports bring in, sorted so the output is the same every run.
+fn import_locals(tree: &SemanticTree) -> std::collections::BTreeSet<String> {
     tree.items.iter()
         .flat_map(|i| match i { SemanticItem::Import { bindings, .. } => bindings.as_slice(), _ => &[] })
         .map(|(_, local)| local.clone())
