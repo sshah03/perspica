@@ -113,7 +113,8 @@ pub fn claude_models() -> Vec<ModelOption> {
     vec![
         ModelOption::new("claude-opus-5-5", "Claude Opus 5.5", "Strong grouping and grounded concerns (default)"),
         ModelOption::new("claude-sonnet-5-5", "Claude Sonnet 5.5", "Faster and cheaper; good for most diffs"),
-        ModelOption::new("claude-haiku-4-5", "Claude Haiku 4.5", "Fastest; a rough first pass, vaguer notes"),
+        ModelOption::new("claude-haiku-5-5", "Claude Haiku 5.5", "Fastest and cheapest; a quick first pass"),
+        ModelOption::new("claude-haiku-4-5", "Claude Haiku 4.5", "Older Haiku; a rough first pass, vaguer notes"),
         ModelOption::new("claude-fable-5-1", "Claude Fable 5.1", "Most capable; slowest and most expensive"),
     ]
 }
