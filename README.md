@@ -28,10 +28,16 @@ It's built for reviewing work done with coding agents. When the change came from
 ## Install
 
 ```bash
-cargo install perspica
+brew install sshah03/perspica/perspica
 ```
 
-Or download a binary for macOS, Linux or Windows from [Releases](https://github.com/sshah03/perspica/releases), or build from source:
+Or with the install script, which puts the binary in `~/.local/bin`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sshah03/perspica/main/install.sh | sh
+```
+
+Or with Cargo (`cargo install perspica`), or download a binary for macOS, Linux or Windows from [Releases](https://github.com/sshah03/perspica/releases), or build from source:
 
 ```bash
 git clone https://github.com/sshah03/perspica && cd perspica
