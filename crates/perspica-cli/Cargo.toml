@@ -21,7 +21,7 @@ perspica-core = { path = "../perspica-core", version = "0.2.1" }
 clap = { version = "4", features = ["derive"] }
 colored = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "process"] }
-axum = "0.7"
+axum = "0.8"
 tower-http = { version = "0.6", features = ["fs"] }
 rust-embed = "8"
 open = "5"
