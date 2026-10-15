@@ -14,7 +14,7 @@ exclude = ["tests/real_prs.rs"]
 description = "Semantic diff engine: AST-aware change classification, noise detection, reading order and test reach"
 
 [dependencies]
-tree-sitter = "0.25"
+tree-sitter = "0.26"
 tree-sitter-typescript = "0.23"
 tree-sitter-python = "0.23"
 tree-sitter-rust = "0.24"
