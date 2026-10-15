@@ -46,7 +46,7 @@ jobs:
           cp "$bin" README.md LICENSE dist/$name/
           cd dist
           if [[ "${{ matrix.target }}" == *windows* ]]; then 7z a $name.zip $name >/dev/null; else tar czf $name.tar.gz $name; fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
           path: dist/perspica-*.*
