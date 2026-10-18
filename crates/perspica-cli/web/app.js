@@ -1768,7 +1768,7 @@ function renderConceptList() {
     const cur = currentConcept();
     const rows = cs.map(c => {
         const sc = quizScore(c);
-        const [cls, icon, label] = S.learnBusy[c.id] ? ['busy', '', 'Writing the lesson']
+        const [cls, icon, label] = S.learnBusy[c.id] ? ['busy', '', S.learnBusy[c.id].phase === 'checking' ? CHECKING : 'Writing the lesson']
             : sc.passed ? ['passed', '✓', 'Quiz passed']
             : c.lesson ? ['ready', '○', sc.answered ? `Quiz: ${sc.right} of ${sc.total} right` : 'Lesson ready']
             : ['empty', '·', 'Lesson not written yet'];
@@ -1819,10 +1819,15 @@ function learnIntroHtml() {
     </div>`;
 }
 
-function busyHtml(what, busy) {
+const CHECKING = 'Checking the lesson against the code';
+const TIDYING = 'Tidying the figure\'s layout';
+
+/** `job` names a lesson whose label switches to CHECKING once its second pass starts. */
+function busyHtml(what, busy, job, note = 'Usually 1 to 3 minutes. You can keep reviewing meanwhile.') {
+    const label = busy.phase === 'checking' ? CHECKING : busy.phase === 'layout' ? TIDYING : what;
     return `<div class="learn-busy"><span class="spinner" aria-hidden="true"></span>
-        <span>${esc(what)} with ${esc(modelLabel(busy.model))}… <span data-since="${busy.started}">${Math.round((Date.now() - busy.started) / 1000)}s</span></span>
-        <span class="muted">Usually 1 to 3 minutes. You can keep reviewing meanwhile.</span></div>`;
+        <span><span${job ? ` data-busy-label="${esc(job)}"` : ''}>${esc(label)}</span> with ${esc(modelLabel(busy.model))}… <span data-since="${busy.started}">${Math.round((Date.now() - busy.started) / 1000)}s</span></span>
+        <span class="muted">${esc(note)}</span></div>`;
 }
 
 function conceptPageHtml(c) {
@@ -1846,7 +1851,7 @@ function conceptPageHtml(c) {
 }
 
 function lessonBodyHtml(c) {
-    if (S.learnBusy[c.id]) return busyHtml('Writing the lesson', S.learnBusy[c.id]);
+    if (S.learnBusy[c.id]) return busyHtml('Writing the lesson', S.learnBusy[c.id], c.id, 'Usually a few minutes: the lesson is written, then checked against the code. You can keep reviewing meanwhile.');
     if (!c.lesson) {
         if (S.static) return '<p class="muted">This lesson wasn\'t written before the page was saved.</p>';
         const err = S.learnErrors[c.id];
@@ -1973,6 +1978,82 @@ function mountFrames(root) {
  * below also blocks every request, so nothing it shows can be sent anywhere. That
  * matters because the code under review can steer what the model writes.
  */
+/* kit:start */
+// Base styles and a step player for Learn's interactive pieces. They load before the model's own markup,
+// so a piece looks consistent with no CSS of its own, and its CSS still wins where it has some.
+const LEARN_KIT_CSS = `*,*::before,*::after{box-sizing:border-box}
+button,select{font:12px/1.3 var(--font);color:var(--fg);background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:4px 10px;cursor:pointer}
+button:hover:not(:disabled){background:var(--bg-alt)}
+button[aria-pressed="true"],button.on{background:color-mix(in srgb,var(--accent) 12%,var(--bg));border-color:var(--accent);color:var(--accent)}
+button:disabled{opacity:.45;cursor:default}
+input[type=range]{accent-color:var(--accent);vertical-align:middle}
+input[type=checkbox],input[type=radio]{accent-color:var(--accent)}
+.k-row{display:flex;flex-wrap:wrap;gap:6px 8px;align-items:center;margin-bottom:10px}
+.k-spacer{flex:1}
+.k-seg{display:inline-flex}.k-seg>button{border-radius:0}.k-seg>button+button{margin-left:-1px}
+.k-seg>button:first-child{border-radius:6px 0 0 6px}.k-seg>button:last-child{border-radius:0 6px 6px 0}
+.k-seg>button[aria-pressed="true"],.k-seg>button.on{position:relative;z-index:1}
+.k-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media (max-width:520px){.k-grid{grid-template-columns:1fr}}
+.k-panel{border:1px solid var(--border);border-radius:8px;padding:10px 12px;background:var(--bg);min-width:0}
+.k-panel-head{display:flex;justify-content:space-between;gap:8px;align-items:baseline;font-weight:600;font-size:13px;margin-bottom:8px}
+.k-label{font-size:12px;color:var(--fg-muted)}
+.k-tag{display:inline-block;font-size:11px;font-weight:600;padding:1px 7px;border-radius:999px;border:1px solid currentColor}
+.k-good{color:var(--good)}.k-bad{color:var(--bad)}.k-warn{color:var(--warn)}.k-accent{color:var(--accent)}.k-muted{color:var(--fg-muted)}
+.k-fill-good{background:color-mix(in srgb,var(--good) 12%,transparent);border-color:color-mix(in srgb,var(--good) 55%,transparent)}
+.k-fill-bad{background:color-mix(in srgb,var(--bad) 12%,transparent);border-color:color-mix(in srgb,var(--bad) 55%,transparent)}
+.k-fill-warn{background:color-mix(in srgb,var(--warn) 14%,transparent);border-color:color-mix(in srgb,var(--warn) 55%,transparent)}
+.k-fill-accent{background:color-mix(in srgb,var(--accent) 12%,transparent);border-color:color-mix(in srgb,var(--accent) 55%,transparent)}
+.k-mono,.k-code{font-family:var(--mono);font-size:12px}
+.k-code{white-space:pre}
+.k-codeblock{font:12px/1.55 var(--mono);white-space:normal;background:var(--bg-alt);border:1px solid var(--border);border-radius:6px;padding:8px 0;overflow-x:auto;margin:0}
+.k-codeblock>span{display:block;padding:0 10px;white-space:pre}
+.k-codeblock>.k-hl{background:color-mix(in srgb,var(--accent) 14%,transparent);box-shadow:inset 2px 0 var(--accent)}
+.k-codeblock>.k-add{background:color-mix(in srgb,var(--good) 13%,transparent)}
+.k-codeblock>.k-del{background:color-mix(in srgb,var(--bad) 12%,transparent)}
+.k-status{margin-top:10px;font-size:13px;line-height:1.45}
+.k-key{font-weight:700;font-variant-numeric:tabular-nums;letter-spacing:-.01em}
+.k-t{transition:all .32s ease}
+svg{overflow:visible}
+svg text{font-family:var(--font);font-size:12px;fill:var(--fg)}
+svg .k-mono{font-family:var(--mono)}
+svg .k-node{fill:var(--bg);stroke:var(--border);stroke-width:1}
+svg .k-edge{stroke:var(--fg-muted);stroke-width:1.25;fill:none}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}`;
+const LEARN_KIT_JS = `window.Kit={steps(total,show,opts={}){let i=Math.min(opts.start||0,total-1),timer=0;const ms=opts.interval||1200;
+const q=n=>document.querySelector('[data-kit="'+n+'"]');
+const sync=()=>{const p=q('play');if(p)p.textContent=timer?'Pause':(i>=total-1?'Replay':'Play');const c=q('count');if(c)c.textContent=(i+1)+' / '+total;};
+const go=n=>{i=Math.max(0,Math.min(total-1,n));show(i);sync();};
+const stop=()=>{clearInterval(timer);timer=0;sync();};
+const play=()=>{if(timer)return stop();if(i>=total-1)go(0);timer=setInterval(()=>{if(i>=total-1)stop();else go(i+1);},ms);sync();};
+q('play')&&q('play').addEventListener('click',play);
+q('step')&&q('step').addEventListener('click',()=>{stop();go(i>=total-1?0:i+1);});
+go(i);return{go,play,stop,get index(){return i;}};}};`;
+// Runs in a figure drawn off screen, and posts what a reader would trip over: text overlapping other text,
+// text cut off at the edge, text too small to read, a figure wider than its frame.
+const LEARN_LINT_JS = `addEventListener('load',()=>setTimeout(()=>{const P=[],de=document.documentElement,W=de.clientWidth;
+if(de.scrollWidth>W+2)P.push('the figure is '+de.scrollWidth+'px wide in a '+W+'px frame, so it scrolls sideways');
+const hidden=el=>{for(let e=el;e&&e!==de;e=e.parentElement){const s=getComputedStyle(e);if(s.visibility==='hidden'||+s.opacity<0.15)return true;}return false;};
+const name=t=>'"'+(t.length>40?t.slice(0,40)+'…':t)+'"',at=b=>' (at x '+Math.round(b.left)+', y '+Math.round(b.top)+')';
+const boxes=[],small=new Set(),shrunk=new Set(),cut=new Set(),pairs=new Set();
+const w=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);let n;
+while((n=w.nextNode())){const t=n.textContent.replace(/\\s+/g,' ').trim();const el=n.parentElement;
+if(!t||!el||el.closest('script,style,noscript')||hidden(el))continue;
+const r=document.createRange();r.selectNodeContents(n);const rs=[...r.getClientRects()].filter(b=>b.width>1&&b.height>1);if(!rs.length)continue;
+let px=parseFloat(getComputedStyle(el).fontSize)||13;const svg=el.ownerSVGElement;
+if(el instanceof SVGGraphicsElement){const m=el.getScreenCTM();if(m)px*=Math.hypot(m.a,m.b);}
+if(px<10.5&&!el.closest('math')){small.add(name(t)+' ('+Math.round(px)+'px)');
+const vb=svg&&svg.viewBox&&svg.viewBox.baseVal;const sw=svg&&svg.getBoundingClientRect().width;
+if(vb&&vb.width&&sw&&sw<vb.width*0.95)shrunk.add('an SVG drawn '+Math.round(vb.width)+' units wide is shown at '+Math.round(sw)+'px, so its text shrinks');}
+for(const b of rs){if(b.right>W+2||b.left<-2)cut.add(name(t)+at(b));boxes.push({b,t,el});}}
+for(let i=0;i<boxes.length;i++)for(let j=i+1;j<boxes.length;j++){const a=boxes[i],c=boxes[j];if(a.el===c.el)continue;
+const x=Math.min(a.b.right,c.b.right)-Math.max(a.b.left,c.b.left),y=Math.min(a.b.bottom,c.b.bottom)-Math.max(a.b.top,c.b.top);
+if(x>2&&y>2&&x*y>0.25*Math.min(a.b.width*a.b.height,c.b.width*c.b.height))pairs.add(name(a.t)+' overlaps '+name(c.t)+at(a.b));}
+pairs.forEach(p=>P.push(p));cut.forEach(t=>P.push(t+' is cut off at the edge'));
+if(small.size)P.push('text too small to read: '+[...small].slice(0,4).join(', '));shrunk.forEach(s=>P.push(s));
+parent.postMessage({perspicaLint:P.slice(0,10)},'*');},1200));`;
+/* kit:end */
+
 function frameDoc(html) {
     const cs = getComputedStyle(document.documentElement);
     const v = n => cs.getPropertyValue(n).trim();
@@ -1984,7 +2065,7 @@ function frameDoc(html) {
 addEventListener('error',e=>fail(e.message||'script error'));addEventListener('unhandledrejection',()=>fail('unhandled promise rejection'));
 addEventListener('load',()=>setTimeout(()=>{const b=document.body;const drawn=b&&(b.innerText.trim().length>0||[...b.querySelectorAll('svg,canvas,img')].some(el=>{const r=el.getBoundingClientRect();return r.width*r.height>100;}));if(!drawn)fail('nothing drawn');settled=true;},800));})()<\/script>`;
     // Our head goes first, so the policy and the watcher apply before any of the model's markup runs.
-    const head = `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${policy}">${watcher}<style>:root{color-scheme:${cs.colorScheme || 'dark'};${vars}}html,body{margin:0;background:transparent;color:var(--fg);font:13px/1.45 var(--font)}</style></head>`;
+    const head = `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${policy}">${watcher}<style>:root{color-scheme:${cs.colorScheme || 'dark'};${vars}}html,body{margin:0;background:transparent;color:var(--fg);font:13px/1.45 var(--font)}\n${LEARN_KIT_CSS}</style><script>${LEARN_KIT_JS}<\/script></head>`;
     // Its own policy would stack on ours and could block its own script. A refresh could navigate the frame away.
     const body = html.replace(/^\s*<!doctype[^>]*>/i, '').replace(/<meta[^>]*http-equiv\s*=\s*["']?(refresh|content-security-policy)[^>]*>/gi, '');
     // The piece reports its height, so the frame fits it without a scrollbar.
@@ -2109,6 +2190,64 @@ async function writeAllLessons() {
 }
 
 let learnTicker = 0;
+/** Draws a figure off screen at the page's width and at phone width, and returns what the layout check found. */
+function lintFigure(html) {
+    const page = Math.min(820, document.querySelector('.learn-page')?.clientWidth || 760);
+    return Promise.all([...new Set([page, 380])].map(w => new Promise(resolve => {
+        const f = document.createElement('iframe');
+        f.setAttribute('sandbox', 'allow-scripts');
+        f.setAttribute('aria-hidden', 'true');
+        f.tabIndex = -1;
+        f.style.cssText = `position:fixed;left:-10000px;top:0;width:${w}px;height:900px;border:0;opacity:0;pointer-events:none`;
+        const done = found => { removeEventListener('message', on); clearTimeout(timer); f.remove(); resolve(found.map(p => `at ${w}px wide, ${p}`)); };
+        const on = e => { if (e.source === f.contentWindow && Array.isArray(e.data?.perspicaLint)) done(e.data.perspicaLint.map(String)); };
+        const timer = setTimeout(() => done([]), 8000);
+        addEventListener('message', on);
+        f.srcdoc = frameDoc(html).replace('</head>', `<script>${LEARN_LINT_JS}<\/script></head>`);
+        document.body.appendChild(f);
+    }))).then(r => r.flat());
+}
+
+/** Before a new figure is shown, fixes what the layout check finds in it. The checking pass reads the figure as text,
+ *  so it can't see these. A fix is kept only when the check finds fewer problems after it, and a second round runs
+ *  only while the first one helped. */
+async function tidyFigure(c, model) {
+    let html = c.lesson.interactive.html, problems = await lintFigure(html), better = null;
+    const post = body => fetch('/api/learn/layout', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ concept: c.id, ...body }) })
+        .then(resp => resp.json().then(r => resp.ok ? r : null, () => null)).catch(() => null);
+    for (let round = 0; round < 2 && problems.length; round++) {
+        const busy = S.learnBusy[c.id];
+        if (busy) {
+            busy.phase = 'layout';
+            document.querySelectorAll('[data-busy-label]').forEach(el => { if (el.dataset.busyLabel === c.id) el.textContent = TIDYING; });
+        }
+        const r = await post({ problems, html, model });
+        if (!r?.fixes || !r.html) break;
+        const left = await lintFigure(r.html);
+        if (left.length >= problems.length) break;
+        html = better = r.html;
+        problems = left;
+    }
+    if (!better) return;
+    const saved = await post({ save: true, html: better, saved_at: c.lesson.saved_at });
+    if (saved?.lesson) c.lesson = saved.lesson;
+}
+
+/** Asks the server which lessons have reached their checking pass, and relabels them. */
+async function pollLearnStatus() {
+    let status;
+    try {
+        const r = await fetch('/api/learn/status');
+        if (!r.ok) return;
+        status = await r.json();
+    } catch { return; }
+    for (const [job, busy] of Object.entries(S.learnBusy)) {
+        if (status[job] !== 'checking' || busy.phase === 'checking') continue;
+        busy.phase = 'checking';
+        document.querySelectorAll('[data-busy-label]').forEach(el => { if (el.dataset.busyLabel === job) el.textContent = CHECKING; });
+    }
+}
+
 /** Find the concepts (no `concept`), or write one concept's lesson. */
 /** `model` overrides the one chosen when the concepts were found (for a rewrite). */
 async function runLearn(concept, model) {
@@ -2119,9 +2258,13 @@ async function runLearn(concept, model) {
     S.learnBusy[job] = { started: Date.now(), model };
     delete S.learnErrors[job];
     setFaviconBusy(true);
-    if (!learnTicker) learnTicker = setInterval(() => {
-        document.querySelectorAll('[data-since]').forEach(el => { el.textContent = Math.round((Date.now() - +el.dataset.since) / 1000) + 's'; });
-    }, 1000);
+    if (!learnTicker) {
+        let ticks = 0;
+        learnTicker = setInterval(() => {
+            document.querySelectorAll('[data-since]').forEach(el => { el.textContent = Math.round((Date.now() - +el.dataset.since) / 1000) + 's'; });
+            if (++ticks % 2 === 0 && Object.keys(S.learnBusy).some(j => j !== 'outline')) pollLearnStatus();
+        }, 1000);
+    }
     const shown = () => S.area === 'learn' && (job === 'outline' || currentConcept()?.id === concept);
     renderHeader();
     if (S.area === 'learn') { renderSidebar(); if (shown()) renderLearn(); }
@@ -2136,6 +2279,7 @@ async function runLearn(concept, model) {
                 if (c.lesson) { delete S.quiz[quizKey(c)]; store.set('quiz:' + sourceKey(), S.quiz); }
                 delete S.frameFailed[concept];
                 c.lesson = r.lesson;
+                if (c.lesson?.interactive?.html) await tidyFigure(c, model);
             }
             if (!shown()) toast(`The lesson on ${(c?.title || 'a concept').replace(/`/g, '')} is ready.`, 'ok');
         } else {

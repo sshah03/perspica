@@ -141,7 +141,7 @@ Each concept has:
 
 <sub>Learn on [pallets/flask#5818](https://github.com/pallets/flask/pull/5818) (architecture diagram), [charmbracelet/lipgloss#591](https://github.com/charmbracelet/lipgloss/pull/591) (a hands-on piece and a quiz) and [encode/uvicorn#2985](https://github.com/encode/uvicorn/pull/2985) (an animation and a quiz). [Full-quality video (MP4)](docs/media/perspica-learn-demo.mp4).</sub>
 
-Learn uses the same setup as [LLM analysis](#llm-analysis): open the tab, pick a model, and perspica looks for concepts. Each lesson is written the first time you open its concept, and saved in `.git/perspica/` with the analysis, so it's only written once. If a lesson isn't good enough, **Rewrite…** writes it again, with a stronger model if you like. Lessons are kept in `--format html` exports, so a shared review keeps its lessons and quizzes.
+Learn uses the same setup as [LLM analysis](#llm-analysis): open the tab, pick a model, and perspica looks for concepts. Each lesson is written the first time you open its concept, and saved in `.git/perspica/` with the analysis, so it's only written once. A second pass checks each lesson against the code and fixes what's wrong, and the viewer fixes any text in the figure that overlaps, gets cut off or is too small to read. So a lesson takes a few minutes to write. If a lesson isn't good enough, **Rewrite…** writes it again, with a stronger model if you like. Lessons are kept in `--format html` exports, so a shared review keeps its lessons and quizzes.
 
 ## Privacy
 

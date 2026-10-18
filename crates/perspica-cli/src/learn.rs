@@ -263,10 +263,12 @@ WRITING RULES (every text field, including the quiz):
   own docs, docs.rs, Wikipedia, an RFC) that cover the concept. For a project-specific idea, a page in the
   repository under review (REPO_URL) works too. Only pages you are sure exist, with no query
   string. Leave the list empty rather than guess; links that don't load are dropped.
-- Only state what the code shown supports. If something isn't shown, don't guess about it. Refer to code by
+- Only state what the code shown supports. If something isn't shown, don't guess about it. Don't give reasons
+  for a design that the code or the description doesn't give. Refer to code by
   symbol and file name, never by change id.
 
-QUIZ: one multiple-choice question per takeaway, so most quizzes have 1 or 2 questions and none more than 3.
+QUIZ: questions are about paths the code can really reach, and every answer agrees with the code and with the
+visual (if the visual can run the quiz's input, it gives the quiz's answer). One multiple-choice question per takeaway, so most quizzes have 1 or 2 questions and none more than 3.
 When the core idea and how this change uses it are really the same point, that's one takeaway and one question.
 3-4 choices each; "answer" is the 0-based index of the one
 correct choice. Start with the core idea (a newcomer who read the intuition can answer it); prefer questions
@@ -280,21 +282,19 @@ Reply with text only. Don't use tools or write files."#;
 const NO_VISUAL: &str = "VISUAL: none for this concept. Leave \"interactive\" as null and write no HTML. \
     The text and the sources carry it.";
 
-/// What each form of visual is for, and how it should behave.
+/// What each form of visual is for.
 fn visual_guidance(kind: &str) -> &'static str {
     match kind {
-        "animation" => "It shows a process that unfolds over time. Start paused on a meaningful first frame, with \
-            Play/Pause and Step buttons. Each step changes one thing and says what happened in a short caption. \
-            It never loops forever on its own.",
-        "diagram" => "It shows structure or relationships: the parts, and how data or control flows between them. \
-            For an architecture change, show before and after (side by side, or a toggle between them) and mark \
-            what moved. Static, or highlight on hover or click.",
-        "simulation" => "It shows how behavior depends on a number (load, input size, a probability). One or two \
-            sliders and a live result.",
-        "comparison" => "It runs two versions on the same input side by side, like this change's old and new behavior, \
-            and makes the difference obvious.",
-        _ => "It makes math easier to feel than read. Write the formula in MathML, with a slider or two showing how the \
-            result responds.",
+        "animation" => "It shows something unfolding over time: messages between parties, a walk through a structure, \
+            state changing until something happens.",
+        "diagram" => "It shows structure or relationships: the parts, how data or control flows between them, and for \
+            an architecture change, what moved.",
+        "simulation" => "It shows how behavior depends on a number (load, input size, a probability), computed from the \
+            real rule in this change, with the point where behavior changes easy to see.",
+        "comparison" => "It shows old and new behavior, or two approaches, on the same input, so the real difference \
+            is obvious.",
+        _ => "It makes math easier to feel than read: the formula in MathML, and the result responding as the reader \
+            changes an input, using this change's real constants.",
     }
 }
 
@@ -305,23 +305,195 @@ Then, after the JSON, write the piece between these two marker lines:
 <html>…a complete document…</html>
 ===END===
 
-One idea per piece. The first view must show the key idea with no clicking. At most 3 controls. At most
-about 80 words of text inside the piece. Use this change's real names and values where you can, not foo and bar.
+THE FIGURE. It sits beside this lesson in a code review, read by a developer who knows code but maybe not this
+concept. Aim for what the best explorable explanations do (Sam Rose's samwho.dev, Bartosz Ciechanowski, Red Blob
+Games, Lin Clark's code cartoons): within a few seconds the reader sees the mechanism happen, and playing with it
+makes the idea stick. It should be better than any textbook figure of this idea, and something a developer would
+want to share.
+
+WHAT GREAT LOOKS LIKE
+- The drawing carries the idea and words support it. The lesson already holds the reasoning, caveats and code, so
+  the figure needs only small labels on the things themselves and at most a line saying what's happening. Every
+  mark earns its place, because clutter costs the reader attention they're spending on the review.
+- Its form comes from this change. Draw the real thing in its own shape: the queue filling, the tree an error
+  climbs, the bytes in their order, messages crossing between two parties, a curve bending at a limit. Pick an
+  instance small enough to take in whole (cells you could count, the actual string, a handful of nodes), with values
+  that make the point visible. A layout that would fit any PR is a sign to look again.
+- The reader can read it without being told: requests as balls that travel, a queue as a column that fills, a
+  pointer as an arrow that moves, a failed attempt that fades. State shows through form (fill, outline, position,
+  fading) more than through text or badges.
+- A quiet scene, with color for the story. Structure in --fg-muted and --border; --accent for the thing acting;
+  --bad for the failure and --good for the right outcome, meaning the same thing throughout. Thin lines, simple
+  shapes, and the figure floats on the page rather than sitting in cards.
+- The first view already says something. Picture a screenshot taken the moment it loads, before anything moves or
+  is clicked: it shows the answer, the failure next to the right result, or the key moment. When something moves,
+  the motion replays how it got there.
+- Interaction where the reader learns by changing something: drag the thing itself, scrub through time, pick the
+  input that matters. Motion shows cause before effect, one thing at a time, with easing. A still figure is a fine
+  answer when nothing needs to move. To compare two behaviors, two small versions from the same start, side by
+  side, usually read faster than a toggle.
+
+DEFAULTS TO NOTICE. Generated figures drift toward these. Each is right sometimes, so use one when this concept
+really calls for it, never out of habit: bordered cards and panels; pills and badges carrying the state; rows of
+text or key: value tables; stat tiles; code blocks or code expressions as labels inside the figure; legends; a row
+of Play, Step and Back buttons; a before/after toggle where two small side-by-side views would do; sentences of
+prose inside the figure.
+
+HOW TO WORK
+1. Before writing HTML, decide for yourself (not in the output): the one thing the reader should see, the picture
+   that shows it, what they can do with it, and what you're leaving out. If you'd draw the same thing for an
+   unrelated PR, look again.
+2. Build it.
+3. Read it back as someone seeing it cold, at 760px and on a phone, in light and dark. Can they tell what they're
+   looking at and what it shows within a few seconds? If not, change the picture rather than adding words. Spend
+   your boldness on one element and keep the rest quiet. Then remove one thing.
+
+TRUTH. Everything drawn matches what this change's code really does: real names, values worked out by tracing the
+code on a concrete input, and the old behavior as it really was. A reviewer checks the figure against the code
+afterwards, so a few exact claims beat many approximate ones.
+
+CRAFT. Readable in both themes; nothing overlapping or cut off anywhere from 300 to 900px wide; text 12px or larger;
+nothing important only on hover, since phones can't hover; with prefers-reduced-motion, change things instantly.
+
+TOOLS already in the frame: native <button>, <select> and <input type="range"> are styled; a selected toggle has
+aria-pressed="true", and a group of toggles goes in <div class="k-seg">. Kit.steps(total, show, { interval, start })
+calls show(i) to draw step i, opens on step start (0 by default, so pass the key step to open there), and wires
+buttons marked data-kit="play" and data-kit="step" and a data-kit="count" label, which it keeps in step with what's
+drawn; it returns { go(i), play(), stop() }. Colors and fonts come only from these variables, so it matches the viewer's
+theme: --bg, --bg-alt, --fg, --fg-muted, --border, --accent, --good, --bad, --warn, --font, --mono. Leave the page
+background transparent. No emoji.
 
 HTML RULES:
 - One complete, self-contained HTML document with inline <style> and <script>, under 20,000 characters,
   plain modern JavaScript, no frameworks. It runs in a sandboxed frame with no network: no external scripts,
   stylesheets, fonts or images, no requests, no alert(). Draw with SVG, canvas and HTML; write formulas in MathML.
-- Use only these CSS variables for colors and fonts, so it matches the viewer's light or dark theme:
-  --bg, --bg-alt, --fg, --fg-muted, --border, --accent, --good, --bad, --warn, --font, --mono.
-  Leave the page background transparent.
-- Fluid width (300 to 900px). Keep the height under 480px. Label what's on screen."#;
+- Wrap the script in an IIFE, so its names can't collide with the page's own (closed, name, status, top).
+- Before you finish, read the script through once: every function and variable it uses is defined, and the
+  first view draws completely when the page loads, with no click."#;
 
 fn visual_section(kind: &str) -> String {
     if !KINDS.contains(&kind) {
         return NO_VISUAL.to_string();
     }
     format!("VISUAL: show this concept as a {kind}. {}\n{}", visual_guidance(kind), VISUAL_RULES.replace("KIND", kind))
+}
+
+/// What the checking pass returns when the draft needs no changes.
+pub const NO_CHANGES: &str = "===NO CHANGES===";
+
+const VERIFY_SPEC: &str = r#"CHECK THE DRAFT. Another engineer wrote the draft above for this concept. Before it reaches reviewers, check it
+against the code, as a careful reviewer would, and fix what's wrong. Work through each point:
+1. Every claim in the title, tldr, intuition, explanation, in_this_change, quiz and the visual (in every state its
+   controls can reach) is true for this code and for the real runtime. Anything that only holds in a model says so briefly in the lesson text.
+2. Trace each number, output and string by hand on its input, the way this code computes it. Numbers, defaults and
+   labels come from this code (its own constants, conversions and default settings), not from a reference table, a
+   spec or memory. Fix any that don't match. A count or badge covers every
+   item drawn, unchanged ones included, and has the same scope as its sentence.
+3. "Before" is the real old behavior. If something is called hypothetical, check the removed code (and any removed
+   dependency) first: when the old code really did it, show it as the real before.
+4. For each absolute (every, only, always, never, can't, forever, "if X then Y"), look for a counterexample in the code,
+   the tests and the rest of the diff, including the visual's own cases. A claimed cost or failure (spins forever,
+   leaks, can't be caught) holds only if every exit path and every other check in the code allows it. A claim copied from a code comment is checked
+   too: a changelog entry or a test can contradict it. Qualify it or remove it. The tldr and title agree with every
+   case the visual shows.
+5. Everything the diff adds is accounted for: no "breaks", "requires" or "can't catch" when the diff has code that
+   handles it.
+   A claim that rests on code not shown here (a default set in another file, a library's exact output, a value only
+   running the code would give) goes only as far as the code shown supports: say what it depends on, or use the
+   test's own values and say they're the test's.
+6. The lesson and visual together show what sets the problem up, the condition that decides the outcome, and the
+   outcome a user would see for the input shown. A case that was right before and is an error now is a
+   regression, not colored as a fix.
+7. Highlighted code is the line that causes the behavior. A part's detail quotes that part's own code. Each state
+   change is pinned to the function that makes it.
+8. Quiz answers agree with the code and with the visual, ask about paths the code can reach, and every question's
+   premise is true.
+9. A fact you correct in one place is corrected everywhere it appears: tldr, intuition, explanation, quiz, visual.
+10. The script defines everything it uses and runs inside an IIFE, and the first view draws with no click.
+11. The visual reads clearly at a glance: verdicts and colors match the outcomes they label, emphasis lands on what
+   matters, captions and labels agree with what's drawn, and no text overlaps other text or lines. Text that only repeats what's already drawn or said can go.
+
+OUTPUT: if nothing needs fixing, reply with exactly NO_CHANGES and nothing else. Otherwise reply with only a list of
+fixes, each one in this form, and nothing else:
+===FIND===
+text copied exactly from the DRAFT, long enough to appear only once
+===REPLACE===
+the corrected text
+===END===
+- FIND is copied character for character from the draft as shown, including the JSON escaping inside the JSON part
+  (\" and \n), so keep it short: a sentence, a label, a line, a number with a few words around it.
+- In the JSON part, REPLACE keeps the JSON valid. To change a quiz answer, fix the question, choices, "answer" and
+  explanation together, with one FIND that covers all of them.
+- In the HTML, change only what's wrong. Keep the elements, classes and layout, and keep a replacement about as long
+  as what it replaces, so it fits where the old text was. Fix the wrong labels, values or states; don't redraw.
+- Fix only what's wrong or confusing, and keep the draft about as long as it is. Correct a claim in place, or cut it,
+  rather than explaining around it. Don't restyle or reword correct text, and never remove a true claim unless it
+  only repeats one. When the draft leaves out something a reviewer needs (points 5 and 6), add it to the lesson text
+  in a sentence, not to the figure."#;
+
+/// The prompt for the checking pass: the lesson's own prompt (so it sees the same code and rules), then the draft.
+pub fn verify_prompt(lesson_prompt: &str, draft: &str) -> String {
+    format!("{lesson_prompt}\n\nDRAFT:\n{draft}\n\n{}", VERIFY_SPEC.replace("NO_CHANGES", NO_CHANGES))
+}
+
+const LAYOUT_SPEC: &str = r#"FIX THE LAYOUT. The interactive figure below is from a lesson in a code review. It was drawn in a browser,
+and a layout check found these problems:
+PROBLEMS
+
+Fix them with the smallest changes that make the figure read cleanly at every width from 300 to 900px: move, shorten
+or wrap labels, give text room, let rows wrap, size drawings to their container, and keep text 12px or larger. Keep
+what the figure shows, its values and words, and its look. Don't redraw it.
+
+OUTPUT: if nothing needs fixing, reply with exactly NO_CHANGES and nothing else. Otherwise reply with only a list of
+fixes, each one in this form, and nothing else:
+===FIND===
+text copied exactly from the figure, long enough to appear only once
+===REPLACE===
+the corrected text
+===END===
+
+FIGURE:
+"#;
+
+/// The prompt for fixing what the viewer's layout check found in a figure: overlapping or cut-off text, text too
+/// small to read, a figure wider than its frame.
+pub fn layout_prompt(html: &str, problems: &[String]) -> String {
+    let list = problems.iter().map(|p| format!("- {p}")).collect::<Vec<_>>().join("\n");
+    format!("{}{html}", LAYOUT_SPEC.replace("PROBLEMS", &list).replace("NO_CHANGES", NO_CHANGES))
+}
+
+/// Applies the checking pass's fixes to the draft. A fix is used only when its FIND text appears exactly
+/// once, so a fix that was copied wrong is skipped instead of landing in the wrong place. A fix is also
+/// skipped when the result isn't `valid`, so one broken fix doesn't cost the others.
+/// Returns the patched draft, how many fixes were used, and how many were skipped.
+pub fn apply_fixes(draft: &str, reply: &str, valid: impl Fn(&str) -> bool) -> (String, usize, usize) {
+    let mut out = draft.to_string();
+    let (mut used, mut skipped) = (0, 0);
+    let mut rest = reply;
+    while let Some(at) = rest.find("===FIND===") {
+        let body = &rest[at + "===FIND===".len()..];
+        let (Some(r), Some(e)) = (body.find("===REPLACE==="), body.find("===END===")) else { skipped += 1; break };
+        if e < r {
+            skipped += 1;
+            rest = &body[e + "===END===".len()..];
+            continue;
+        }
+        let trim = |t: &str| t.strip_prefix('\n').unwrap_or(t).strip_suffix('\n').unwrap_or(t).to_string();
+        let find = trim(&body[..r]);
+        let replace = trim(&body[r + "===REPLACE===".len()..e]);
+        let patched = (!find.is_empty() && out.matches(find.as_str()).count() == 1)
+            .then(|| out.replacen(find.as_str(), &replace, 1))
+            .filter(|p| valid(p));
+        match patched {
+            Some(p) => {
+                out = p;
+                used += 1;
+            }
+            None => skipped += 1,
+        }
+        rest = &body[e + "===END===".len()..];
+    }
+    (out, used, skipped)
 }
 
 /// Said instead of calling the model when the change is only mechanical.
@@ -627,6 +799,37 @@ fn clip(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fixes_apply_only_when_they_match_once() {
+        let draft = "{\"tldr\": \"Two of three\"}\n===INTERACTIVE===\n<b>2 of 3</b><i>x</i><i>x</i>\n===END===";
+        let reply = "===FIND===\nTwo of three\n===REPLACE===\nThree of three\n===END===\n\
+                     ===FIND===\n<b>2 of 3</b>\n===REPLACE===\n<b>3 of 3</b>\n===END===\n\
+                     ===FIND===\n<i>x</i>\n===REPLACE===\n<i>y</i>\n===END===\n\
+                     ===FIND===\nnot in the draft\n===REPLACE===\nanything\n===END===";
+        let (out, used, skipped) = apply_fixes(draft, reply, |_| true);
+        assert_eq!((used, skipped), (2, 2), "the repeated <i>x</i> and the missing text are skipped");
+        assert!(out.contains("Three of three") && out.contains("<b>3 of 3</b>") && out.matches("<i>x</i>").count() == 2);
+    }
+
+    #[test]
+    fn layout_prompt_lists_the_problems_and_ends_with_the_figure() {
+        let p = layout_prompt("<svg></svg>", &["at 380px wide, \"a\" overlaps \"b\"".to_string()]);
+        assert!(p.contains("- at 380px wide, \"a\" overlaps \"b\""));
+        assert!(p.contains(NO_CHANGES) && !p.contains("PROBLEMS"));
+        assert!(p.ends_with("FIGURE:\n<svg></svg>"));
+    }
+
+    #[test]
+    fn a_fix_that_breaks_the_lesson_is_skipped_alone() {
+        let draft = "{\"tldr\": \"Two of three\", \"intuition\": \"x\"}";
+        let reply = "===FIND===\nTwo of three\n===REPLACE===\nThree of three\n===END===\n\
+                     ===FIND===\n\"intuition\": \"x\"\n===REPLACE===\n\"intuition\": \"x\n===END===";
+        let valid = |t: &str| serde_json::from_str::<serde_json::Value>(t).is_ok();
+        let (out, used, skipped) = apply_fixes(draft, reply, valid);
+        assert_eq!((used, skipped), (1, 1));
+        assert!(out.contains("Three of three") && valid(&out));
+    }
+
     use super::*;
 
     fn sources() -> Vec<String> {

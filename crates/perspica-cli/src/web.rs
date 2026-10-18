@@ -1,7 +1,7 @@
 use crate::{deep, intel, learn, llm, MultiFileResult};
 use axum::{extract::{Request, State}, http::{header, Method, StatusCode}, middleware::{self, Next}, response::{Html, IntoResponse, Response}, routing::{get, post}, Json, Router};
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
@@ -14,8 +14,9 @@ struct AppState {
     deep_lock: Mutex<()>,
     /// Identifies this diff for saved analyses.
     key: String,
-    /// Learn jobs running now: "outline", or a concept id while its lesson is written.
-    learn_busy: std::sync::Mutex<HashSet<String>>,
+    /// Learn jobs running now ("outline", or a concept id while its lesson is written), and what each is
+    /// doing: "writing", or "checking" while the lesson is checked against the code.
+    learn_busy: std::sync::Mutex<HashMap<String, &'static str>>,
 }
 
 pub async fn serve(result: MultiFileResult, port: u16, provider: Option<Box<dyn llm::LlmProvider>>, detect: llm::Detect, open_browser: bool, key: String) {
@@ -52,6 +53,8 @@ pub async fn serve(result: MultiFileResult, port: u16, provider: Option<Box<dyn 
         .route("/api/analyze", post(analyze_handler))
         .route("/api/llm/check", post(check_handler))
         .route("/api/learn", post(learn_handler))
+        .route("/api/learn/status", get(learn_status_handler))
+        .route("/api/learn/layout", post(learn_layout_handler))
         .layer(middleware::from_fn(move |req, next| local_only(allowed.clone(), req, next)))
         .with_state(state);
     let url = format!("http://{}", listener.local_addr().map(|a| a.to_string()).unwrap_or_default());
@@ -302,6 +305,12 @@ struct LearnRequest {
 /// Marks a Learn job as running until it's dropped.
 struct LearnJob<'a>(&'a AppState, String);
 
+impl LearnJob<'_> {
+    fn set(&self, phase: &'static str) {
+        self.0.learn_busy.lock().unwrap_or_else(|e| e.into_inner()).insert(self.1.clone(), phase);
+    }
+}
+
 impl Drop for LearnJob<'_> {
     fn drop(&mut self) {
         self.0.learn_busy.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.1);
@@ -312,6 +321,124 @@ async fn learn_handler(State(state): State<Arc<AppState>>, Json(req): Json<Learn
     learn_run(state, req).await
 }
 
+#[derive(Deserialize)]
+struct LayoutRequest {
+    concept: String,
+    /// What the viewer's layout check found when it drew the figure.
+    #[serde(default)]
+    problems: Vec<String>,
+    /// The figure to fix, when it's a fix of a fix. Otherwise the saved one.
+    #[serde(default)]
+    html: Option<String>,
+    /// Save `html` as the lesson's figure instead of fixing anything. The viewer saves a fix only after its
+    /// own check shows it helped. `saved_at` names the lesson it was made for.
+    #[serde(default)]
+    save: bool,
+    #[serde(default)]
+    saved_at: u64,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+/// Fixes what the viewer's layout check found in a lesson's figure, with small edits to its HTML, or saves a fix
+/// the viewer has checked. The checking pass reads the figure as text, so it can't see these.
+async fn learn_layout_handler(State(state): State<Arc<AppState>>, Json(req): Json<LayoutRequest>) -> (StatusCode, Json<serde_json::Value>) {
+    let fail = |code: StatusCode, msg: &str| (code, Json(serde_json::json!({ "error": msg })));
+    if req.save {
+        let Some(html) = req.html.filter(|h| !h.trim().is_empty()) else {
+            return fail(StatusCode::BAD_REQUEST, "No figure to save.");
+        };
+        let mut result = state.result.write().await;
+        let Some(learn) = result.learn.as_mut() else {
+            return fail(StatusCode::CONFLICT, "The lesson changed while its figure was fixed.");
+        };
+        // The lesson may have been rewritten meanwhile; then this fix is for an old figure.
+        let Some(lesson) = learn.concepts.iter_mut().find(|c| c.id == req.concept).and_then(|c| c.lesson.as_mut()).filter(|l| l.saved_at == req.saved_at) else {
+            return fail(StatusCode::CONFLICT, "The lesson changed while its figure was fixed.");
+        };
+        let Some(figure) = lesson.interactive.as_mut() else {
+            return fail(StatusCode::NOT_FOUND, "That lesson has no figure.");
+        };
+        figure.html = html;
+        let lesson = lesson.clone();
+        crate::saved::save_learn(&state.key, learn);
+        return (StatusCode::OK, Json(serde_json::json!({ "concept": req.concept, "lesson": lesson })));
+    }
+
+    let problems: Vec<String> = req.problems.iter().take(12).map(|p| p.chars().take(200).collect()).collect();
+    if problems.is_empty() {
+        return fail(StatusCode::BAD_REQUEST, "No layout problems were given.");
+    }
+    let base = state.provider.read().await;
+    let Some(base) = &*base else {
+        return fail(StatusCode::SERVICE_UNAVAILABLE, "No LLM set up yet.");
+    };
+    let job = format!("layout:{}", req.concept);
+    if state.learn_busy.lock().unwrap_or_else(|e| e.into_inner()).insert(job.clone(), "layout").is_some() {
+        return fail(StatusCode::CONFLICT, "That figure is already being fixed.");
+    }
+    let _job = LearnJob(&state, job);
+    let chosen = req.model.as_deref().map(str::trim).filter(|m| !m.is_empty() && *m != base.model()).map(|m| base.with_model(m));
+    let provider: &dyn llm::LlmProvider = chosen.as_deref().unwrap_or(&**base);
+
+    let html = match req.html {
+        Some(h) => h,
+        None => {
+            let result = state.result.read().await;
+            let lesson = result.learn.as_ref().and_then(|l| l.concepts.iter().find(|c| c.id == req.concept)).and_then(|c| c.lesson.as_ref());
+            match lesson.and_then(|l| l.interactive.as_ref()) {
+                Some(i) => i.html.clone(),
+                None => return fail(StatusCode::NOT_FOUND, "That lesson has no figure."),
+            }
+        }
+    };
+    let reply = match provider.complete(&learn::layout_prompt(&html, &problems)).await {
+        Ok(r) => r,
+        Err(e) => return fail(StatusCode::BAD_GATEWAY, &e),
+    };
+    let (fixed, used, skipped) = if reply.trim() == learn::NO_CHANGES { (html, 0, 0) } else { learn::apply_fixes(&html, &reply, |t| !t.trim().is_empty()) };
+    eprintln!("perspica: suggested layout fixes for the figure: {used} applied, {skipped} skipped");
+    (StatusCode::OK, Json(serde_json::json!({ "concept": req.concept, "html": fixed, "fixes": used })))
+}
+
+/// What each running Learn job is doing, so the viewer can say when a lesson is being checked.
+async fn learn_status_handler(State(state): State<Arc<AppState>>) -> Json<HashMap<String, &'static str>> {
+    Json(state.learn_busy.lock().unwrap_or_else(|e| e.into_inner()).clone())
+}
+
+/// A second pass that checks a lesson against the code and fixes what's wrong. The lesson prompt
+/// leaves the detailed checking to this pass. The draft is kept when the check finds nothing,
+/// fails, or returns something that doesn't parse.
+async fn check_lesson(provider: &dyn llm::LlmProvider, prompt: &str, draft_text: &str, draft: learn::Lesson, visual: &str) -> learn::Lesson {
+    match provider.complete(&learn::verify_prompt(prompt, draft_text)).await {
+        Ok(r) if r.trim() == learn::NO_CHANGES => {
+            eprintln!("perspica: checked the lesson, no changes");
+            draft
+        }
+        Ok(r) => {
+            let (patched, used, skipped) = learn::apply_fixes(draft_text, &r, |t| learn::parse_lesson(t, provider.model(), visual).is_ok());
+            if used == 0 {
+                eprintln!("perspica: checked the lesson; kept the draft ({skipped} fixes didn't apply)");
+                return draft;
+            }
+            match learn::parse_lesson(&patched, provider.model(), visual) {
+                Ok(fixed) => {
+                    eprintln!("perspica: checked the lesson: {used} fixes applied, {skipped} skipped");
+                    fixed
+                }
+                Err(e) => {
+                    eprintln!("perspica: kept the draft lesson, the fixed one didn't parse: {e}");
+                    draft
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("perspica: kept the draft lesson, the check failed: {e}");
+            draft
+        }
+    }
+}
+
 async fn learn_run(state: Arc<AppState>, req: LearnRequest) -> (StatusCode, Json<serde_json::Value>) {
     let fail = |code: StatusCode, msg: &str| (code, Json(serde_json::json!({ "error": msg })));
     let base = state.provider.read().await;
@@ -320,8 +447,12 @@ async fn learn_run(state: Arc<AppState>, req: LearnRequest) -> (StatusCode, Json
     };
     let job = req.concept.clone().unwrap_or_else(|| "outline".into());
     // One run per job. Lessons for different concepts can be written side by side.
-    if !state.learn_busy.lock().unwrap_or_else(|e| e.into_inner()).insert(job.clone()) {
-        return fail(StatusCode::CONFLICT, "That's already being written.");
+    {
+        let mut busy = state.learn_busy.lock().unwrap_or_else(|e| e.into_inner());
+        if busy.contains_key(&job) {
+            return fail(StatusCode::CONFLICT, "That's already being written.");
+        }
+        busy.insert(job.clone(), "writing");
     }
     let _job = LearnJob(&state, job);
     let chosen = req.model.as_deref().map(str::trim).filter(|m| !m.is_empty() && *m != base.model()).map(|m| base.with_model(m));
@@ -370,7 +501,9 @@ async fn learn_run(state: Arc<AppState>, req: LearnRequest) -> (StatusCode, Json
     // A lesson's links are checked before the result is locked: the sites can be slow.
     let lesson = match (&req.concept, &response) {
         (Some(_), Some(r)) => match learn::parse_lesson(r, provider.model(), &visual) {
-            Ok(mut l) => {
+            Ok(draft) => {
+                _job.set("checking");
+                let mut l = check_lesson(provider, prompt.as_deref().unwrap_or_default(), r, draft, &visual).await;
                 learn::check_sources(&mut l, repo_url.as_deref()).await;
                 Some(l)
             }
