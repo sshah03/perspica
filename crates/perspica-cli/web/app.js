@@ -143,8 +143,8 @@ async function init() {
     setupSidebarResize();
     restoreFromUrl(hash.get('at'));
     if (hash.get('area') === 'learn') { S.concept = hash.get('concept'); setArea('learn'); }
-    // Highlight.js loads deferred; re-render visible code once it arrives.
-    if (typeof hljs === 'undefined') {
+    // Deferred grammars can arrive after Highlight.js itself; retry any cached plain text.
+    if (document.readyState !== 'complete') {
         window.addEventListener('load', () => { if (typeof hljs !== 'undefined') { hlCache.clear(); renderMain(true); } }, { once: true });
     }
 }
