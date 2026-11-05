@@ -202,6 +202,16 @@ impl MultiFileResult {
     }
 }
 
+/// A page is made to be shared, so it leaves out everything from your own agent sessions: your prompts,
+/// Decisions, and which groups you asked for, in your words.
+fn for_sharing(multi: &mut MultiFileResult) {
+    multi.source.sessions = Default::default();
+    multi.decisions = None;
+    if let Some(groups) = multi.intent_groups.as_mut() {
+        intel::without_session_links(groups);
+    }
+}
+
 fn parse_language(lang_str: &str) -> Language {
     match lang_str.to_lowercase().as_str() {
         "typescript" | "ts" | "javascript" | "js" => Language::TypeScript,
@@ -416,9 +426,7 @@ fn main() {
     match format {
         "json" => render_json::render_multi(&multi),
         "html" => {
-            // A page is made to be shared, so leave out the prompts from your own agent sessions.
-            multi.source.sessions = Default::default();
-            multi.decisions = None;
+            for_sharing(&mut multi);
             if let Err(e) = std::fs::write(&cli.out, web::export_html(&multi)) {
                 fail(format!("could not write {}: {e}", cli.out.display()));
             }
@@ -700,5 +708,48 @@ async fn run_llm(multi: &mut MultiFileResult, provider: &dyn llm::LlmProvider, d
             eprintln!("Showing the results without it.");
             multi.llm_error = Some(e);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_pages_carry_nothing_from_your_sessions() {
+        let prompt = "only have the one that's clicked showing";
+        let mut multi = MultiFileResult {
+            version: "0".into(),
+            source: SourceInfo {
+                label: "x".into(), detail: None, repo: None, repo_url: None, pr_title: None, pr_url: None, author_context: None, window: None,
+                sessions: sessions::SessionContext {
+                    sessions: vec![],
+                    requirements: vec![sessions::Requirement { id: "R1".into(), session: "s".into(), timestamp: "t".into(), text: prompt.into() }],
+                },
+            },
+            files: vec![],
+            results: vec![],
+            cross_file: Default::default(),
+            intent_groups: Some(vec![serde_json::from_value(serde_json::json!({
+                "label": "Decisions tab", "entry_ids": [1], "origin": "requested", "requirement": {"id": "R1", "quote": prompt}})).unwrap()]),
+            summary: None,
+            concerns: vec![],
+            llm_provider: None,
+            llm_model: None,
+            llm_saved_at: None,
+            llm_error: None,
+            learn: None,
+            decisions: Some(Default::default()),
+        };
+        for_sharing(&mut multi);
+        let page = web::export_html(&multi);
+        assert!(!page.contains("clicked showing"), "no prompt text anywhere on the page");
+        let tag = r#"<script id="perspica-data" type="application/json">"#;
+        let start = page.find(tag).unwrap() + tag.len();
+        let data: serde_json::Value = serde_json::from_str(&page[start..start + page[start..].find("</script>").unwrap()]).unwrap();
+        let group = &data["intent_groups"][0];
+        assert_eq!(group["label"], "Decisions tab", "the analysis itself stays");
+        assert!(group.get("origin").is_none() && group.get("requirement").is_none() && data.get("decisions").is_none());
+        assert_eq!(data["source"]["sessions"]["requirements"], serde_json::json!([]));
     }
 }

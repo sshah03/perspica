@@ -145,7 +145,19 @@ pub const REQUIREMENTS_SPEC: &str = r#"REQUIREMENTS RULES (the USER REQUIREMENTS
   default the user never asked for. Reviewers check these first, so be honest: when the user only gave a goal
   ("make it better"), the specific choices are autonomous.
   "mixed": requested work that includes significant unrequested choices; give requirement and quote too.
-- Requirements the diff does not seem to address may be listed in concerns."#;
+- Requirements the diff does not seem to address may be listed in concerns, as what the change is missing
+  ("nothing retries a failed upload"), not as what the user asked for.
+- The user's messages are private. Outside "origin", "requirement" and "quote", never mention the user, their
+  requests or the session: write the summary, review notes and concerns as facts about the change."#;
+
+/// Drops what came from the user's own agent sessions: which groups they asked for, and their words. For
+/// anything shared, like `--format html` pages. The user's prompts are private.
+pub fn without_session_links(groups: &mut [IntentGroup]) {
+    for g in groups {
+        g.origin = None;
+        g.requirement = None;
+    }
+}
 
 /// Run the LLM analysis: one call for intent grouping and a summary.
 pub async fn run_analysis(input: &IntelInput<'_>, provider: &dyn LlmProvider) -> Result<IntelResult, String> {

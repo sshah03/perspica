@@ -527,7 +527,8 @@ fn author_and_requirements(input: &IntelInput<'_>) -> String {
     } else {
         let list: String = input.requirements.iter().map(|r| format!("[{}] {}\n", r.id, r.text)).collect();
         format!("USER REQUIREMENTS (the user's own messages to the coding agent that made this change, oldest first). \
-                 When they explain a choice, use them for why_here and chosen_over:\n{}\n", intel::truncate(&list, 8000))
+                 When they explain a choice, use them for why_here and chosen_over, but state the reason itself. \
+                 These messages are private: never mention the user, their requests or the session.\n{}\n", intel::truncate(&list, 8000))
     };
     author + &reqs
 }
