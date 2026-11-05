@@ -1819,14 +1819,17 @@ function renderLearn() {
     S.concept = c.id;
     panel.innerHTML = conceptPageHtml(c);
     mountFrames(panel);
-    // Lessons are written the first time their concept is opened.
-    if (!c.lesson && !S.learnBusy[c.id] && !S.learnErrors[c.id] && !S.static && S.data.capabilities?.llm) runLearn(c.id);
+    // Lessons are written the first time their concept is opened, through the same provider that found the
+    // concepts. If that changed (an API key set since, say), the page asks first with its "Write the lesson"
+    // button, so a lesson never goes to a paid API on its own.
+    const llm = S.data.capabilities?.llm;
+    if (!c.lesson && !S.learnBusy[c.id] && !S.learnErrors[c.id] && !S.static && llm && llm === learnData()?.provider) runLearn(c.id);
 }
 
 function learnIntroHtml() {
     return `<div class="learn-page learn-empty">
         <h2>Learn the ideas behind this change</h2>
-        <p>perspica finds the technical concepts this change relies on, like an architecture choice, an algorithm, a concurrency pattern or a formula. It explains each one with words and an interactive piece, ties it to this change's code, and quizzes you on it. Use it before you approve a change, or to understand one afterwards. If the change needs no background, it says so.</p>
+        <p>perspica finds the technical concepts this change relies on, like an architecture choice, an algorithm, a concurrency pattern or a formula. It explains each one in words, with a diagram or animation when one helps, ties it to this change's code, and quizzes you on it. Use it before you approve a change, or to understand one afterwards. If the change needs no background, it says so.</p>
         ${S.static ? '<p class="muted">No lessons were written before this page was saved.</p>'
             : '<button class="accent-btn primary" data-action="learn-start">Find concepts…</button>'}
     </div>`;
