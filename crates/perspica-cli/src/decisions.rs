@@ -5,7 +5,7 @@
 //! changes: other people's sessions aren't on this machine.
 
 use crate::intel::{self, IntelInput};
-use crate::sessions::{self, TraceEvent};
+use crate::sessions::{self, clip, TraceEvent};
 use serde::{Deserialize, Serialize};
 
 const MAX_TOPICS: usize = 6;
@@ -205,14 +205,23 @@ pub fn parse(response: &str, trace: &[TraceEvent], sources: &[(String, String, S
             .take(MAX_DECISIONS)
             .map(|d| {
                 let unseen = d.who == "unseen";
-                // The developer's decisions point at the developer's own words. One that points elsewhere
-                // is still shown as theirs: the label is the model's best reading, and dropping it would hide it.
-                let who = match d.who.as_str() { "you" | "approved" => d.who.clone(), _ => "agent".to_string() };
-                if (who == "you" || who == "approved") && event(d.event).is_some_and(|e| e.who != "user") {
-                    eprintln!("perspica: a decision credited to the developer cites event {}, which isn't theirs", d.event);
+                let mut who = match d.who.as_str() { "you" | "approved" => d.who.clone(), _ => "agent".to_string() };
+                let mut at_event = d.event;
+                // A choice credited to the developer has to rest on their own words. The model sometimes cites the
+                // agent's message instead: where it did the work, or its proposal. A request ("you") is theirs if
+                // they spoke before that point, since the ask comes first. Agreeing ("approved") needs a reply after
+                // the proposal. Without either, it was the agent's.
+                if who != "agent" && event(d.event).is_some_and(|e| e.who != "user") {
+                    let before = trace.iter().rfind(|e| e.n < d.event && e.who == "user");
+                    let after = trace.iter().find(|e| e.n > d.event && e.who == "user");
+                    match (who.as_str(), before, after) {
+                        ("you", Some(ask), _) => at_event = ask.n,
+                        (_, _, Some(reply)) => { who = "approved".into(); at_event = reply.n; }
+                        _ => who = "agent".into(),
+                    }
                 }
-                let at = (!unseen).then(|| event(d.event).map(|e| e.ts.clone())).flatten();
-                let moment = (!unseen).then(|| moments.iter().position(|(n, _)| *n == d.event)).flatten();
+                let at = (!unseen).then(|| event(at_event).map(|e| e.ts.clone())).flatten();
+                let moment = (!unseen).then(|| moments.iter().position(|(n, _)| *n == at_event || *n == d.event)).flatten();
                 let code = d.symbols.iter().take(3).filter_map(|s| locate(s, &d.files, sources)).collect();
                 let look = d.look.map(|l| l.trim().to_string()).filter(|l| !l.is_empty());
                 Decision { who, unseen, title: clip(d.title.trim(), 240), look, at, moment, code }
@@ -280,15 +289,6 @@ fn defines(line: &str, name: &str) -> bool {
         || (before.is_empty() && (after.starts_with('=') || after.starts_with(':') || (after.starts_with('(') && t.trim_end().ends_with('{'))))
 }
 
-fn clip(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max).collect();
-    out.push('…');
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,6 +316,20 @@ mod tests {
         assert_eq!((t.decisions[0].code[0].file.as_str(), t.decisions[0].code[0].line), ("src/cache.py", 4));
         assert!(t.decisions[1].unseen && t.decisions[1].who == "agent" && t.decisions[1].at.is_none());
         assert!(t.open.is_empty());
+    }
+
+    #[test]
+    fn credit_needs_the_developers_own_words() {
+        let trace = [ev(1, "user", "Add a cache"), ev(2, "agent", "Added it. I'll use an LRU?"), ev(3, "user", "ok"), ev(4, "agent", "I also capped it at 1,000.")];
+        let reply = r#"{"topics": [{"title": "Caching", "summary": "s", "timeline": [{"event": 2, "quote": "I'll use an LRU?"}],
+            "decisions": [{"who": "you", "title": "Add a cache", "event": 2}, {"who": "approved", "title": "Use an LRU", "event": 2},
+                          {"who": "approved", "title": "Cap at 1,000", "event": 4}, {"who": "you", "title": "Cache it", "event": 1}]}]}"#;
+        let t = &parse(reply, &trace, &[]).unwrap()[0];
+        let whos: Vec<&str> = t.decisions.iter().map(|d| d.who.as_str()).collect();
+        assert_eq!(whos, vec!["you", "approved", "agent", "you"],
+            "a request cited at the work stays theirs; a proposal they answered is agreed; one never answered is the agent's");
+        assert_eq!(t.decisions[0].at.as_deref(), Some("2026-02-01T00:00:01Z"), "points at the ask");
+        assert_eq!(t.decisions[1].at.as_deref(), Some("2026-02-01T00:00:03Z"), "points at the reply");
     }
 
     #[test]

@@ -250,7 +250,7 @@ fn fit(events: &mut Vec<TraceEvent>, budget: usize) {
     }
 }
 
-fn clip(s: &str, max: usize) -> String {
+pub(crate) fn clip(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }
@@ -477,9 +477,14 @@ fn relevant(t: Transcript, m: &PathMatchers, since: i64, until: i64) -> Option<R
 /// Whether a shell command changes files, rather than only reading them. Agents often edit with
 /// scripts, redirects and in-place tools instead of their edit tool.
 fn writes_files(cmd: &str) -> bool {
-    const WRITES: [&str; 17] = ["sed -i", "perl -pi", "tee ", "apply_patch", "git apply", "patch -", "patch <", ".write(", "write_text(",
-        "writeFile", "File.write", "mv ", "cp ", "rm ", "truncate ", "git checkout -- ", "git restore "];
-    WRITES.iter().any(|w| cmd.contains(w)) || redirects_to_file(cmd)
+    // Shell tools, which only count where a command starts: "rm " inside "perform " isn't one.
+    const TOOLS: [&str; 12] = ["sed -i", "perl -pi", "tee ", "git apply", "patch -", "patch <", "mv ", "cp ", "rm ", "truncate ",
+        "git checkout -- ", "git restore "];
+    // Edits from inside scripts and patch tools, wherever they appear.
+    const CALLS: [&str; 5] = ["apply_patch", ".write(", "write_text(", "writeFile", "File.write"];
+    let starts_command = |i: usize| cmd[..i].trim_end_matches(' ').chars().next_back().is_none_or(|c| matches!(c, ';' | '&' | '|' | '(' | '`' | '\n' | '{'))
+        || cmd[..i].ends_with("sudo ") || cmd[..i].ends_with("xargs ");
+    TOOLS.iter().any(|w| cmd.match_indices(w).any(|(i, _)| starts_command(i))) || CALLS.iter().any(|w| cmd.contains(w)) || redirects_to_file(cmd)
 }
 
 /// A `>` or `>>` into a file. Not `2>&1`, `> /dev/null`, or a comparison in an inline script.
@@ -843,7 +848,11 @@ mod tests {
         for w in ["cat > src/a.rs <<'EOF'", "echo x >> notes/todo.md", "sed -i '' 's/a/b/' a.rs", "python3 - <<'EOF'\nopen(p,'w').write(s)\nEOF", "apply_patch <<'EOF'"] {
             assert!(writes_files(w), "{w}");
         }
-        for r in ["cargo test 2>&1 | tail", "grep -n x a.rs > /dev/null", "git diff a.rs", "python3 -c 'print(a > b)'", "node -e 'x => x >= 2'", "cat a.rs | head"] {
+        for w in ["rm a.rs", "cd src && mv a.rs b.rs", "(cp a.rs b.rs)", "git status; rm -f old.rs", "find . -name '*.o' | xargs rm "] {
+            assert!(writes_files(w), "{w}");
+        }
+        for r in ["cargo test 2>&1 | tail", "grep -n x a.rs > /dev/null", "git diff a.rs", "python3 -c 'print(a > b)'", "node -e 'x => x >= 2'", "cat a.rs | head",
+            "grep -rn 'perform ' a.rs", "lsof -i tcp 8080 a.rs", "echo 'confirm the form ' a.rs"] {
             assert!(!writes_files(r), "{r}");
         }
     }
