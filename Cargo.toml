@@ -11,3 +11,8 @@ homepage = "https://github.com/sshah03/perspica"
 authors = ["sshah03"]
 keywords = ["diff", "code-review", "semantic-diff", "tree-sitter", "git"]
 categories = ["development-tools", "command-line-utilities"]
+
+# Full debug info for the tree-sitter grammars made target/debug tens of gigabytes. Line tables
+# keep file and line numbers in panics and backtraces.
+[profile.dev]
+debug = "line-tables-only"

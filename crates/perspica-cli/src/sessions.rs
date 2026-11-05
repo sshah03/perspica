@@ -21,6 +21,8 @@ const MAX_PROMPTS: usize = 20;
 const MAX_PROMPT_CHARS: usize = 1200;
 /// Sessions kept per diff.
 const MAX_SESSIONS: usize = 4;
+/// A pause this long after the last edit means the session has moved on.
+const BREAK_SECS: i64 = 2 * 3600;
 /// Shorter prompts are acknowledgements ("yes", "go ahead"), not requirements.
 const MIN_PROMPT_WORDS: usize = 4;
 
@@ -69,20 +71,35 @@ pub fn find(root: &Path, changed: &[String], since: i64, until: Option<i64>) -> 
 }
 
 fn find_in(claude: Option<&Path>, codex: Option<&Path>, root: &Path, changed: &[String], since: i64, until: Option<i64>) -> SessionContext {
+    let found = relevant_sessions(claude, codex, root, changed, since, until).into_iter()
+        .map(|s| {
+            let prompts = s.events.iter()
+                .filter(|e| e.kind == Kind::User)
+                .filter_map(|e| requirement_text(&e.text).map(|t| (e.ts.clone(), t)))
+                .collect();
+            (s.info, prompts)
+        })
+        .collect();
+    finish(found)
+}
+
+/// Every session in this repository that touched a changed file in the window, cut to the part that can
+/// have produced the change.
+fn relevant_sessions(claude: Option<&Path>, codex: Option<&Path>, root: &Path, changed: &[String], since: i64, until: Option<i64>) -> Vec<Relevant> {
     let matchers = PathMatchers::new(root, changed);
     let until = until.unwrap_or(i64::MAX);
-    let mut found: Vec<(AgentSession, Vec<(String, String)>)> = Vec::new();
+    let mut found = Vec::new();
     if let Some(dir) = claude {
         for f in claude_files(dir, root, since) {
-            found.extend(read_session(&f, &matchers, since, until));
+            found.extend(read_claude(&f, &matchers).and_then(|s| relevant(s, &matchers, since, until)));
         }
     }
     if let Some(dir) = codex {
         for f in jsonl_files_since(dir, since, 4) {
-            found.extend(read_codex_session(&f, root, &matchers, since, until));
+            found.extend(read_codex(&f, root, &matchers).and_then(|s| relevant(s, &matchers, since, until)));
         }
     }
-    finish(found)
+    found
 }
 
 /// Claude Code transcripts for this repository (and its subdirectories / worktrees).
@@ -130,6 +147,115 @@ fn jsonl_files_since(dir: &Path, since: i64, depth: usize) -> Vec<PathBuf> {
             out.push(p);
         }
     }
+    out
+}
+
+/// Where the sessions behind a change can be read again: the repository, the changed files, and the
+/// time window (unix seconds).
+#[derive(Debug, Clone)]
+pub struct Window {
+    pub root: PathBuf,
+    pub changed: Vec<String>,
+    pub since: i64,
+    pub until: Option<i64>,
+}
+
+/// One moment of the sessions behind a change, for the Decisions tab.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceEvent {
+    /// 1, 2, … in time order across sessions.
+    pub n: usize,
+    pub ts: String,
+    pub session: String,
+    /// "user", "agent", "notes" (the agent's thinking), "edit", "command", "result" or "compaction".
+    pub who: String,
+    pub text: String,
+}
+
+/// Characters kept per event, by kind.
+const TRACE_CLIP: [(&str, usize); 7] = [("user", 4000), ("agent", 3000), ("notes", 2000), ("edit", 300), ("command", 400), ("result", 400), ("compaction", 0)];
+/// Longer tool output is left out, unless it's an error.
+const TRACE_RESULT_MAX: usize = 600;
+
+/// Everything said and done in the sessions behind a change, oldest first, cut to fit `budget` characters.
+pub fn trace(root: &Path, changed: &[String], since: i64, until: Option<i64>, budget: usize) -> Vec<TraceEvent> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let dir = |var: &str, default: &str| std::env::var_os(var).map(PathBuf::from).or_else(|| home.as_ref().map(|h| h.join(default)));
+    let claude = dir("CLAUDE_CONFIG_DIR", ".claude").map(|d| d.join("projects"));
+    let codex = dir("CODEX_HOME", ".codex").map(|d| d.join("sessions"));
+    trace_in(claude.as_deref(), codex.as_deref(), root, changed, since, until, budget)
+}
+
+fn trace_in(claude: Option<&Path>, codex: Option<&Path>, root: &Path, changed: &[String], since: i64, until: Option<i64>, budget: usize) -> Vec<TraceEvent> {
+    let mut found = relevant_sessions(claude, codex, root, changed, since, until);
+    found.sort_by(|a, b| b.info.files_touched.len().cmp(&a.info.files_touched.len()).then(b.info.ended.cmp(&a.info.ended)));
+    found.truncate(MAX_SESSIONS);
+    let mut events: Vec<TraceEvent> = found.iter()
+        .flat_map(|s| s.events.iter().filter_map(|e| {
+            let who = match e.kind {
+                Kind::User => "user",
+                Kind::Agent => "agent",
+                Kind::Notes => "notes",
+                // Only tool calls on the changed files say anything about this change.
+                Kind::Tool if e.touches.is_empty() => return None,
+                Kind::Tool if e.writes => "edit",
+                Kind::Tool => "command",
+                Kind::Result if !e.is_error && e.text.len() > TRACE_RESULT_MAX => return None,
+                Kind::Result => "result",
+                Kind::Compaction => "compaction",
+            };
+            let text = if e.kind == Kind::Compaction { "(the agent's context was summarized here)".to_string() } else { e.text.trim().to_string() };
+            (!text.is_empty()).then(|| TraceEvent { n: 0, ts: e.ts.clone(), session: s.info.id.clone(), who: who.into(), text })
+        }))
+        .collect();
+    events.sort_by(|a, b| a.ts.cmp(&b.ts));
+    for e in &mut events {
+        let max = TRACE_CLIP.iter().find(|(w, _)| *w == e.who).map(|(_, m)| *m).unwrap_or(1000);
+        if max > 0 {
+            e.text = clip(&e.text, max);
+        }
+    }
+    fit(&mut events, budget);
+    for (i, e) in events.iter_mut().enumerate() {
+        e.n = i + 1;
+    }
+    events
+}
+
+/// Cuts the trace to `budget` characters, least telling first: tool output, then commands, then the
+/// length of the agent's messages, then its oldest messages. The person's own words go last.
+fn fit(events: &mut Vec<TraceEvent>, budget: usize) {
+    let size = |es: &[TraceEvent]| es.iter().map(|e| e.text.len() + 24).sum::<usize>();
+    for who in ["result", "command"] {
+        if size(events) <= budget {
+            return;
+        }
+        events.retain(|e| e.who != who);
+    }
+    for max in [1200, 500] {
+        if size(events) <= budget {
+            return;
+        }
+        for e in events.iter_mut().filter(|e| e.who == "agent" || e.who == "notes") {
+            e.text = clip(&e.text, max);
+        }
+    }
+    while size(events) > budget {
+        match events.iter().position(|e| e.who != "user") {
+            Some(i) => { events.remove(i); }
+            None => {
+                events.remove(0);
+            }
+        }
+    }
+}
+
+fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
     out
 }
 
@@ -191,6 +317,43 @@ impl PathMatchers {
         self.changed.iter().position(|c| c == rel)
     }
 
+    /// Changed files a shell command names, and whether it writes them. A command run in another
+    /// directory names other files: there, a bare `README.md` is some other project's.
+    fn command(&self, cmd: &str, cwd: Option<&str>) -> (Vec<usize>, bool) {
+        let elsewhere = cwd.is_some_and(|c| !self.inside(c)) || self.cds_elsewhere(cmd);
+        let touches: Vec<usize> = if elsewhere {
+            self.changed.iter().enumerate().filter(|(_, c)| cmd.contains(&format!("{}/{c}", self.root))).map(|(i, _)| i).collect()
+        } else {
+            self.mentions(cmd)
+        };
+        let writes = !touches.is_empty() && writes_files(cmd);
+        (touches, writes)
+    }
+
+    fn inside(&self, dir: &str) -> bool {
+        let dir = dir.trim_end_matches('/');
+        dir == self.root || dir.starts_with(&format!("{}/", self.root))
+    }
+
+    /// Whether the command `cd`s to a directory outside the repository.
+    fn cds_elsewhere(&self, cmd: &str) -> bool {
+        let home = std::env::var("HOME").unwrap_or_default();
+        cmd.match_indices("cd ").any(|(i, _)| {
+            if cmd[..i].chars().next_back().is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+                return false;
+            }
+            let dir: String = cmd[i + 3..].trim_start().chars().take_while(|c| !c.is_whitespace() && !matches!(c, ';' | '&' | '|' | ')')).collect();
+            let dir = dir.trim_matches(|c| c == '"' || c == '\'');
+            let dir = match dir.strip_prefix('~') { Some(rest) if !home.is_empty() => format!("{home}{rest}"), _ => dir.to_string() };
+            dir.starts_with('/') && !self.inside(&dir)
+        })
+    }
+
+    /// `path` relative to the repository, when it's inside it.
+    fn relative<'p>(&self, path: &'p str) -> &'p str {
+        path.strip_prefix(&self.root).map(|r| r.trim_start_matches('/')).unwrap_or(path)
+    }
+
     /// Changed files mentioned in a shell command.
     fn mentions(&self, text: &str) -> Vec<usize> {
         let mut hits: Vec<usize> = self.changed.iter().enumerate()
@@ -216,73 +379,198 @@ fn contains_path_token(text: &str, needle: &str) -> bool {
     })
 }
 
-/// (session, prompts as (timestamp, text)) if the transcript touched a changed file after `since`.
-fn read_session(path: &Path, m: &PathMatchers, since: i64, until: i64) -> Option<(AgentSession, Vec<(String, String)>)> {
-    let text = std::fs::read_to_string(path).ok()?;
+/// What one transcript line or block was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// Something the person typed.
+    User,
+    /// What the agent said.
+    Agent,
+    /// The agent's thinking, when the transcript keeps its text.
+    Notes,
+    /// A tool call: an edit, or a command.
+    Tool,
+    /// What a tool call returned.
+    Result,
+    /// The agent's context was summarized here, so it forgot the details before.
+    Compaction,
+}
+
+#[derive(Debug, Clone)]
+struct Event {
+    ts: String,
+    kind: Kind,
+    text: String,
+    /// Changed files a tool call edits or names.
+    touches: Vec<usize>,
+    /// Whether the tool call changed those files, as far as the transcript shows.
+    writes: bool,
+    /// Whether it changed some other file: work on something else.
+    writes_other: bool,
+    is_error: bool,
+}
+
+impl Event {
+    fn new(ts: &str, kind: Kind, text: String) -> Self {
+        Event { ts: ts.to_string(), kind, text, touches: vec![], writes: false, writes_other: false, is_error: false }
+    }
+}
+
+/// A whole transcript, before it's cut to the change.
+struct Transcript {
+    agent: &'static str,
+    id: String,
+    events: Vec<Event>,
+}
+
+/// The part of a session that can have produced the change.
+struct Relevant {
+    info: AgentSession,
+    events: Vec<Event>,
+}
+
+/// Cuts a transcript to the window, and then to where it moves on to other work after its last edit of
+/// a changed file: the prompt before it starts writing other files, or one after a long break. The talk
+/// right after the last edit stays, since a choice like "only dotfiles for now" often needs no new edit.
+/// `None` if it never touched a changed file in the window.
+fn relevant(t: Transcript, m: &PathMatchers, since: i64, until: i64) -> Option<Relevant> {
+    let mut events: Vec<Event> = t.events.into_iter()
+        .filter(|e| parse_iso(&e.ts).is_some_and(|ts| ts >= since && ts <= until))
+        .collect();
+    // Reading a file (cat, grep, git diff) doesn't make a session part of the change. Writing it does.
     let mut touched = vec![false; m.changed.len()];
-    let mut prompts = Vec::new();
-    let (mut first, mut last): (Option<String>, Option<String>) = (None, None);
-    let mut id = path.file_stem()?.to_string_lossy().into_owned();
-    for line in text.lines() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-        let Some(ts) = v["timestamp"].as_str() else { continue };
-        if parse_iso(ts).is_none_or(|t| t < since || t > until) {
-            continue;
-        }
-        if let Some(s) = v["sessionId"].as_str() {
-            id = s.to_string();
-        }
-        match v["type"].as_str() {
-            Some("user") if v["isMeta"].as_bool() != Some(true) && v["isSidechain"].as_bool() != Some(true) => {
-                if let Some(p) = user_prompt(&v["message"]["content"]) {
-                    prompts.push((ts.to_string(), p));
-                }
-            }
-            Some("assistant") => {
-                for block in v["message"]["content"].as_array().into_iter().flatten() {
-                    if block["type"] != "tool_use" {
-                        continue;
-                    }
-                    let input = &block["input"];
-                    match block["name"].as_str().unwrap_or("") {
-                        "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => {
-                            let p = input["file_path"].as_str().or(input["notebook_path"].as_str()).unwrap_or("");
-                            if let Some(i) = m.file(p) {
-                                touched[i] = true;
-                            }
-                        }
-                        "Bash" => {
-                            for i in m.mentions(input["command"].as_str().unwrap_or("")) {
-                                touched[i] = true;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            _ => continue,
-        }
-        if first.is_none() {
-            first = Some(ts.to_string());
-        }
-        last = Some(ts.to_string());
+    for i in events.iter().filter(|e| e.writes).flat_map(|e| &e.touches) {
+        touched[*i] = true;
     }
     let files_touched: Vec<String> = m.changed.iter().zip(&touched).filter(|(_, t)| **t).map(|(c, _)| c.clone()).collect();
     if files_touched.is_empty() {
         return None;
     }
-    let session = AgentSession {
-        agent: "claude-code".into(),
-        id,
-        started: first.unwrap_or_default(),
-        ended: last.unwrap_or_default(),
+    let last = events.iter().rposition(|e| e.writes && !e.touches.is_empty()).unwrap_or(0);
+    let secs = |e: &Event| parse_iso(&e.ts).unwrap_or(0);
+    let mut cut = events.len();
+    let mut prompt = None;
+    for i in last + 1..events.len() {
+        let e = &events[i];
+        if e.kind == Kind::User {
+            if secs(e) - secs(&events[i - 1]) > BREAK_SECS {
+                cut = i;
+                break;
+            }
+            prompt = Some(i);
+        } else if e.writes_other {
+            cut = prompt.unwrap_or(i);
+            break;
+        }
+    }
+    events.truncate(cut);
+    let info = AgentSession {
+        agent: t.agent.into(),
+        id: t.id,
+        started: events.first().map(|e| e.ts.clone()).unwrap_or_default(),
+        ended: events.last().map(|e| e.ts.clone()).unwrap_or_default(),
         files_touched,
     };
-    Some((session, prompts))
+    Some(Relevant { info, events })
 }
 
-/// A Codex rollout, if it ran in this repository and touched a changed file in the window.
-fn read_codex_session(path: &Path, root: &Path, m: &PathMatchers, since: i64, until: i64) -> Option<(AgentSession, Vec<(String, String)>)> {
+/// Whether a shell command changes files, rather than only reading them. Agents often edit with
+/// scripts, redirects and in-place tools instead of their edit tool.
+fn writes_files(cmd: &str) -> bool {
+    const WRITES: [&str; 17] = ["sed -i", "perl -pi", "tee ", "apply_patch", "git apply", "patch -", "patch <", ".write(", "write_text(",
+        "writeFile", "File.write", "mv ", "cp ", "rm ", "truncate ", "git checkout -- ", "git restore "];
+    WRITES.iter().any(|w| cmd.contains(w)) || redirects_to_file(cmd)
+}
+
+/// A `>` or `>>` into a file. Not `2>&1`, `> /dev/null`, or a comparison in an inline script.
+fn redirects_to_file(cmd: &str) -> bool {
+    let b = cmd.as_bytes();
+    (0..b.len()).filter(|&i| b[i] == b'>').any(|i| {
+        let before = i.checked_sub(1).map(|j| b[j]);
+        // `2>`, `&>`, `=>`, `->`, `>>` (handled at its first `>`), and `<>` aren't a plain redirect start.
+        if before.is_some_and(|c| c.is_ascii_digit() || matches!(c, b'&' | b'=' | b'-' | b'>' | b'<')) {
+            return false;
+        }
+        let rest = cmd[i + 1..].trim_start_matches('>').trim_start();
+        let target: String = rest.chars().take_while(|c| !c.is_whitespace() && !matches!(c, ';' | '&' | '|' | ')')).collect();
+        let target = target.trim_matches(|c| c == '"' || c == '\'');
+        !target.is_empty() && !target.starts_with("/dev/") && !target.starts_with('&') && !target.starts_with('=')
+            && !target.starts_with(|c: char| c.is_ascii_digit()) && (target.contains('.') || target.contains('/'))
+    })
+}
+
+/// A Claude Code transcript as events.
+fn read_claude(path: &Path, m: &PathMatchers) -> Option<Transcript> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut id = path.file_stem()?.to_string_lossy().into_owned();
+    let mut events = Vec::new();
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let Some(ts) = v["timestamp"].as_str() else { continue };
+        // Subagents' work and the harness's own messages aren't the conversation.
+        if v["isSidechain"].as_bool() == Some(true) || v["isMeta"].as_bool() == Some(true) {
+            continue;
+        }
+        if let Some(s) = v["sessionId"].as_str() {
+            id = s.to_string();
+        }
+        let content = &v["message"]["content"];
+        match v["type"].as_str() {
+            Some("user") if v["isCompactSummary"].as_bool() == Some(true) => events.push(Event::new(ts, Kind::Compaction, String::new())),
+            Some("user") => {
+                for b in content.as_array().into_iter().flatten().filter(|b| b["type"] == "tool_result") {
+                    let mut e = Event::new(ts, Kind::Result, block_text(&b["content"]));
+                    e.is_error = b["is_error"].as_bool() == Some(true);
+                    events.push(e);
+                }
+                if let Some(t) = user_text(content) {
+                    events.push(Event::new(ts, Kind::User, t));
+                }
+            }
+            Some("assistant") => {
+                for b in content.as_array().into_iter().flatten() {
+                    match b["type"].as_str() {
+                        Some("text") => events.push(Event::new(ts, Kind::Agent, b["text"].as_str().unwrap_or("").to_string())),
+                        Some("thinking") => {
+                            let t = b["thinking"].as_str().unwrap_or("").trim();
+                            if !t.is_empty() {
+                                events.push(Event::new(ts, Kind::Notes, t.to_string()));
+                            }
+                        }
+                        Some("tool_use") => {
+                            let input = &b["input"];
+                            let name = b["name"].as_str().unwrap_or("");
+                            let mut e = Event::new(ts, Kind::Tool, String::new());
+                            match name {
+                                "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => {
+                                    let p = input["file_path"].as_str().or(input["notebook_path"].as_str()).unwrap_or("");
+                                    e.touches.extend(m.file(p));
+                                    e.writes = !e.touches.is_empty();
+                                    e.writes_other = e.touches.is_empty();
+                                    e.text = format!("{name} {}", m.relative(p));
+                                }
+                                "Bash" => {
+                                    let cmd = input["command"].as_str().unwrap_or("");
+                                    (e.touches, e.writes) = m.command(cmd, v["cwd"].as_str());
+                                    e.writes_other = e.touches.is_empty() && writes_files(cmd);
+                                    e.text = cmd.to_string();
+                                }
+                                _ => continue,
+                            }
+                            events.push(e);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(Transcript { agent: "claude-code", id, events })
+}
+
+/// A Codex rollout as events, if it ran in this repository.
+fn read_codex(path: &Path, root: &Path, m: &PathMatchers) -> Option<Transcript> {
     let text = std::fs::read_to_string(path).ok()?;
     let meta = text.lines().take(5)
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
@@ -293,28 +581,30 @@ fn read_codex_session(path: &Path, root: &Path, m: &PathMatchers, since: i64, un
         return None;
     }
     let id = meta["payload"]["id"].as_str().or(meta["payload"]["session_id"].as_str()).unwrap_or("codex").to_string();
-    let mut touched = vec![false; m.changed.len()];
-    let mut prompts = Vec::new();
-    let (mut first, mut last): (Option<String>, Option<String>) = (None, None);
+    let mut events = Vec::new();
     for line in text.lines() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
         if v["type"] != "response_item" {
             continue;
         }
         let Some(ts) = v["timestamp"].as_str() else { continue };
-        if parse_iso(ts).is_none_or(|t| t < since || t > until) {
-            continue;
-        }
         let p = &v["payload"];
+        let texts = |kinds: &[&str]| p["content"].as_array().into_iter().flatten()
+            .filter(|c| c["type"].as_str().is_some_and(|t| kinds.contains(&t)))
+            .filter_map(|c| c["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         match p["type"].as_str().unwrap_or("") {
             "message" if p["role"] == "user" => {
-                let joined: String = p["content"].as_array().into_iter().flatten()
-                    .filter(|c| matches!(c["type"].as_str(), Some("input_text" | "text")))
-                    .filter_map(|c| c["text"].as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if let Some(prompt) = user_prompt(&serde_json::Value::String(joined)) {
-                    prompts.push((ts.to_string(), prompt));
+                if let Some(t) = user_text(&serde_json::Value::String(texts(&["input_text", "text"]))) {
+                    events.push(Event::new(ts, Kind::User, t));
+                }
+            }
+            "message" if p["role"] == "assistant" => events.push(Event::new(ts, Kind::Agent, texts(&["output_text", "text"]))),
+            "reasoning" => {
+                let t = p["summary"].as_array().into_iter().flatten().filter_map(|s| s["text"].as_str()).collect::<Vec<_>>().join("\n");
+                if !t.trim().is_empty() {
+                    events.push(Event::new(ts, Kind::Notes, t));
                 }
             }
             // Shell commands, patches and scripted edits all carry the paths they touch.
@@ -323,26 +613,30 @@ fn read_codex_session(path: &Path, root: &Path, m: &PathMatchers, since: i64, un
                     .map(|x| if x.is_string() { x.as_str().unwrap_or("").to_string() } else if x.is_null() { String::new() } else { x.to_string() })
                     .collect::<Vec<_>>()
                     .join(" ");
-                for i in m.mentions(&input) {
-                    touched[i] = true;
-                }
+                let mut e = Event::new(ts, Kind::Tool, String::new());
+                (e.touches, e.writes) = m.command(&input, None);
+                e.writes_other = e.touches.is_empty() && writes_files(&input);
+                e.text = input;
+                events.push(e);
             }
-            _ => continue,
+            "function_call_output" | "custom_tool_call_output" => events.push(Event::new(ts, Kind::Result, block_text(&p["output"]))),
+            _ => {}
         }
-        if first.is_none() {
-            first = Some(ts.to_string());
-        }
-        last = Some(ts.to_string());
     }
-    let files_touched: Vec<String> = m.changed.iter().zip(&touched).filter(|(_, t)| **t).map(|(c, _)| c.clone()).collect();
-    if files_touched.is_empty() {
-        return None;
+    Some(Transcript { agent: "codex", id, events })
+}
+
+/// Text from a tool result's content: a string, or a list of text blocks.
+fn block_text(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(items) => items.iter().filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("\n"),
+        _ => String::new(),
     }
-    Some((AgentSession { agent: "codex".into(), id, started: first.unwrap_or_default(), ended: last.unwrap_or_default(), files_touched }, prompts))
 }
 
 /// The text a person typed, or `None` for tool results and harness messages.
-fn user_prompt(content: &serde_json::Value) -> Option<String> {
+fn user_text(content: &serde_json::Value) -> Option<String> {
     let raw = match content {
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Array(blocks) => {
@@ -363,6 +657,11 @@ fn user_prompt(content: &serde_json::Value) -> Option<String> {
     {
         return None;
     }
+    Some(t.to_string())
+}
+
+/// A prompt worth checking the change against, shortened to `MAX_PROMPT_CHARS`.
+fn requirement_text(t: &str) -> Option<String> {
     // Replies like "yes", "2" or "sounds good" only make sense next to the
     // agent's proposal; on their own they aren't requirements.
     if t.split_whitespace().count() < MIN_PROMPT_WORDS {
@@ -440,8 +739,9 @@ mod tests {
             r#"{"type":"user","timestamp":"2026-02-01T00:00:01Z","sessionId":"s1","isMeta":true,"message":{"content":"meta"}}"#,
             r#"{"type":"user","timestamp":"2026-02-01T00:00:02Z","sessionId":"s1","message":{"content":"<task-notification>done</task-notification>"}}"#,
             r#"{"type":"user","timestamp":"2026-02-01T00:00:03Z","sessionId":"s1","message":{"content":[{"type":"tool_result","content":"x"}]}}"#,
-            r#"{"type":"assistant","timestamp":"2026-02-01T00:00:04Z","sessionId":"s1","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"cd /work/my.repo/src && python3 - <<'EOF'\np='net/fetch.rs'\nEOF"}}]}}"#,
+            r#"{"type":"assistant","timestamp":"2026-02-01T00:00:04Z","sessionId":"s1","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"cd /work/my.repo/src && python3 - <<'EOF'\np='net/fetch.rs'\nopen(p,'w').write(s)\nEOF"}}]}}"#,
             r#"{"type":"user","timestamp":"2026-02-01T00:01:00Z","sessionId":"s1","message":{"content":"and cap them at 3"}}"#,
+            r#"{"type":"assistant","timestamp":"2026-02-01T00:01:05Z","sessionId":"s1","message":{"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"/work/my.repo/src/net/fetch.rs"}}]}}"#,
         ];
         std::fs::write(proj.join("s1.jsonl"), lines.join("\n")).unwrap();
         // An unrelated session in the same repo.
@@ -483,6 +783,69 @@ mod tests {
         // No agent directories at all: empty, no error.
         let none = find_in(Some(Path::new("/nonexistent/claude")), Some(Path::new("/nonexistent/codex")), Path::new("/work/app"), &["a.rs".into()], 0, None);
         assert!(none.is_empty() && none.sessions.is_empty());
+    }
+
+    #[test]
+    fn only_writes_count_and_the_session_ends_at_its_last_edit() {
+        let dir = std::env::temp_dir().join(format!("perspica-writes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let root = Path::new("/work/app");
+        let proj = dir.join(project_slug(root));
+        std::fs::create_dir_all(&proj).unwrap();
+        let line = |ts: &str, kind: &str, content: serde_json::Value, cwd: &str| serde_json::json!({
+            "type": kind, "timestamp": ts, "sessionId": "s", "cwd": cwd, "message": {"content": content}}).to_string();
+        let bash = |cmd: &str| serde_json::json!([{"type": "tool_use", "name": "Bash", "input": {"command": cmd}}]);
+        let s1 = [
+            line("2026-02-01T00:00:00Z", "user", "Make the cache expire entries after an hour".into(), "/work/app"),
+            line("2026-02-01T00:00:01Z", "assistant", bash("grep -n ttl src/cache.py 2>/dev/null"), "/work/app"),
+            line("2026-02-01T00:00:02Z", "assistant", serde_json::json!([{"type": "tool_use", "name": "Edit", "input": {"file_path": "/work/app/src/cache.py"}}]), "/work/app"),
+            line("2026-02-01T00:00:03Z", "assistant", serde_json::json!([{"type": "text", "text": "Done. Entries now expire after 3600s. Should a read refresh the timer?"}]), "/work/app"),
+            line("2026-02-01T00:00:04Z", "user", "No, keep it fixed from the write".into(), "/work/app"),
+            serde_json::json!({"type": "user", "timestamp": "2026-02-01T00:00:04Z", "sessionId": "s", "isCompactSummary": true,
+                "message": {"content": "This session is being continued from a previous conversation"}}).to_string(),
+            // Later work in another repository, with a README.md of its own.
+            line("2026-02-01T00:05:00Z", "user", "Now update the other project's readme".into(), "/work/app"),
+            line("2026-02-01T00:05:01Z", "assistant", bash("cd /work/other && cat > README.md <<'EOF'\nhi\nEOF"), "/work/app"),
+        ];
+        std::fs::write(proj.join("s1.jsonl"), s1.join("\n")).unwrap();
+        // A session that only read the files isn't part of the change.
+        let s2 = [
+            line("2026-02-01T01:00:00Z", "user", "Explain what this diff does to the cache".into(), "/work/app"),
+            line("2026-02-01T01:00:01Z", "assistant", bash("git diff src/cache.py README.md > /dev/null"), "/work/app"),
+        ];
+        std::fs::write(proj.join("s2.jsonl"), s2.join("\n")).unwrap();
+        let changed = ["src/cache.py".to_string(), "README.md".to_string()];
+        let found = relevant_sessions(Some(&dir), None, root, &changed, 0, None);
+        let ctx = find_in(Some(&dir), None, root, &changed, 0, None);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(found.len(), 1, "the read-only session is left out");
+        assert_eq!(found[0].info.files_touched, vec!["src/cache.py"], "the other project's README.md isn't this one");
+        let kinds: Vec<Kind> = found[0].events.iter().map(|e| e.kind).collect();
+        assert_eq!(kinds, vec![Kind::User, Kind::Tool, Kind::Tool, Kind::Agent, Kind::User, Kind::Compaction], "keeps the choice made after the last edit, ends where other work starts");
+        assert_eq!(ctx.requirements.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(), vec!["Make the cache expire entries after an hour", "No, keep it fixed from the write"]);
+    }
+
+    #[test]
+    fn trace_fits_its_budget_and_keeps_the_persons_words() {
+        let ev = |who: &str, text: &str| TraceEvent { n: 0, ts: String::new(), session: "s".into(), who: who.into(), text: text.into() };
+        let mut es = vec![ev("user", "add a cache"), ev("command", &"x".repeat(300)), ev("agent", &"y".repeat(5000)), ev("result", "ok"), ev("user", "yes, do 2")];
+        fit(&mut es, 1000);
+        let whos: Vec<&str> = es.iter().map(|e| e.who.as_str()).collect();
+        assert_eq!(whos, vec!["user", "agent", "user"]);
+        assert!(es[1].text.chars().count() <= 501);
+        let mut tight = es.clone();
+        fit(&mut tight, 60);
+        assert!(tight.iter().all(|e| e.who == "user"));
+    }
+
+    #[test]
+    fn writes_and_reads() {
+        for w in ["cat > src/a.rs <<'EOF'", "echo x >> notes/todo.md", "sed -i '' 's/a/b/' a.rs", "python3 - <<'EOF'\nopen(p,'w').write(s)\nEOF", "apply_patch <<'EOF'"] {
+            assert!(writes_files(w), "{w}");
+        }
+        for r in ["cargo test 2>&1 | tail", "grep -n x a.rs > /dev/null", "git diff a.rs", "python3 -c 'print(a > b)'", "node -e 'x => x >= 2'", "cat a.rs | head"] {
+            assert!(!writes_files(r), "{r}");
+        }
     }
 
     #[test]

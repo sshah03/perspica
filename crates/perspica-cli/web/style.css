@@ -596,6 +596,50 @@ body.area-learn #sidebar-tabs, body.area-learn #toc-filter-wrap { display: none 
 .concept-kind { color: var(--text-3); font-size: var(--font-size-xs); }
 .concept-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 8px 12px; font-size: var(--font-size-sm); }
 
+/* Decisions: the same page layout as Learn. Who decided is the one color code: blue is you, purple the agent. */
+.topic-dot { border: 0; }
+.topic-dot::before { content: ''; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); }
+.topic-dot.own::before { background: var(--extract-fg); }
+.concept-kind.own { color: var(--extract-fg); }
+.dec-chip { cursor: pointer; color: var(--extract-fg); background: none; font: inherit; font-size: var(--font-size-xs); }
+.dec-pointer { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; font-size: 13px; color: var(--text-2); padding: 8px 12px; border: 1px dashed var(--border); border-radius: var(--radius); }
+.dec-split { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; align-items: start; }
+.dec-split .learn-card { align-content: start; }
+.dec-split ul, .dec-open ul { margin: 0; padding-left: 18px; display: grid; gap: 8px; }
+.dec-split .muted { margin: 2px 0 0; font-size: 12.5px; }
+.dec-mine { border-left: 3px solid var(--accent); }
+.dec-own { border-left: 3px solid var(--extract-fg); }
+.dec-open { border-left: 3px solid var(--risk-med); }
+.dec-look { margin-top: 4px; font-size: 12.5px; line-height: 1.5; color: var(--risk-med); }
+.code-link { font: inherit; background: none; border: 0; padding: 0; cursor: pointer; }
+.code-link code { font-size: 12px; color: var(--accent); }
+.moment-link { font: inherit; font-size: var(--font-size-xs); color: var(--text-2); background: none; border: 0; padding: 0; text-decoration: underline dotted; text-underline-offset: 3px; cursor: pointer; font-variant-numeric: tabular-nums; }
+.moment-link:hover { color: var(--accent); }
+.ev-tag { font-size: var(--font-size-xs); border-radius: 10px; padding: 0 7px; border: 1px solid currentColor; white-space: nowrap; }
+.ev-tag.agreed { color: var(--accent); }
+.ev-tag.unseen { color: var(--risk-med); }
+.dec-lede { margin: 0; font-size: 13px; }
+.dec-line { list-style: none; margin: 4px 0 0 6px; padding: 0 0 0 18px; display: grid; gap: 12px; border-left: 2px solid var(--border-subtle); }
+.ev-day { font-size: var(--font-size-xs); font-weight: 600; color: var(--text-3); padding-top: 4px; }
+.ev { position: relative; display: grid; gap: 5px; padding: 8px 12px; border-radius: var(--radius); transition: background .6s; }
+.ev::before { content: ''; position: absolute; left: -26px; top: 13px; width: 10px; height: 10px; border-radius: 50%; background: var(--bg-0); border: 2px solid var(--dot, var(--text-3)); }
+.ev.who-you { --dot: var(--accent); }
+.ev.who-agent { --dot: var(--extract-fg); }
+.ev.who-run { --dot: var(--risk-low); }
+.ev.turn { background: var(--bg-1); border: 1px solid var(--border-subtle); }
+.ev.flash { background: var(--accent-muted); }
+.ev-meta { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; font-size: 12.5px; }
+.ev-who { font-weight: 600; color: var(--text-0); }
+.ev.who-you .ev-who { color: var(--accent); }
+.ev.who-agent .ev-who { color: var(--extract-fg); }
+.ev-meta time { color: var(--text-3); font-variant-numeric: tabular-nums; }
+.ev-label { color: var(--text-2); }
+.ev-label.turn { color: var(--risk-med); font-weight: 600; }
+.ev blockquote { margin: 0; font-size: 14px; line-height: 1.6; color: var(--text-1); max-width: 72ch; overflow-wrap: anywhere; }
+.ev.who-notes blockquote { color: var(--text-2); font-style: italic; }
+.ev blockquote.mono { font-family: var(--font-mono); font-size: 12.5px; background: var(--bg-1); border: 1px solid var(--border-subtle); border-radius: 4px; padding: 4px 8px; width: fit-content; max-width: 100%; overflow-x: auto; }
+@media (prefers-reduced-motion: reduce) { .ev { transition: none; } }
+
 .learn-page { max-width: 820px; margin: 0 auto; display: grid; gap: 18px; }
 .learn-empty { padding-top: 6vh; }
 .learn-empty h2, .learn-head h2 { font-size: 20px; font-weight: 600; color: var(--text-0); line-height: 1.3; }

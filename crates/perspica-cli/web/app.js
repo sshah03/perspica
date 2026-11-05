@@ -29,7 +29,7 @@ const S = {
     changedSinceViewed: {}, // path → true: marked viewed earlier, changed since (persisted per source)           // "check before merging" items marked done (persisted per source)
     checkOpen: false,
     askedOpen: false,
-    area: 'review',        // 'review' (the diff) | 'learn' (concepts behind it)
+    area: 'review',        // 'review' (the diff) | 'learn' (concepts behind it) | 'decisions' (how it was decided)
     concept: null,         // Learn: the concept shown
     learnTab: 'explain',   // Learn: 'explain' | 'quiz'
     learnBusy: {},         // Learn jobs running: 'outline' or a concept id → {started, model}
@@ -37,6 +37,8 @@ const S = {
     quiz: {},              // concept key → {answers: {question index: choice}} (persisted per source)
     frameFailed: {},       // concept id → why its interactive piece was hidden
     reviewScroll: 0,       // where the diff was when Learn opened
+    topic: null,           // Decisions: the topic shown
+    decisionsBusy: null,   // Decisions: {started, model} while the session is read
 };
 
 // Derived indexes (rebuilt by derive()).
@@ -143,6 +145,7 @@ async function init() {
     setupSidebarResize();
     restoreFromUrl(hash.get('at'));
     if (hash.get('area') === 'learn') { S.concept = hash.get('concept'); setArea('learn'); }
+    if (hash.get('area') === 'decisions') { S.topic = hash.get('topic'); setArea('decisions'); }
     // Highlight.js loads deferred; re-render visible code once it arrives.
     if (typeof hljs === 'undefined') {
         window.addEventListener('load', () => { if (typeof hljs !== 'undefined') { hlCache.clear(); renderMain(true); } }, { once: true });
@@ -171,8 +174,9 @@ function syncUrl() {
     urlTimer = setTimeout(() => {
         const k = order[S.currentHunk];
         let hash = `view=${S.mode}`;
-        if (S.area === 'learn') {
-            hash = 'area=learn' + (currentConcept() ? `&concept=${currentConcept().id}` : '');
+        if (S.area !== 'review') {
+            hash = S.area === 'learn' ? 'area=learn' + (currentConcept() ? `&concept=${currentConcept().id}` : '')
+                : 'area=decisions' + (currentTopic() ? `&topic=${currentTopic().id}` : '');
             if (location.hash.slice(1) !== hash) history.replaceState(null, '', '#' + hash);
             return;
         }
@@ -426,6 +430,12 @@ function renderHeader() {
     badge.classList.toggle('busy', writing);
     badge.textContent = lp.total ? `${lp.passed}/${lp.total}` : '';
     badge.title = [lp.total ? `${lp.passed} of ${lp.total} concept quizzes passed` : '', writing ? (S.learnBusy.outline ? 'Looking for concepts…' : 'Writing a lesson…') : ''].filter(Boolean).join('. ');
+    const db = document.getElementById('decisions-badge');
+    const own = decisionsData()?.topics.reduce((n, t) => n + t.decisions.filter(x => x.who === 'agent').length, 0) || 0;
+    db.classList.toggle('hidden', !own && !S.decisionsBusy);
+    db.classList.toggle('busy', !!S.decisionsBusy);
+    db.textContent = own || '';
+    db.title = S.decisionsBusy ? 'Reading your session…' : `${own} decision${pl(own)} the agent made on its own`;
     document.querySelectorAll('#view-toggle .pill-btn').forEach(b => b.classList.toggle('active', b.dataset.view === S.view));
     document.getElementById('noise-toggle').checked = S.hideNoise;
     document.getElementById('wrap-toggle').checked = S.wrap;
@@ -635,6 +645,7 @@ function locLink(path, line) {
 function renderSidebar() {
     const el = document.getElementById('toc-content');
     if (S.area === 'learn') { el.innerHTML = renderConceptList(); return; }
+    if (S.area === 'decisions') { el.innerHTML = renderTopicList(); return; }
     document.querySelectorAll('.sidebar-tab').forEach(b => {
         b.classList.toggle('active', b.dataset.tab === S.tab);
         if (b.dataset.tab === 'changes') b.innerHTML = `Changes<span class="count">${changeListCount()}</span>`;
@@ -959,7 +970,7 @@ function groupHeadHtml(g, gi) {
     return `<div class="section-head group-head" data-section-toggle>
         <span class="chev">▼</span><span class="num">${gi + 1}.</span>${depth}<span class="title">${richText(g.label, false)}</span>
         ${f ? `<span class="flow-file">${esc(shortPath(f.file))}</span>` : ''}${reach}
-        ${riskHtml(g.risk)}${originChip(g)}
+        ${riskHtml(g.risk)}${originChip(g)}${topicChip(g)}
         <span class="spacer"></span>${statsHtml(st)}
         <label class="viewed-toggle" title="Mark as viewed (v)"><input type="checkbox" data-group-reviewed="${gi}"${reviewed ? ' checked' : ''}><span>Viewed</span></label>
     </div>`;
@@ -1725,11 +1736,13 @@ function learnProgress() {
 
 function setArea(area) {
     if (area === S.area) return;
-    if (area === 'learn') S.reviewScroll = window.scrollY;
+    if (S.area === 'review') S.reviewScroll = window.scrollY;
     S.area = area;
-    document.body.classList.toggle('area-learn', area === 'learn');
+    // Decisions uses Learn's layout: a list in the sidebar, one page beside it.
+    document.body.classList.toggle('area-learn', area !== 'review');
     renderHeader(); renderSidebar();
     if (area === 'learn') { renderLearn(); window.scrollTo({ top: 0 }); }
+    else if (area === 'decisions') { renderDecisions(); window.scrollTo({ top: 0 }); }
     else { renderOverview(); window.scrollTo({ top: S.reviewScroll }); }
     syncUrl();
 }
@@ -1878,7 +1891,7 @@ function explainHtml(c) {
         ${L.intuition ? `<div class="learn-text learn-intuition">${mdBlocks(L.intuition)}</div>` : ''}
         ${fig}
         ${section(L.intuition ? 'How it works' : '', `<div class="learn-text">${mdBlocks(L.explanation)}</div>`)}
-        ${here}${section('Key points', points)}
+        ${here}${conceptTopicsHtml(c)}${section('Key points', points)}
         ${L.sources?.length ? section('Read more', `<ul class="learn-sources">${L.sources.map(x => `<li><a href="${esc(x.url)}" target="_blank" rel="noopener noreferrer">${esc(x.title)}</a> <span class="muted">${esc(new URL(x.url).host)}</span></li>`).join('')}</ul>`) : ''}
         <div class="learn-foot">${next}<span class="muted">Written by ${esc(modelLabel(L.model))} ${ago(L.saved_at)}. Model-written, so check it against the code.</span>
             ${S.static ? '' : `<button class="link-btn" data-action="learn-rewrite" data-concept="${esc(c.id)}">Rewrite…</button>`}</div>`;
@@ -2132,6 +2145,221 @@ function startLearn() {
             } },
         ],
     });
+}
+
+// ── Decisions ──────────────────────────────────────────────────────────
+
+function decisionsData() { return S.data.decisions || null; }
+function currentTopic() {
+    const ts = decisionsData()?.topics || [];
+    return ts.find(t => t.id === S.topic) || ts[0] || null;
+}
+const ownDecisions = t => t.decisions.filter(d => d.who === 'agent').length;
+
+/** "Claude Code", "Codex", or "the agent" when the sessions are from both. */
+function agentName() {
+    const kinds = new Set((S.data.source?.sessions?.sessions || []).map(s => s.agent));
+    return kinds.size === 1 && kinds.has('codex') ? 'Codex' : kinds.size === 1 ? 'Claude Code' : 'the agent';
+}
+const capitalized = s => s.charAt(0).toUpperCase() + s.slice(1);
+
+function showTopic(id) {
+    S.topic = id;
+    if (S.area !== 'decisions') { setArea('decisions'); return; }
+    renderSidebar(); renderDecisions();
+    window.scrollTo({ top: 0 });
+    syncUrl();
+}
+
+function stepTopic(dir) {
+    const ts = decisionsData()?.topics || [];
+    if (!ts.length) return;
+    const i = ts.indexOf(currentTopic());
+    showTopic(ts[(i + dir + ts.length) % ts.length].id);
+}
+
+function renderTopicList() {
+    const d = decisionsData();
+    const ts = d?.topics || [];
+    const hint = !d ? 'How this change was decided, from your coding-agent sessions.'
+        : !ts.length ? 'Nothing here needed a decision worth reviewing.'
+        : `How this change was decided, from your ${esc(agentName())} session.`;
+    const cur = currentTopic();
+    const rows = ts.map(t => {
+        const own = ownDecisions(t), look = t.decisions.some(x => x.look);
+        const sub = (own ? `${own} of ${agentName()}'s own` : 'Decided with you') + (look ? ' · worth a look' : '');
+        return `<button class="concept-row${t === cur ? ' current' : ''}" data-topic="${esc(t.id)}">
+            <span class="concept-status topic-dot${own ? ' own' : ''}" aria-hidden="true"></span>
+            <span class="concept-main"><span class="concept-title">${esc(t.title)}</span><span class="concept-kind${own ? ' own' : ''}">${esc(sub)}</span></span>
+        </button>`;
+    }).join('');
+    const again = S.static || !d ? '' : '<div class="concept-actions"><button class="link-btn" data-action="decisions-start">Look again…</button></div>';
+    return `<div class="toc-caption"><div><b>Decisions</b>${ts.length ? ` · ${ts.length} topic${pl(ts.length)}` : ''}</div><div class="hint">${hint}</div></div>
+        <div class="concept-list">${rows}</div>${again}`;
+}
+
+function renderDecisions() {
+    const panel = document.getElementById('learn-panel');
+    const d = decisionsData();
+    if (S.decisionsBusy) {
+        panel.innerHTML = `<div class="learn-page">${busyHtml('Reading your session', S.decisionsBusy, null, 'Usually 1 to 2 minutes. You can keep reviewing meanwhile.')}</div>`;
+        return;
+    }
+    if (!d) { panel.innerHTML = decisionsIntroHtml(); return; }
+    if (!d.topics.length) {
+        panel.innerHTML = `<div class="learn-page learn-empty">
+            <h2>Nothing to review here</h2>
+            <p>The session didn't settle anything a reviewer needs to weigh in on: no design choices, trade-offs or changes of course.</p>
+            <p class="muted">Checked by ${esc(modelLabel(d.model))} ${ago(d.saved_at)}.</p>
+        </div>`;
+        return;
+    }
+    panel.innerHTML = topicPageHtml(currentTopic(), d);
+}
+
+function decisionsIntroHtml() {
+    const found = S.data.source?.sessions?.sessions?.length > 0;
+    const body = `<p>perspica reads the Claude Code or Codex session that made this change and shows how it was decided. Related choices are grouped into topics. Each topic separates what you decided from what the agent decided on its own, and shows the moments that settled it, quoted word for word from the session.</p>`;
+    if (S.static) return `<div class="learn-page learn-empty"><h2>How this change was decided</h2>${body}<p class="muted">Saved pages leave this out, since it quotes your own sessions.</p></div>`;
+    if (!found) return `<div class="learn-page learn-empty"><h2>How this change was decided</h2>${body}
+        <p class="muted">No Claude Code or Codex session on this machine edited these files. Decisions works for your own changes, made with an agent on this computer. Other people's pull requests don't have their sessions here.</p></div>`;
+    return `<div class="learn-page learn-empty"><h2>How this change was decided</h2>${body}
+        <button class="accent-btn primary" data-action="decisions-start">Find decisions…</button></div>`;
+}
+
+function topicPageHtml(t, d) {
+    const agent = agentName();
+    const mine = t.decisions.filter(x => x.who !== 'agent');
+    const own = t.decisions.filter(x => x.who === 'agent');
+    const day = ts => new Date(ts).toLocaleString(undefined, { month: 'short', day: 'numeric' });
+    const clock = ts => new Date(ts).toLocaleString(undefined, { hour: 'numeric', minute: '2-digit' });
+    // A topic settled over several days needs the day next to each decision's time.
+    const days = new Set([...t.timeline.map(m => m.ts), ...t.decisions.map(x => x.at).filter(Boolean)].map(day)).size;
+    const time = ts => days > 1 ? `${day(ts)}, ${clock(ts)}` : clock(ts);
+    const item = x => {
+        const code = x.code.slice(0, 2).map(c => `<button class="code-link" data-goto="${esc(c.file)}:${c.line}" title="${esc(c.file)}:${c.line}, in Review"><code>${esc(c.name)}</code></button>`).join(' ');
+        const when = x.unseen ? '<span class="ev-tag unseen" title="It\'s in the change, but the session never discusses it">not discussed</span>'
+            : x.moment != null ? `<button class="moment-link" data-moment="${x.moment}">${esc(time(t.timeline[x.moment].ts))}</button>`
+            : x.at ? `<span class="muted">${esc(time(x.at))}</span>` : '';
+        const tag = x.who === 'approved' ? '<span class="ev-tag agreed" title="Proposed by the agent, agreed by you">you agreed</span>' : '';
+        return `<li><span>${mdInline(x.title)}</span> ${tag} ${code} ${when}${x.look ? `<div class="dec-look">${mdInline(x.look)}</div>` : ''}</li>`;
+    };
+    const WHO = { you: 'You', agent: capitalized(agent), notes: `${capitalized(agent)}'s notes`, run: 'Command output' };
+    const moments = t.timeline.map((m, i) => {
+        const newDay = i === 0 || day(t.timeline[i - 1].ts) !== day(m.ts);
+        const turn = /changed course|turning point/i.test(m.label || '');
+        const quote = m.who === 'run' ? esc(m.quote) : (/^[a-z]/.test(m.quote) ? '…' : '') + mdInline(m.quote);
+        return `${newDay ? `<li class="ev-day">${esc(day(m.ts))}</li>` : ''}<li class="ev who-${esc(m.who)}${turn ? ' turn' : ''}" id="moment-${i}">
+            <div class="ev-meta"><span class="ev-who">${esc(WHO[m.who] || m.who)}</span><time datetime="${esc(m.ts)}">${esc(clock(m.ts))}</time>${m.label ? `<span class="ev-label${turn ? ' turn' : ''}">${esc(m.label)}</span>` : ''}</div>
+            <blockquote class="${m.who === 'run' ? 'mono' : ''}">${quote}</blockquote>
+        </li>`;
+    }).join('');
+    const concepts = (learnData()?.concepts || []).filter(c => topicConcept(t, c));
+    const open = t.open.length ? `<div class="learn-card dec-open"><div class="ov-label">Left open</div><ul>${t.open.map(o => `<li>${mdInline(o)}</li>`).join('')}</ul></div>` : '';
+    const next = d.topics.length > 1 ? '<button class="plain-btn" data-action="topic-next">Next topic</button>' : '';
+    return `<article class="learn-page">
+        <header class="learn-head">
+            <span class="chip">${t.decisions.length} decision${pl(t.decisions.length)}</span>
+            <h2>${esc(t.title)}</h2>
+            <p class="learn-why">${mdInline(t.summary)}</p>
+            ${concepts.map(c => `<button class="link-btn" data-concept="${esc(c.id)}">Learn: ${richText(c.title, false)}</button>`).join('')}
+        </header>
+        <div class="dec-split">
+            <div class="learn-card dec-mine"><div class="ov-label">What you decided</div>${mine.length ? `<ul>${mine.map(item).join('')}</ul>` : `<p class="muted">Nothing. ${esc(capitalized(agent))} settled this topic on its own.</p>`}</div>
+            <div class="learn-card dec-own"><div class="ov-label">What ${esc(agent)} decided on its own</div>${own.length ? `<ul>${own.map(item).join('')}</ul><p class="muted">You weren't asked about these, so they're worth checking in the diff.</p>` : '<p class="muted">Nothing. Every choice here was yours or agreed with you.</p>'}</div>
+        </div>
+        ${t.timeline.length ? `<section class="learn-section"><div class="ov-label">How it was decided</div>
+            <p class="muted dec-lede">${t.timeline.length} moment${pl(t.timeline.length)} from the session. Every quote is checked word for word against the transcript.</p>
+            <ol class="dec-line">${moments}</ol></section>` : ''}
+        ${open}
+        <div class="learn-foot">${next}<span class="muted">Found by ${esc(modelLabel(d.model))} ${ago(d.saved_at)}, from ${d.events} session events. The topics and who decided what are model-written, so check them against the code.</span></div>
+    </article>`;
+}
+
+function flashMoment(i) {
+    const el = document.getElementById('moment-' + i);
+    if (!el) return;
+    el.scrollIntoView({ behavior: scrollBehavior(), block: 'center' });
+    el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash');
+}
+
+/** Whether a topic and a Learn concept are about the same code: the concept names a symbol the topic's decisions point at. */
+function topicConcept(t, c) {
+    const text = `${c.title} ${c.why_here}`;
+    return t.decisions.some(x => x.code.some(r => {
+        const name = r.name.split(/[.:#/]/).pop();
+        return name.length > 2 && new RegExp(`(^|[^\\w$])${name.replace(/[$]/g, '\\$')}([^\\w$]|$)`).test(text);
+    }));
+}
+
+function conceptTopicsHtml(c) {
+    const ts = (decisionsData()?.topics || []).filter(t => topicConcept(t, c));
+    if (!ts.length) return '';
+    return `<div class="dec-pointer"><span>How this was decided:</span>${ts.map(t => `<button class="link-btn" data-topic="${esc(t.id)}">${esc(t.title)}</button>${ownDecisions(t) ? `<span class="muted">${ownDecisions(t)} of ${esc(agentName())}'s own</span>` : ''}`).join('')}</div>`;
+}
+
+/** A Review step in reading order, when a topic's decisions point at its function. */
+function topicChip(g) {
+    if (!g.flow) return '';
+    const t = (decisionsData()?.topics || []).find(t => t.decisions.some(x => x.code.some(r => r.file === g.flow.file && r.name.split(/[.:#/]/).pop() === g.label)));
+    return t ? `<button class="tag dec-chip" data-topic="${esc(t.id)}" title="How this was decided: ${esc(t.title)}">decisions</button>` : '';
+}
+
+function startDecisions() {
+    if (S.static || S.decisionsBusy) return;
+    const cap = S.data.capabilities || {};
+    if (!cap.llm) { showSetup('', true); return; }
+    const d = decisionsData();
+    const saved = store.get('decisions', {});
+    const models = cap.models || [];
+    const model = saved.model && (models.some(m => m.id === saved.model) || !models.length) ? saved.model : cap.model;
+    const n = S.data.source?.sessions?.sessions?.length || 0;
+    showDialog({
+        title: d ? 'Look for decisions again' : 'Find how this change was decided',
+        body: `<p class="muted">Reads the ${n === 1 ? 'session' : `${n} sessions`} that made this change and groups what was decided into topics, with quotes from the session. One request.</p>
+            ${d ? '<p class="setup-note">This replaces the current topics.</p>' : ''}
+            <label class="field-label">Model <span class="muted">via ${esc(cap.llm)}</span></label>${modelFieldHtml('dc-model', model, false)}
+            <details class="sent" open><summary>What gets sent to ${esc(cap.llm)}</summary><ul>
+                <li>your messages to ${esc(agentName())} in ${n === 1 ? 'that session' : 'those sessions'}, its replies and notes, and its commands on the changed files, up to their last edit</li>
+                <li>the classified changes and the changed code, never whole files</li>
+                ${S.data.source?.label?.includes('..') ? '<li>the commit messages</li>' : ''}
+            </ul><p class="muted">Turn off reading sessions with <code>--no-sessions</code>.</p></details>`,
+        actions: [
+            { label: 'Cancel' },
+            { label: d ? 'Look again' : 'Find decisions', primary: true, onClick: () => {
+                const m = document.getElementById('dc-model')?.value.trim() || cap.model;
+                store.set('decisions', { model: m });
+                runDecisions(m);
+            } },
+        ],
+    });
+}
+
+async function runDecisions(model) {
+    if (S.decisionsBusy) return;
+    S.decisionsBusy = { started: Date.now(), model };
+    setFaviconBusy(true);
+    const ticker = setInterval(() => document.querySelectorAll('[data-since]').forEach(el => { el.textContent = Math.round((Date.now() - +el.dataset.since) / 1000) + 's'; }), 1000);
+    renderHeader();
+    if (S.area === 'decisions') { renderSidebar(); renderDecisions(); }
+    try {
+        const resp = await fetch('/api/decisions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model }) });
+        const r = await resp.json().catch(() => ({ error: `HTTP ${resp.status}` }));
+        if (!resp.ok || r.error) throw new Error(r.error || `HTTP ${resp.status}`);
+        S.data.decisions = r.decisions;
+        S.topic = r.decisions.topics[0]?.id || null;
+        const n = r.decisions.topics.length;
+        toast(n ? `Found ${n} topic${pl(n)} in ${r.decisions.seconds}s.` : 'Nothing in the session needs reviewing.', 'ok');
+    } catch (e) {
+        toast('Couldn\'t find the decisions: ' + truncate(e.message, 300), 'error', 9000);
+    } finally {
+        clearInterval(ticker);
+        S.decisionsBusy = null;
+        if (!S.running && !Object.keys(S.learnBusy).length) setFaviconBusy(false);
+        renderHeader();
+        if (S.area === 'decisions') { renderSidebar(); renderDecisions(); syncUrl(); }
+        else if (S.area === 'review') renderMain(true);
+    }
 }
 
 /** How capable a Claude model is, for suggesting a step up. Other providers' models aren't ranked. */
@@ -2418,8 +2646,16 @@ function setupListeners() {
             else if (act === 'learn-rewrite') rewriteLesson(a.dataset.concept);
             else if (act === 'learn-all') writeAllLessons();
             else if (act === 'learn-next') stepConcept(1);
+            else if (act === 'decisions-start') startDecisions();
+            else if (act === 'topic-next') stepTopic(1);
             return;
         }
+        const tp = t.closest('[data-topic]');
+        if (tp) { showTopic(tp.dataset.topic); closeMobileSidebar(); return; }
+        const mo = t.closest('[data-moment]');
+        if (mo) { flashMoment(+mo.dataset.moment); return; }
+        const at = t.closest('[data-goto]');
+        if (at) { setArea('review'); setTimeout(() => restoreFromUrl(at.dataset.goto), 0); return; }
         const lc = t.closest('[data-concept]');
         if (lc) { showConcept(lc.dataset.concept); closeMobileSidebar(); return; }
         const lt = t.closest('[data-learn-tab]');
@@ -2511,9 +2747,19 @@ function setupListeners() {
         }
         if (modalOpen || e.metaKey || e.ctrlKey || e.altKey) return;
         if (['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) return;
+        if (S.area === 'decisions') {
+            const decisionKeys = {
+                d: () => setArea('review'), l: () => setArea('learn'), j: () => stepTopic(1), k: () => stepTopic(-1),
+                b: toggleSidebar, t: toggleTheme,
+                '?': () => document.getElementById('shortcut-modal').classList.toggle('hidden'),
+            };
+            const fn = decisionKeys[e.key];
+            if (fn) { fn(); e.preventDefault(); }
+            return;
+        }
         if (S.area === 'learn') {
             const learnKeys = {
-                l: () => setArea('review'), j: () => stepConcept(1), k: () => stepConcept(-1),
+                l: () => setArea('review'), d: () => setArea('decisions'), j: () => stepConcept(1), k: () => stepConcept(-1),
                 e: () => setLearnTab('explain'), q: () => setLearnTab('quiz'),
                 b: toggleSidebar, t: toggleTheme,
                 '?': () => document.getElementById('shortcut-modal').classList.toggle('hidden'),
@@ -2523,7 +2769,7 @@ function setupListeners() {
             return;
         }
         const keys = {
-            l: () => setArea('learn'),
+            l: () => setArea('learn'), d: () => setArea('decisions'),
             j: () => navigateChange(1), k: () => navigateChange(-1),
             n: () => jumpSection(1), p: () => jumpSection(-1),
             f: () => setMode('files'), i: () => setMode('intent'), r: () => setMode('flow'),

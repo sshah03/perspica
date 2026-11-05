@@ -1,4 +1,4 @@
-use crate::{deep, intel, learn, llm, MultiFileResult};
+use crate::{decisions, deep, intel, learn, llm, sessions, MultiFileResult};
 use axum::{extract::{Request, State}, http::{header, Method, StatusCode}, middleware::{self, Next}, response::{Html, IntoResponse, Response}, routing::{get, post}, Json, Router};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -17,10 +17,12 @@ struct AppState {
     /// Learn jobs running now ("outline", or a concept id while its lesson is written), and what each is
     /// doing: "writing", or "checking" while the lesson is checked against the code.
     learn_busy: std::sync::Mutex<HashMap<String, &'static str>>,
+    /// Whether the Decisions tab's topics are being found now.
+    decisions_busy: std::sync::atomic::AtomicBool,
 }
 
 pub async fn serve(result: MultiFileResult, port: u16, provider: Option<Box<dyn llm::LlmProvider>>, detect: llm::Detect, open_browser: bool, key: String) {
-    let state = Arc::new(AppState { result: RwLock::new(result), provider: RwLock::new(provider), detect, deep_lock: Mutex::new(()), key, learn_busy: Default::default() });
+    let state = Arc::new(AppState { result: RwLock::new(result), provider: RwLock::new(provider), detect, deep_lock: Mutex::new(()), key, learn_busy: Default::default(), decisions_busy: Default::default() });
 
     // Use the requested port, or the next free one.
     let mut listener = None;
@@ -55,6 +57,7 @@ pub async fn serve(result: MultiFileResult, port: u16, provider: Option<Box<dyn 
         .route("/api/learn", post(learn_handler))
         .route("/api/learn/status", get(learn_status_handler))
         .route("/api/learn/layout", post(learn_layout_handler))
+        .route("/api/decisions", post(decisions_handler))
         .layer(middleware::from_fn(move |req, next| local_only(allowed.clone(), req, next)))
         .with_state(state);
     let url = format!("http://{}", listener.local_addr().map(|a| a.to_string()).unwrap_or_default());
@@ -437,6 +440,88 @@ async fn check_lesson(provider: &dyn llm::LlmProvider, prompt: &str, draft_text:
             draft
         }
     }
+}
+
+#[derive(Deserialize)]
+struct DecisionsRequest {
+    /// Model id; the provider's default when absent.
+    #[serde(default)]
+    model: Option<String>,
+    /// Send all of the changed code, not just the provider's budget.
+    #[serde(default)]
+    full: bool,
+}
+
+/// Clears the Decisions busy flag when the run ends, however it ends.
+struct DecisionsJob(Arc<AppState>);
+
+impl Drop for DecisionsJob {
+    fn drop(&mut self) {
+        self.0.decisions_busy.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The run goes on, and is saved, even if the page is reloaded while the model works.
+async fn decisions_handler(State(state): State<Arc<AppState>>, Json(req): Json<DecisionsRequest>) -> (StatusCode, Json<serde_json::Value>) {
+    tokio::spawn(decisions_run(state, req)).await
+        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "The run stopped unexpectedly." }))))
+}
+
+/// Reads the agent sessions behind the change again, in full, and asks the model how it was decided.
+async fn decisions_run(state: Arc<AppState>, req: DecisionsRequest) -> (StatusCode, Json<serde_json::Value>) {
+    let fail = |code: StatusCode, msg: &str| (code, Json(serde_json::json!({ "error": msg })));
+    let base = state.provider.read().await;
+    let Some(base) = &*base else {
+        return fail(StatusCode::SERVICE_UNAVAILABLE, "No LLM set up yet. Log in to Claude Code, set ANTHROPIC_API_KEY or OPENAI_API_KEY, or run Ollama.");
+    };
+    if state.decisions_busy.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return fail(StatusCode::CONFLICT, "Already looking for the decisions.");
+    }
+    let _job = DecisionsJob(state.clone());
+    let chosen = req.model.as_deref().map(str::trim).filter(|m| !m.is_empty() && *m != base.model()).map(|m| base.with_model(m));
+    let provider: &dyn llm::LlmProvider = chosen.as_deref().unwrap_or(&**base);
+    let Some(w) = state.result.read().await.source.window.clone() else {
+        return fail(StatusCode::BAD_REQUEST, "Decisions come from your own Claude Code or Codex sessions, so they aren't available for this change.");
+    };
+    // The session gets about twice the room the code does: it's most of what the model reads.
+    let budget = provider.context_budget() * 2;
+    let trace = tokio::task::spawn_blocking(move || sessions::trace(&w.root, &w.changed, w.since, w.until, budget)).await.unwrap_or_default();
+    if trace.is_empty() {
+        return fail(StatusCode::NOT_FOUND, "No Claude Code or Codex session on this machine edited these files.");
+    }
+    let (prompt, sources) = {
+        let result = state.result.read().await;
+        let sources = result.file_sources();
+        let input = intel::IntelInput {
+            results: &result.results,
+            sources: &sources,
+            cross_file: &result.cross_file,
+            author_context: result.source.author_context.as_deref(),
+            requirements: &[],
+            budget: (!req.full).then_some(provider.context_budget()),
+        };
+        (decisions::prompt(&input, &trace), sources)
+    };
+    let started = std::time::Instant::now();
+    let reply = match provider.complete(&prompt).await {
+        Ok(r) => r,
+        Err(e) => return fail(StatusCode::BAD_GATEWAY, &e),
+    };
+    let topics = match decisions::parse(&reply, &trace, &sources) {
+        Ok(t) => t,
+        Err(e) => return fail(StatusCode::BAD_GATEWAY, &e),
+    };
+    let found = decisions::Decisions {
+        provider: provider.name().to_string(),
+        model: provider.model().to_string(),
+        saved_at: crate::saved::now(),
+        seconds: started.elapsed().as_secs(),
+        events: trace.len(),
+        topics,
+    };
+    crate::saved::save_decisions(&state.key, &found);
+    state.result.write().await.decisions = Some(found.clone());
+    (StatusCode::OK, Json(serde_json::json!({ "decisions": found })))
 }
 
 async fn learn_run(state: Arc<AppState>, req: LearnRequest) -> (StatusCode, Json<serde_json::Value>) {

@@ -143,9 +143,15 @@ Each concept has:
 
 Learn uses the same setup as [LLM analysis](#llm-analysis): open the tab, pick a model, and perspica looks for concepts. Each lesson is written the first time you open its concept, and saved in `.git/perspica/` with the analysis, so it's only written once. A second pass checks each lesson against the code and fixes what's wrong, and the viewer fixes any text in the figure that overlaps, gets cut off or is too small to read. So a lesson takes a few minutes to write. If a lesson isn't good enough, **Rewrite…** writes it again, with a stronger model if you like. Lessons are kept in `--format html` exports, so a shared review keeps its lessons and quizzes.
 
+## Decisions
+
+The **Decisions** tab shows how a change you made with Claude Code or Codex was decided. perspica reads the session that made it and groups what was settled into topics. Each topic separates what you decided from what the agent decided on its own, so you know which choices nobody has looked at yet. Below that is a timeline of the moments that settled it: your requests, the agent's proposals, measurements and changes of course. Every quote is checked word for word against the session, and anything that doesn't match is dropped.
+
+It only works for your own changes, with the sessions on this machine: uncommitted work, or commits you authored. A session counts when it edited the changed files, and perspica reads it up to where it moved on to other work. **Find decisions…** sends the session and the changed code to your LLM in one request, which takes about a minute. The result is saved in `.git/perspica/`. Shared `--format html` pages leave Decisions out, since it quotes your sessions.
+
 ## Privacy
 
-- Everything initially runs locally. Nothing is sent anywhere unless you ask for it: `-s` / **Analyze…**, or **Find concepts…** in Learn (after that, opening a concept writes its lesson).
+- Everything initially runs locally. Nothing is sent anywhere unless you ask for it: `-s` / **Analyze…**, **Find concepts…** in Learn (after that, opening a concept writes its lesson), or **Find decisions…**.
 - Agent sessions (`~/.claude/projects`, `~/.codex/sessions`) are read only for **your own** changes (uncommitted work, or commits authored with your git identity), never for someone else's PR. perspica says when it uses them; `--no-sessions` turns this off.
 - The web viewer listens on `127.0.0.1` and only answers its own page: other hosts (DNS rebinding) and other sites' requests are refused.
 - Learn's interactive pieces are written by the model, so they run in a sandboxed frame that can't reach the network or the rest of the page.
@@ -192,7 +198,7 @@ Options:
   -V, --version              Print version
 ```
 
-Viewer shortcuts: `j`/`k` next/previous change · `n`/`p` next/previous file or group · `v` mark viewed and go to the next unviewed file · `f`/`i`/`r` by file / by intent / reading order · `m` show/hide mechanical changes · `u`/`s` unified/split · `/` filter · `l` switch between Review and Learn · `e`/`q` explanation/quiz in Learn (`j`/`k` change concept) · `?` all shortcuts.
+Viewer shortcuts: `j`/`k` next/previous change · `n`/`p` next/previous file or group · `v` mark viewed and go to the next unviewed file · `f`/`i`/`r` by file / by intent / reading order · `m` show/hide mechanical changes · `u`/`s` unified/split · `/` filter · `l` switch between Review and Learn · `d` switch to Decisions and back · `e`/`q` explanation/quiz in Learn (`j`/`k` change concept) · `?` all shortcuts.
 
 </details>
 

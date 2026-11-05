@@ -302,3 +302,33 @@ fn test_web_server_rejects_foreign_requests() {
     // Passes the guard; with no LLM provider the analysis itself is unavailable.
     assert_eq!(results.4, 503, "own origin, JSON");
 }
+
+#[test]
+fn working_tree_review_includes_new_files() {
+    let dir = std::env::temp_dir().join(format!("perspica-untracked-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let git = |args: &[&str]| {
+        let ok = Command::new("git").args(args).current_dir(&dir)
+            .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .status().unwrap().success();
+        assert!(ok, "git {args:?}");
+    };
+    git(&["init", "-q"]);
+    std::fs::write(dir.join("a.py"), "def a():\n    return 1\n").unwrap();
+    std::fs::write(dir.join(".gitignore"), "ignored.py\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "first"]);
+    std::fs::write(dir.join("a.py"), "def a():\n    return 2\n").unwrap();
+    std::fs::write(dir.join("b.py"), "def b():\n    return 3\n").unwrap();
+    std::fs::write(dir.join("ignored.py"), "x = 1\n").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_perspica")).args(["--git", "--format", "json", "--no-sessions"]).current_dir(&dir)
+        .env_remove("ANTHROPIC_API_KEY").env_remove("OPENAI_API_KEY").output().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let mut paths: Vec<&str> = v["files"].as_array().unwrap().iter().map(|f| f["new_path"].as_str().unwrap()).collect();
+    paths.sort();
+    assert_eq!(paths, vec!["a.py", "b.py"], "the new file is reviewed, the ignored one isn't");
+}

@@ -3,7 +3,7 @@
 //! analysis twice. Stored in the repository's git directory (`.git/perspica/`),
 //! or `~/.cache/perspica/` outside a repository.
 
-use crate::{intel, learn, MultiFileResult};
+use crate::{decisions, intel, learn, MultiFileResult};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -81,6 +81,17 @@ pub fn load_learn(key: &str) -> Option<learn::Learn> {
 pub fn save_learn(key: &str, learn: &learn::Learn) {
     if let Err(e) = write("learn", key, learn) {
         eprintln!("perspica: couldn't save the lessons ({e}); they will be lost on restart");
+    }
+}
+
+/// The Decisions tab's topics.
+pub fn load_decisions(key: &str) -> Option<decisions::Decisions> {
+    read("decisions", key)
+}
+
+pub fn save_decisions(key: &str, d: &decisions::Decisions) {
+    if let Err(e) = write("decisions", key, d) {
+        eprintln!("perspica: couldn't save the decisions ({e}); they will be lost on restart");
     }
 }
 

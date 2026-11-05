@@ -26,7 +26,7 @@ pub struct GitFileDiff {
 pub enum Target {
     /// Index vs HEAD.
     Staged,
-    /// Working tree vs a ref.
+    /// Working tree vs a ref, untracked files included.
     WorkingTree(String),
     /// Two revisions.
     Range(String, String),
@@ -229,9 +229,9 @@ pub fn collect(target: &Target) -> Result<Vec<GitFileDiff>, String> {
     ns_args.extend(&arg_refs);
     let entries = parse_name_status_z(&git_cmd(&ns_args)?);
     if entries.is_empty() {
-        // The branch may only have new files.
+        // The change may only have new files.
         return match (target, repo_root()) {
-            (Target::Branch { .. }, Some(root)) => {
+            (Target::Branch { .. } | Target::WorkingTree(_), Some(root)) => {
                 let mut out = untracked_files(&root)?;
                 apply_attribute_roles(&mut out);
                 Ok(out)
@@ -310,7 +310,8 @@ pub fn collect(target: &Target) -> Result<Vec<GitFileDiff>, String> {
             role: None,
         });
     }
-    if let (Target::Branch { .. }, Some(root)) = (target, &root) {
+    // New files are part of the working tree's change, as they are of a branch's: agents add them all the time.
+    if let (Target::Branch { .. } | Target::WorkingTree(_), Some(root)) = (target, &root) {
         out.extend(untracked_files(root)?);
     }
     apply_attribute_roles(&mut out);

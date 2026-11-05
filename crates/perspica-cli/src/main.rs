@@ -7,6 +7,7 @@ mod web;
 mod deep;
 mod sessions;
 mod saved;
+mod decisions;
 mod learn;
 
 use clap::Parser;
@@ -108,7 +109,7 @@ struct Cli {
     model: Option<String>,
 
     /// Don't read the Claude Code or Codex sessions behind your change (your prompts are
-    /// shown, and sent with -s). Never read for other people's changes
+    /// shown, and sent with -s and Find decisions). Never read for other people's changes
     #[arg(long)]
     no_sessions: bool,
 
@@ -149,6 +150,9 @@ pub struct MultiFileResult {
     /// The Learn outline and the lessons written so far (the viewer's Learn tab).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub learn: Option<learn::Learn>,
+    /// How the change was decided, from the agent sessions behind it (the viewer's Decisions tab).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decisions: Option<decisions::Decisions>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,6 +177,9 @@ pub struct SourceInfo {
     /// Coding-agent sessions that made the change, and the user's prompts in them.
     #[serde(default)]
     pub sessions: sessions::SessionContext,
+    /// Where to read those sessions again in full, for Decisions. Only for the local user's own changes.
+    #[serde(skip)]
+    pub window: Option<sessions::Window>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -240,7 +247,7 @@ fn main() {
             let _ = std::env::set_current_dir(root);
         }
     }
-    let mut source = SourceInfo { label: String::new(), pr_title: None, pr_url: None, author_context: None, sessions: Default::default(), detail: None, repo: None, repo_url: None };
+    let mut source = SourceInfo { label: String::new(), pr_title: None, pr_url: None, author_context: None, sessions: Default::default(), window: None, detail: None, repo: None, repo_url: None };
     let mut target: Option<git::Target> = None;
     let diffs: Vec<git::GitFileDiff> = if let Some(pr) = cli.pr {
         let (t, info) = git::pr_target(pr).unwrap_or_else(|e| fail(e));
@@ -279,6 +286,7 @@ fn main() {
             // A little slack: the commit is made just after the last prompt's work.
             let until = git::head_time(t).map(|h| h + 120);
             source.sessions = sessions::find(&root, &changed, since, until);
+            source.window = Some(sessions::Window { root, changed, since, until });
             // Reading transcripts should never be silent.
             let ctx = &source.sessions;
             if !ctx.is_empty() {
@@ -343,6 +351,7 @@ fn main() {
         llm_saved_at: None,
         llm_error: None,
         learn: None,
+        decisions: None,
     };
 
     if let Some(t) = &target {
@@ -377,6 +386,7 @@ fn main() {
     let wants_llm = wants_llm && !reused;
     if (format == "web" || format == "html") && !cli.fresh {
         multi.learn = saved::load_learn(&key);
+        multi.decisions = saved::load_decisions(&key);
     }
 
     if wants_llm {
@@ -408,6 +418,7 @@ fn main() {
         "html" => {
             // A page is made to be shared, so leave out the prompts from your own agent sessions.
             multi.source.sessions = Default::default();
+            multi.decisions = None;
             if let Err(e) = std::fs::write(&cli.out, web::export_html(&multi)) {
                 fail(format!("could not write {}: {e}", cli.out.display()));
             }
