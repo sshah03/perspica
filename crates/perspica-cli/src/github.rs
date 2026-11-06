@@ -846,9 +846,8 @@ pub fn grade(prev: Option<Graded>, quiz: &[learn::Question], quiz_id: &str, user
 }
 
 /// The reply to answers from someone who had already passed. They change nothing, so it says only that.
-pub fn after_passing(g: &Graded, quiz: &[learn::Question]) -> String {
-    format!("@{} already passed the quiz ({} of {} right first try), so these answers don't change anything.\n\n{GRADED}{} -->",
-        g.user, g.first_right(quiz), quiz.len(), encode(g))
+pub fn after_passing(g: &Graded) -> String {
+    format!("@{} already passed the quiz, so these answers don't change anything.\n\n{GRADED}{} -->", g.user, encode(g))
 }
 
 /// The Action's note when someone approves before passing a quiz the author required.
@@ -862,7 +861,10 @@ pub fn reply(g: &Graded, quiz: &[learn::Question], answers: &[(usize, usize)]) -
     let mut out = vec![];
     let right = g.right.iter().filter(|r| **r).count();
     out.push(if g.passed() {
-        format!("@{} passed the quiz: {} of {total} right first try.", g.user, g.first_right(quiz))
+        match g.first_right(quiz) {
+            n if n == total => format!("@{} passed the quiz: all {total} right on the first try.", g.user),
+            n => format!("@{} passed the quiz: all {total} right now. On the first try, {n} of {total} were right.", g.user),
+        }
     } else {
         format!("@{} {right} of {total} right so far.", g.user)
     });
@@ -994,7 +996,13 @@ pub fn check_run(stamp: Option<&Stamp>, head: &str, graded: &[Graded], own: Opti
         if let Some((r, t)) = s.author_score { q.push(format!("- The author: {r} of {t} right first try")); }
         for g in graded {
             let first = g.first_right(&s.quiz);
-            q.push(format!("- {}: {}, {first} of {} right first try", g.user, if g.passed() { "passed" } else { "not finished" }, s.quiz.len()));
+            let total = s.quiz.len();
+            let right = g.right.iter().filter(|r| **r).count();
+            q.push(match (g.passed(), first == total) {
+                (true, true) => format!("- {}: passed, all on the first try", g.user),
+                (true, false) => format!("- {}: passed. On the first try, {first} of {total} were right", g.user),
+                (false, _) => format!("- {}: not finished, {right} of {total} right so far", g.user),
+            });
         }
         section(&mut out, ("Quiz".into(), q.join("\n")));
     }
@@ -1118,6 +1126,7 @@ async fn run_action() -> Result<(), String> {
     let mut comments = api.comments(number).await?;
     let stamp = latest_stamp(&comments, &author);
 
+    // Demo build only: lets a one-person demo take the reviewer's side.
     let author_too = std::env::var_os("PERSPICA_DEMO_AUTHOR_ANSWERS").is_some();
     let say = |text: String| {
         let api = &api;
@@ -1149,7 +1158,7 @@ async fn run_action() -> Result<(), String> {
             let already = prev.as_ref().is_some_and(Graded::passed);
             let mut g = grade(prev, &s.quiz, &id, &src.user, &answers);
             g.answered.push(src.key.clone());
-            let text = if already { after_passing(&g, &s.quiz) } else { reply(&g, &s.quiz, &answers) };
+            let text = if already { after_passing(&g) } else { reply(&g, &s.quiz, &answers) };
             let text = say(text).await?;
             comments.push(IssueComment { key: String::new(), user: BOT.into(), body: text, at: src.at.clone() });
         }
@@ -1460,7 +1469,9 @@ mod tests {
         assert!(g.passed());
         assert_eq!(g.first, vec![Some(0), Some(1)], "a second try doesn't change the first");
         let text = reply(&g, &quiz, &[(1, 2)]);
-        assert!(text.starts_with("@rev passed the quiz: 1 of 2 right first try."), "{text}");
+        assert!(text.starts_with("@rev passed the quiz: all 2 right now. On the first try, 1 of 2 were right."), "{text}");
+        let clean = grade(None, &quiz, "id", "ace", &[(0, 0), (1, 2)]);
+        assert!(reply(&clean, &quiz, &[(0, 0), (1, 2)]).starts_with("@ace passed the quiz: all 2 right on the first try."));
         // Answers to an older quiz don't carry over.
         let fresh = grade(Some(g), &quiz, "other", "rev", &[]);
         assert!(!fresh.passed() && fresh.first == vec![None, None]);
@@ -1513,8 +1524,8 @@ mod tests {
         assert_eq!(with_author, vec!["c4", "c5", "r1"]);
         assert!(approved_early("rev").starts_with("@rev approved, but hasn't passed the quiz yet"));
         let passed = grade(None, &s.quiz, &id, "rev", &[(0, 1), (1, 0)]);
-        let later = after_passing(&passed, &s.quiz);
-        assert!(later.starts_with("@rev already passed the quiz (2 of 2 right first try), so these answers don't change anything."));
+        let later = after_passing(&passed);
+        assert!(later.starts_with("@rev already passed the quiz, so these answers don't change anything."));
         assert_eq!(decode::<Graded>(&later, GRADED).unwrap().user, "rev", "it still records the reply as graded");
     }
 
@@ -1529,7 +1540,7 @@ mod tests {
         let done = check_run(Some(&s), &s.sha, &[g], None, 7).unwrap();
         assert_eq!((done.status, done.conclusion), ("completed", Some("success")));
         assert!(done.title.starts_with("Quiz passed by rev"));
-        assert!(done.summary.contains("- rev: passed, 2 of 2 right first try"));
+        assert!(done.summary.contains("- rev: passed, all on the first try"), "{}", done.summary);
 
         let mut optional = s.clone();
         optional.require_quiz = false;
