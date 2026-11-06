@@ -845,6 +845,12 @@ pub fn grade(prev: Option<Graded>, quiz: &[learn::Question], quiz_id: &str, user
     g
 }
 
+/// The reply to answers from someone who had already passed. They change nothing, so it says only that.
+pub fn after_passing(g: &Graded, quiz: &[learn::Question]) -> String {
+    format!("@{} already passed the quiz ({} of {} right first try), so these answers don't change anything.\n\n{GRADED}{} -->",
+        g.user, g.first_right(quiz), quiz.len(), encode(g))
+}
+
 /// The Action's note when someone approves before passing a quiz the author required.
 pub fn approved_early(user: &str) -> String {
     format!("@{user} approved, but hasn't passed the quiz yet, so the perspica check is still waiting. Reply with `/quiz` and your answers to take it.")
@@ -1140,9 +1146,11 @@ async fn run_action() -> Result<(), String> {
         for src in todo {
             let Some(answers) = parse_answers(&src.body) else { continue };
             let prev = gradings(&comments, &id).into_iter().find(|g| g.user == src.user);
+            let already = prev.as_ref().is_some_and(Graded::passed);
             let mut g = grade(prev, &s.quiz, &id, &src.user, &answers);
             g.answered.push(src.key.clone());
-            let text = say(reply(&g, &s.quiz, &answers)).await?;
+            let text = if already { after_passing(&g, &s.quiz) } else { reply(&g, &s.quiz, &answers) };
+            let text = say(text).await?;
             comments.push(IssueComment { key: String::new(), user: BOT.into(), body: text, at: src.at.clone() });
         }
         // Approving before passing a required quiz is allowed, but the check keeps waiting. Say so.
@@ -1504,6 +1512,10 @@ mod tests {
         let with_author: Vec<&str> = ungraded(&sources, &comments, "author", true).iter().map(|c| c.key.as_str()).collect();
         assert_eq!(with_author, vec!["c4", "c5", "r1"]);
         assert!(approved_early("rev").starts_with("@rev approved, but hasn't passed the quiz yet"));
+        let passed = grade(None, &s.quiz, &id, "rev", &[(0, 1), (1, 0)]);
+        let later = after_passing(&passed, &s.quiz);
+        assert!(later.starts_with("@rev already passed the quiz (2 of 2 right first try), so these answers don't change anything."));
+        assert_eq!(decode::<Graded>(&later, GRADED).unwrap().user, "rev", "it still records the reply as graded");
     }
 
     #[test]
