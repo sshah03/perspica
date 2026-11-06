@@ -423,6 +423,7 @@ body.sidebar-collapsed #sidebar { display: none; }
 .post-options .check { display: flex; gap: 8px; align-items: flex-start; font-size: var(--font-size-sm); color: var(--text-0); cursor: pointer; }
 .post-options .check input { margin-top: 2px; accent-color: var(--accent); }
 .post-options .check.sub { padding-left: 22px; }
+.post-options .check.sub2 { padding-left: 44px; }
 .post-options .check.off { color: var(--text-3); cursor: default; }
 .post-options .check > span { display: grid; gap: 1px; }
 .post-options .opt-note { color: var(--text-2); font-size: var(--font-size-xs); }

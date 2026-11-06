@@ -145,10 +145,15 @@ struct Cli {
     #[arg(long, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
     quiz_score: Option<bool>,
 
-    /// With --post: ask reviewers to take the quiz before approving. Needs the perspica check in the
-    /// repo (`perspica github init`), which grades it. Remembered
+    /// With --post: suggest reviewers take the quiz. It's optional for them. Remembered
     #[arg(long, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
     ask_quiz: Option<bool>,
+
+    /// With --post: have the perspica check wait until a reviewer passes the quiz. Make the check
+    /// required to keep the PR from merging until then. Needs the check in the repo (`perspica github
+    /// init`). Remembered
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
+    require_quiz: Option<bool>,
 }
 
 /// Multi-file analysis output.
@@ -462,7 +467,7 @@ fn main() {
     if cli.post {
         let Some(share) = share else { fail("--post shares the review of a pull request. Run it on your PR's branch, or with --pr N.") };
         let mut settings = saved::load_post_settings();
-        for (flag, value) in [(cli.concerns, &mut settings.concerns), (cli.lessons, &mut settings.lessons), (cli.quiz_score, &mut settings.quiz_score), (cli.ask_quiz, &mut settings.ask_quiz)] {
+        for (flag, value) in [(cli.concerns, &mut settings.concerns), (cli.lessons, &mut settings.lessons), (cli.quiz_score, &mut settings.quiz_score), (cli.ask_quiz, &mut settings.ask_quiz), (cli.require_quiz, &mut settings.require_quiz)] {
             if let Some(v) = flag { *value = v; }
         }
         if let Err(e) = github::post_cli(&multi, &share, settings, &key, cli.yes) {

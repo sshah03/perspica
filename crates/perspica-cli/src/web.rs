@@ -708,7 +708,7 @@ async fn build_comment(state: &AppState, settings: &github::PostSettings) -> Res
     let pr = pr_state(state, false).await?;
     let score = score(state).await;
     let mut used = settings.clone();
-    used.ask_quiz &= pr.action;
+    used.require_quiz &= pr.action;
     let result = state.result.read().await;
     let stamp = github::stamp(&result, &used, score, &pr.head, &format!("{}/files", pr.url));
     let notes = github::notes(&pr, settings, &result, score);

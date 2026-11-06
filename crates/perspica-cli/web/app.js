@@ -2906,7 +2906,7 @@ async function startPost() {
     const lessons = (learnData()?.concepts || []).filter(c => c.lesson).length;
     const done = score.total > 0 && score.answered === score.total;
     const opt = (id, on, label, note, disabled = false, sub = false) =>
-        `<label class="check${sub ? ' sub' : ''}${disabled ? ' off' : ''}"><input type="checkbox" id="${id}"${on && !disabled ? ' checked' : ''}${disabled ? ' disabled' : ''}><span>${label}${note ? `<span class="opt-note">${note}</span>` : ''}</span></label>`;
+        `<label class="check${sub === 'sub2' ? ' sub sub2' : sub ? ' sub' : ''}${disabled ? ' off' : ''}"><input type="checkbox" id="${id}"${on && !disabled ? ' checked' : ''}${disabled ? ' disabled' : ''}><span>${label}${note ? `<span class="opt-note">${note}</span>` : ''}</span></label>`;
     showDialog({
         title: `${pr.comment ? 'Update' : 'Post'} perspica's comment on PR #${pr.number}`,
         body: `<p class="muted">One comment on <b>${esc(pr.repo)}#${pr.number}</b>, from your GitHub account${pr.me ? ` (${esc(pr.me)})` : ''}. Posting again updates it. Nothing from your agent sessions goes in: no prompts, no Decisions.</p>
@@ -2914,8 +2914,9 @@ async function startPost() {
             <div class="post-options">
                 ${opt('po-concerns', set.concerns, 'Concerns', concerns ? `${concerns} from Analyze` : 'None yet. Analyze first.', !concerns)}
                 ${opt('po-lessons', set.lessons, 'Lessons and quiz', lessons ? `${lessons} lesson${pl(lessons)}, ${score.total} question${pl(score.total)}` : 'None yet. Open Learn first.', !lessons)}
-                ${opt('po-score', set.quiz_score, 'My quiz score', done ? `${score.right} of ${score.total} right first try` : score.total ? `Answer all ${score.total} questions in Learn first. ${score.answered} so far.` : '', !done, true)}
-                ${opt('po-ask', set.ask_quiz, 'Ask reviewers to take the quiz before approving', pr.action ? 'The perspica check waits until one passes.' : 'Needs the perspica check in this repo: run <code>perspica github init</code>', !pr.action || !lessons, true)}
+                ${opt('po-score', set.quiz_score, 'My quiz score, as a badge', done ? `${score.right} of ${score.total} right first try` : score.total ? `Answer all ${score.total} questions in Learn first. ${score.answered} so far.` : '', !done, true)}
+                ${opt('po-ask', set.ask_quiz || set.require_quiz, 'Ask reviewers to take the quiz', 'Suggested in the comment. It\'s optional for them.', !lessons, true)}
+                ${opt('po-require', set.require_quiz, 'Wait for a reviewer to pass before merging', pr.action ? 'The perspica check waits until one passes. Make it a required check to block merging.' : 'Needs the perspica check in this repo: run <code>perspica github init</code>', !pr.action || !lessons || !(set.ask_quiz || set.require_quiz), 'sub2')}
             </div>
             <div id="po-notes" class="post-notes"></div>
             <div class="field-label">Preview <span class="muted" id="po-size"></span></div>
@@ -2928,9 +2929,10 @@ async function startPost() {
     const box = document.querySelector('#dialog .post-options');
     const sync = () => {
         const l = document.getElementById('po-lessons');
-        for (const id of ['po-score', 'po-ask']) {
+        const ask = document.getElementById('po-ask');
+        for (const id of ['po-score', 'po-ask', 'po-require']) {
             const el = document.getElementById(id);
-            const off = !l.checked || (id === 'po-score' ? !done : !pr.action);
+            const off = !l.checked || (id === 'po-score' ? !done : id === 'po-require' ? !pr.action || !ask.checked : false);
             el.disabled = off; el.closest('label').classList.toggle('off', off);
         }
         updatePostPreview();
@@ -2945,7 +2947,7 @@ function postSettings() {
     const prev = S.pr?.settings || {};
     // A choice that can't be made now (no concerns yet, say) keeps what was saved, for next time.
     const keep = (id, key) => document.getElementById(id)?.disabled ? !!prev[key] : on(id);
-    return { concerns: keep('po-concerns', 'concerns'), lessons: keep('po-lessons', 'lessons'), quiz_score: keep('po-score', 'quiz_score'), ask_quiz: keep('po-ask', 'ask_quiz') };
+    return { concerns: keep('po-concerns', 'concerns'), lessons: keep('po-lessons', 'lessons'), quiz_score: keep('po-score', 'quiz_score'), ask_quiz: keep('po-ask', 'ask_quiz'), require_quiz: keep('po-require', 'require_quiz') };
 }
 
 let previewTimer = 0, previewSeq = 0;
@@ -2958,7 +2960,7 @@ function updatePostPreview() {
         try {
             const settings = postSettings();
             // What's posted leaves out choices that can't apply now.
-            for (const [id, key] of [['po-concerns', 'concerns'], ['po-lessons', 'lessons'], ['po-score', 'quiz_score'], ['po-ask', 'ask_quiz']]) if (document.getElementById(id)?.disabled) settings[key] = false;
+            for (const [id, key] of [['po-concerns', 'concerns'], ['po-lessons', 'lessons'], ['po-score', 'quiz_score'], ['po-ask', 'ask_quiz'], ['po-require', 'require_quiz']]) if (document.getElementById(id)?.disabled) settings[key] = false;
             const resp = await fetch('/api/pr/preview', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ settings }) });
             const p = await resp.json();
             if (seq !== previewSeq) return;
@@ -2973,7 +2975,7 @@ function updatePostPreview() {
 async function postComment(pr) {
     const settings = postSettings();
     const sent = { ...settings };
-    for (const [id, key] of [['po-concerns', 'concerns'], ['po-lessons', 'lessons'], ['po-score', 'quiz_score'], ['po-ask', 'ask_quiz']]) if (document.getElementById(id)?.disabled) sent[key] = false;
+    for (const [id, key] of [['po-concerns', 'concerns'], ['po-lessons', 'lessons'], ['po-score', 'quiz_score'], ['po-ask', 'ask_quiz'], ['po-require', 'require_quiz']]) if (document.getElementById(id)?.disabled) sent[key] = false;
     // Saved as chosen; sent as it can apply.
     try {
         const resp = await fetch('/api/pr/post', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ settings: sent }) });

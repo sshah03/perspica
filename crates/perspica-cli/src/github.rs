@@ -39,13 +39,15 @@ pub struct PostSettings {
     pub lessons: bool,
     /// The author's own quiz score, once they've answered every question.
     pub quiz_score: bool,
-    /// Ask reviewers to take the quiz before approving. Needs the Action, which grades it.
+    /// Ask reviewers to take the quiz. Without `require_quiz` it's a suggestion.
     pub ask_quiz: bool,
+    /// Keep the check waiting until a reviewer passes. Needs the Action, which grades the quiz.
+    pub require_quiz: bool,
 }
 
 impl Default for PostSettings {
     fn default() -> Self {
-        PostSettings { concerns: true, lessons: true, quiz_score: true, ask_quiz: false }
+        PostSettings { concerns: true, lessons: true, quiz_score: true, ask_quiz: false, require_quiz: false }
     }
 }
 
@@ -117,6 +119,8 @@ pub struct Stamp {
     pub lessons: Vec<StampLesson>,
     pub quiz: Vec<learn::Question>,
     pub ask_quiz: bool,
+    /// The check waits until a reviewer passes.
+    pub require_quiz: bool,
     /// Right first try, out of how many.
     pub author_score: Option<(usize, usize)>,
     /// Places the change may have broken: references to removed names, calls not updated.
@@ -316,7 +320,8 @@ pub fn stamp(multi: &MultiFileResult, settings: &PostSettings, score: Score, sha
         concerns,
         names,
         lessons: lessons.iter().map(|(c, l)| StampLesson { title: c.title.clone(), tldr: l.tldr.clone(), in_this_change: l.in_this_change.clone(), sources: l.sources.clone() }).collect(),
-        ask_quiz: settings.ask_quiz && !quiz.is_empty(),
+        ask_quiz: (settings.ask_quiz || settings.require_quiz) && !quiz.is_empty(),
+        require_quiz: settings.require_quiz && !quiz.is_empty(),
         author_score: (settings.quiz_score && score.complete() && !quiz.is_empty()).then_some((score.right, score.total)),
         quiz,
         annotations,
@@ -522,17 +527,26 @@ pub fn preview(s: &Stamp, graded: bool) -> String {
     c.lines().filter(|l| !l.starts_with(DATA) && *l != MARK).collect::<Vec<_>>().join("\n").trim().to_string()
 }
 
+/// The author's score as a badge, like a repo's build badge. The image has the same words, for when it doesn't load.
+fn author_badge(right: usize, total: usize) -> String {
+    let color = if right * 5 >= total * 4 { "2ea44f" } else { "dbab09" };
+    format!("![The author took the quiz: {right} of {total} right first try](https://img.shields.io/badge/author%27s%20quiz-{right}%20of%20{total}%20right%20first%20try-{color})")
+}
+
 fn render(s: &Stamp, graded: bool) -> String {
     let mut out = vec![MARK.to_string(), format!("**perspica** · {}", s.headline())];
     if let Some(sum) = &s.summary {
         out.push(s.linked(sum));
     }
     let mut lines = vec![];
-    if s.ask_quiz {
-        lines.push(format!("**Quiz requested.** The author asks reviewers to take the quiz below before approving ({}).", plural(s.quiz.len(), "question", "questions")));
-    }
     if let Some((right, total)) = s.author_score {
-        lines.push(format!("The author took the quiz: {right} of {total} right first try."));
+        lines.push(author_badge(right, total));
+    }
+    let n = plural(s.quiz.len(), "question", "questions");
+    if s.require_quiz {
+        lines.push(format!("**Quiz required.** The author asks a reviewer to pass the quiz below ({n}) before this merges. The perspica check waits until one does."));
+    } else if s.ask_quiz {
+        lines.push(format!("**Quiz suggested.** The author suggests reviewers take the quiz below ({n}) before approving. It's optional."));
     }
     if !lines.is_empty() {
         out.push(lines.join("\n"));
@@ -556,7 +570,7 @@ fn render(s: &Stamp, graded: bool) -> String {
         if graded {
             body.push(format!("Reply with `/quiz` and your answers, like `/quiz {example}`. The perspica check grades them."));
         }
-        let title = if s.ask_quiz { "Quiz" } else { "Quiz, optional" };
+        let title = if s.require_quiz { "Quiz, required" } else { "Quiz, optional" };
         out.push(fold(format!("{title} ({})", plural(s.quiz.len(), "question", "questions")), body.join("\n\n")));
     }
     out.push(format!("<sub>Posted with [perspica]({HOME}) from the author's machine, for {}.</sub>", short(&s.sha)));
@@ -695,8 +709,8 @@ pub fn notes(pr: &PrState, settings: &PostSettings, multi: &MultiFileResult, sco
             format!("You've answered {} of {} quiz questions. Your score is added once you've answered them all.", score.answered, score.total)
         });
     }
-    if settings.ask_quiz && !pr.action {
-        notes.push(format!("Asking reviewers for the quiz needs the perspica Action in {}, which grades it. Add it with `perspica github init`.", pr.repo));
+    if settings.require_quiz && !pr.action {
+        notes.push(format!("Waiting for a reviewer to pass needs the perspica check in {}, which grades the quiz. Add it with `perspica github init`.", pr.repo));
     }
     notes
 }
@@ -711,7 +725,7 @@ pub fn describe(s: &Stamp) -> String {
     if s.author_score.is_some() { parts.push("your quiz score".into()); }
     let last = parts.pop().unwrap_or_default();
     let list = if parts.is_empty() { last } else { format!("{} and {last}", parts.join(", ")) };
-    let ask = if s.ask_quiz { " It asks reviewers to take the quiz before approving." } else { "" };
+    let ask = if s.require_quiz { " The check waits until a reviewer passes the quiz." } else if s.ask_quiz { " It suggests reviewers take the quiz." } else { "" };
     format!("The comment has {list}.{ask}")
 }
 
@@ -725,13 +739,13 @@ pub fn post_cli(multi: &MultiFileResult, share: &Share, settings: PostSettings, 
     }
     let score = author_score(multi.learn.as_ref(), &crate::saved::load_quiz(key));
     let mut used = settings.clone();
-    used.ask_quiz &= pr.action;
+    used.require_quiz &= pr.action;
     let s = stamp(multi, &used, score, &pr.head, &format!("{}/files", pr.url));
     println!("{}\n", preview(&s, pr.action));
     for n in notes(&pr, &settings, multi, score) {
         eprintln!("Note: {n}");
     }
-    eprintln!("{} Change what's in it with --concerns, --lessons, --quiz-score or --ask-quiz (=false to leave one out). perspica remembers your choice.", describe(&s));
+    eprintln!("{} Change what's in it with --concerns, --lessons, --quiz-score, --ask-quiz or --require-quiz (=false to leave one out). perspica remembers your choice.", describe(&s));
     let verb = if pr.comment.is_some() { "Update" } else { "Post" };
     if !yes {
         if !std::io::stdin().is_terminal() {
@@ -888,10 +902,12 @@ pub fn check_run(stamp: Option<&Stamp>, head: &str, graded: &[Graded], own: Opti
         return Some(CheckRun { status: "completed", conclusion: Some("neutral"), title: own.headline(), summary: fit_summary(out.join("\n")), annotations: cap(&own.annotations) });
     };
     let passed: Vec<&Graded> = graded.iter().filter(|g| g.passed()).collect();
-    let (status, conclusion, lead) = match (s.ask_quiz, passed.is_empty()) {
+    let by = format!("Quiz passed by {}", passed.iter().map(|g| g.user.clone()).collect::<Vec<_>>().join(", "));
+    let (status, conclusion, lead) = match (s.require_quiz, passed.is_empty()) {
         (true, true) => ("in_progress", None, "Waiting on a reviewer's quiz".to_string()),
-        (true, false) => ("completed", Some("success"), format!("Quiz passed by {}", passed.iter().map(|g| g.user.clone()).collect::<Vec<_>>().join(", "))),
-        (false, _) => ("completed", Some("neutral"), String::new()),
+        (true, false) => ("completed", Some("success"), by),
+        (false, false) => ("completed", Some("neutral"), by),
+        (false, true) => ("completed", Some("neutral"), String::new()),
     };
     // Counts and lines describe the latest commit when the comment is older.
     let mut shown = s.clone();
@@ -908,8 +924,12 @@ pub fn check_run(stamp: Option<&Stamp>, head: &str, graded: &[Graded], own: Opti
             shown.annotations.clear();
         }
     }
-    let title = [lead, shown.headline()].into_iter().filter(|t| !t.is_empty()).collect::<Vec<_>>().join(" · ");
+    let author = s.author_score.map(|(r, t)| format!("Author's quiz {r}/{t}")).unwrap_or_default();
+    let title = [lead, author, shown.headline()].into_iter().filter(|t| !t.is_empty()).collect::<Vec<_>>().join(" · ");
     let mut out = vec![];
+    if let Some((r, t)) = s.author_score {
+        out.push(format!("{}\n", author_badge(r, t)));
+    }
     if fresh.is_none() {
         out.push(format!("> The author posted this for {}. The pull request has newer commits, so parts of it may be out of date.\n", short(&s.sha)));
     }
@@ -920,7 +940,8 @@ pub fn check_run(stamp: Option<&Stamp>, head: &str, graded: &[Graded], own: Opti
     for sec in shown.sections(true) { section(&mut out, sec); }
     if !s.quiz.is_empty() {
         let mut q = vec![format!("{} in the perspica comment{}. Reviewers answer by replying with `/quiz` and their answers.\n",
-            plural(s.quiz.len(), "question", "questions"), if s.ask_quiz { ", which the author asks reviewers to take before approving" } else { ", optional" })];
+            plural(s.quiz.len(), "question", "questions"),
+            if s.require_quiz { ". The author asks a reviewer to pass it before this merges" } else if s.ask_quiz { ", which the author suggests reviewers take" } else { ", optional" })];
         if let Some((r, t)) = s.author_score { q.push(format!("- The author: {r} of {t} right first try")); }
         for g in graded {
             let first = g.first_right(&s.quiz);
@@ -1078,7 +1099,7 @@ fn review_pr(number: u64, head: &str, files_url: &str) -> Result<Stamp, String> 
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
     let multi: MultiFileResult = serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
-    Ok(stamp(&multi, &PostSettings { concerns: false, lessons: false, quiz_score: false, ask_quiz: false }, Score::default(), head, files_url))
+    Ok(stamp(&multi, &PostSettings { concerns: false, lessons: false, quiz_score: false, ask_quiz: false, require_quiz: false }, Score::default(), head, files_url))
 }
 
 async fn update_check(api: &Api, head: &str, check: &CheckRun) -> Result<(), String> {
@@ -1220,6 +1241,7 @@ mod tests {
                 sources: vec![learn::Source { title: "Rust book".into(), url: "https://doc.rust-lang.org/book/".into() }] }],
             quiz: vec![question("What does `fit` drop -- first?", 1), question("Why?", 0)],
             ask_quiz: true,
+            require_quiz: true,
             author_score: Some((2, 2)),
             annotations: vec![Annotation { path: "src/c.rs".into(), line: 3, title: "`foo` was removed".into(), message: "still called here".into(), in_diff: false }],
         }
@@ -1238,7 +1260,8 @@ mod tests {
         assert_eq!(back.quiz[0].question, "What does `fit` drop -- first?");
         assert_eq!(back.sha, s.sha);
         assert!(c.contains("**perspica** · 2 changes to review, 1 worth a careful look · 218 of 1,326 changed lines are mechanical · 1 place may need updating"));
-        assert!(c.contains("**Quiz requested.**") && c.contains("The author took the quiz: 2 of 2 right first try."));
+        assert!(c.contains("**Quiz required.**"));
+        assert!(c.contains("![The author took the quiz: 2 of 2 right first try](https://img.shields.io/badge/author%27s%20quiz-2%20of%202%20right%20first%20try-2ea44f)"), "{c}");
         assert!(c.contains("/quiz 1a 2b"), "graded quizzes ask for a reply");
         assert!(!c.contains("<summary>Answer</summary>"), "and don't show the answers");
         let p = preview(&s, true);
@@ -1249,6 +1272,7 @@ mod tests {
     fn without_the_action_answers_are_folded_under_each_question() {
         let mut s = sample();
         s.ask_quiz = false;
+        s.require_quiz = false;
         let c = comment(&s, false);
         assert_eq!(c.matches("<summary>Answer</summary>").count(), 2);
         assert!(c.contains("Quiz, optional (2 questions)") && !c.contains("/quiz 1a"));
@@ -1364,7 +1388,7 @@ mod tests {
         let s = sample();
         let waiting = check_run(Some(&s), &s.sha, &[], None, 7).unwrap();
         assert_eq!((waiting.status, waiting.conclusion), ("in_progress", None));
-        assert!(waiting.title.starts_with("Waiting on a reviewer's quiz · 2 changes"), "{}", waiting.title);
+        assert!(waiting.title.starts_with("Waiting on a reviewer's quiz · Author's quiz 2/2 · 2 changes"), "{}", waiting.title);
         assert_eq!(waiting.annotations.len(), 1);
         let g = grade(None, &s.quiz, &s.quiz_id(), "rev", &[(0, 1), (1, 0)]);
         let done = check_run(Some(&s), &s.sha, &[g], None, 7).unwrap();
@@ -1373,9 +1397,14 @@ mod tests {
         assert!(done.summary.contains("- rev: passed, 2 of 2 right first try"));
 
         let mut optional = s.clone();
-        optional.ask_quiz = false;
+        optional.require_quiz = false;
         let plain = check_run(Some(&optional), &s.sha, &[], None, 7).unwrap();
-        assert_eq!(plain.conclusion, Some("neutral"));
+        assert_eq!((plain.status, plain.conclusion), ("completed", Some("neutral")), "a suggested quiz never holds the check");
+        let g = grade(None, &s.quiz, &s.quiz_id(), "rev", &[(0, 1), (1, 0)]);
+        let passed = check_run(Some(&optional), &s.sha, &[g], None, 7).unwrap();
+        assert_eq!(passed.conclusion, Some("neutral"));
+        assert!(passed.title.starts_with("Quiz passed by rev · Author's quiz 2/2 · "), "{}", passed.title);
+        assert!(comment(&optional, true).contains("**Quiz suggested.**"));
     }
 
     #[test]

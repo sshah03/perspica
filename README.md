@@ -154,10 +154,11 @@ It only works for your own changes, with the sessions on this machine: uncommitt
 
 Post the review on your pull request as one comment, so reviewers get it without installing anything. Run `perspica --pr 123 --post`, or click **Post to PR #123…** in the viewer when the review is of your own branch or PR. You see a preview first, and posting again updates the same comment. It uses the `gh` CLI and your GitHub login.
 
-The comment is short: the counts, then folded sections for the reading order, Analyze's concerns, the lessons and the quiz. Tick what goes in. perspica remembers your choices.
+The comment is short: the counts and a summary, then folded sections. Each change it describes links to its code in **Files changed**. The sections cover what each change is for, files safe to skim, Analyze's concerns, places that may need updating, background on the concepts with links to docs, and the quiz. Tick what goes in, and perspica remembers your choices.
 
-- **Your quiz score.** Once you've answered every question in Learn, the comment can say how many you got right first try.
-- **Ask reviewers to take the quiz.** The comment asks reviewers to take the quiz before approving. They answer by replying `/quiz 1a 2c 3b`. The perspica check grades the answers, replies with what they missed, and waits until a reviewer passes. To keep the PR from merging until then, make `perspica` a required check in the repo's branch settings. It's an honor system: the answers are in the comment's data, so the check shows someone took the quiz, not proof they understood.
+- **Your quiz score.** Once you've answered every question in Learn, the comment shows a badge with how many you got right first try, and so does the perspica check's title. The badge image comes from shields.io; it carries only the score.
+- **Ask reviewers to take the quiz.** The comment suggests it, and it stays optional. With the perspica check in the repo, reviewers answer by replying `/quiz 1a 2c 3b`, and the check grades them and replies with what they missed.
+- **Wait for a reviewer to pass.** The perspica check waits until a reviewer passes the quiz. To keep the PR from merging until then, make `perspica` a required check in the repo's branch settings. It's an honor system: the answers are in the comment's data, so the check shows someone took the quiz, not proof they understood.
 
 Nothing from your agent sessions goes in: no prompts, no Decisions, no marks for what you asked for.
 
