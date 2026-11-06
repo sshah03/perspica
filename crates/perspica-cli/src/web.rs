@@ -1,4 +1,4 @@
-use crate::{decisions, deep, intel, learn, llm, sessions, MultiFileResult};
+use crate::{decisions, deep, github, intel, learn, llm, sessions, MultiFileResult};
 use axum::{extract::{Request, State}, http::{header, Method, StatusCode}, middleware::{self, Next}, response::{Html, IntoResponse, Response}, routing::{get, post}, Json, Router};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -19,10 +19,13 @@ struct AppState {
     learn_busy: std::sync::Mutex<HashMap<String, &'static str>>,
     /// Whether the Decisions tab's topics are being found now.
     decisions_busy: std::sync::atomic::AtomicBool,
+    /// The pull request this review can be posted to, if any, and what GitHub said about it last.
+    share: Option<github::Share>,
+    pr: Mutex<Option<github::PrState>>,
 }
 
-pub async fn serve(result: MultiFileResult, port: u16, provider: Option<Box<dyn llm::LlmProvider>>, detect: llm::Detect, open_browser: bool, key: String) {
-    let state = Arc::new(AppState { result: RwLock::new(result), provider: RwLock::new(provider), detect, deep_lock: Mutex::new(()), key, learn_busy: Default::default(), decisions_busy: Default::default() });
+pub async fn serve(result: MultiFileResult, port: u16, provider: Option<Box<dyn llm::LlmProvider>>, detect: llm::Detect, open_browser: bool, key: String, share: Option<github::Share>) {
+    let state = Arc::new(AppState { result: RwLock::new(result), provider: RwLock::new(provider), detect, deep_lock: Mutex::new(()), key, learn_busy: Default::default(), decisions_busy: Default::default(), share, pr: Mutex::new(None) });
 
     // Use the requested port, or the next free one.
     let mut listener = None;
@@ -58,6 +61,10 @@ pub async fn serve(result: MultiFileResult, port: u16, provider: Option<Box<dyn 
         .route("/api/learn/status", get(learn_status_handler))
         .route("/api/learn/layout", post(learn_layout_handler))
         .route("/api/decisions", post(decisions_handler))
+        .route("/api/quiz", post(quiz_handler))
+        .route("/api/pr", post(pr_handler))
+        .route("/api/pr/preview", post(pr_preview_handler))
+        .route("/api/pr/post", post(pr_post_handler))
         .layer(middleware::from_fn(move |req, next| local_only(allowed.clone(), req, next)))
         .with_state(state);
     let url = format!("http://{}", listener.local_addr().map(|a| a.to_string()).unwrap_or_default());
@@ -634,5 +641,118 @@ async fn learn_run(state: Arc<AppState>, req: LearnRequest) -> (StatusCode, Json
             (StatusCode::OK, Json(serde_json::json!({ "concept": id, "lesson": lesson, "seconds": seconds })))
         }
         (Some(_), None) => fail(StatusCode::INTERNAL_SERVER_ERROR, "No lesson was written."),
+    }
+}
+
+#[derive(Deserialize)]
+struct QuizRequest {
+    answers: Vec<github::QuizAnswer>,
+}
+
+/// The author's quiz answers, kept so a PR comment can carry their score. Only first tries count.
+async fn quiz_handler(State(state): State<Arc<AppState>>, Json(req): Json<QuizRequest>) -> Json<serde_json::Value> {
+    let key = state.key.clone();
+    let _ = tokio::task::spawn_blocking(move || crate::saved::add_quiz(&key, &req.answers)).await;
+    Json(serde_json::json!({ "ok": true }))
+}
+
+#[derive(Deserialize, Default)]
+struct PrRequest {
+    /// Ask GitHub again rather than use what it said last.
+    #[serde(default)]
+    fresh: bool,
+}
+
+/// The pull request this review can be posted to, from GitHub (through `gh`), with what's needed to post.
+async fn pr_state(state: &AppState, fresh: bool) -> Result<github::PrState, String> {
+    let Some(share) = state.share.clone() else {
+        return Err("Only the review of a pull request, or of a branch with one, can be posted.".into());
+    };
+    let mut cached = state.pr.lock().await;
+    if let (Some(pr), false) = (cached.as_ref(), fresh) {
+        return Ok(pr.clone());
+    }
+    let pr = tokio::task::spawn_blocking(move || github::pr_state(&share)).await.map_err(|e| e.to_string())??;
+    *cached = Some(pr.clone());
+    Ok(pr)
+}
+
+async fn score(state: &AppState) -> github::Score {
+    let key = state.key.clone();
+    let answers = tokio::task::spawn_blocking(move || crate::saved::load_quiz(&key)).await.unwrap_or_default();
+    github::author_score(state.result.read().await.learn.as_ref(), &answers)
+}
+
+async fn pr_handler(State(state): State<Arc<AppState>>, Json(req): Json<PrRequest>) -> (StatusCode, Json<serde_json::Value>) {
+    if state.share.is_none() {
+        return (StatusCode::OK, Json(serde_json::json!({ "available": false })));
+    }
+    match pr_state(&state, req.fresh).await {
+        Ok(pr) => (StatusCode::OK, Json(serde_json::json!({
+            "available": true,
+            "pr": pr,
+            "settings": crate::saved::load_post_settings(),
+            "score": score(&state).await,
+        }))),
+        Err(e) => (StatusCode::OK, Json(serde_json::json!({ "available": false, "error": e }))),
+    }
+}
+
+#[derive(Deserialize)]
+struct PostRequest {
+    settings: github::PostSettings,
+}
+
+/// The comment these settings make, and how GitHub shows it.
+async fn build_comment(state: &AppState, settings: &github::PostSettings) -> Result<(github::PrState, github::Stamp, Vec<String>), String> {
+    let pr = pr_state(state, false).await?;
+    let score = score(state).await;
+    let mut used = settings.clone();
+    used.ask_quiz &= pr.action;
+    let result = state.result.read().await;
+    let stamp = github::stamp(&result, &used, score, &pr.head);
+    let notes = github::notes(&pr, settings, &result, score);
+    Ok((pr, stamp, notes))
+}
+
+async fn pr_preview_handler(State(state): State<Arc<AppState>>, Json(req): Json<PostRequest>) -> (StatusCode, Json<serde_json::Value>) {
+    match build_comment(&state, &req.settings).await {
+        Ok((pr, stamp, notes)) => {
+            let markdown = github::preview(&stamp, pr.action);
+            let (repo, md) = (pr.repo.clone(), markdown.clone());
+            let html = tokio::task::spawn_blocking(move || github::render_html(&repo, &md)).await.ok().flatten();
+            (StatusCode::OK, Json(serde_json::json!({
+                "markdown": markdown, "html": html, "notes": notes,
+                "chars": github::comment(&stamp, pr.action).len(),
+                "describe": github::describe(&stamp),
+            })))
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e }))),
+    }
+}
+
+async fn pr_post_handler(State(state): State<Arc<AppState>>, Json(req): Json<PostRequest>) -> (StatusCode, Json<serde_json::Value>) {
+    // Ask GitHub again: the branch may have been pushed, or the comment posted, since the page loaded.
+    if let Err(e) = pr_state(&state, true).await {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e })));
+    }
+    let (pr, stamp) = match build_comment(&state, &req.settings).await {
+        Ok((pr, stamp, _)) => (pr, stamp),
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e }))),
+    };
+    if let Some(p) = &pr.problem {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": p })));
+    }
+    let body = github::comment(&stamp, pr.action);
+    let posted = { let pr = pr.clone(); tokio::task::spawn_blocking(move || github::post(&pr, &body)).await };
+    match posted {
+        Ok(Ok(url)) => {
+            crate::saved::save_post_settings(&req.settings);
+            let updated = pr.comment.is_some();
+            let _ = pr_state(&state, true).await;
+            (StatusCode::OK, Json(serde_json::json!({ "url": url, "updated": updated })))
+        }
+        Ok(Err(e)) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({ "error": e }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))),
     }
 }
