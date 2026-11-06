@@ -35,6 +35,7 @@ const S = {
     learnBusy: {},         // Learn jobs running: 'outline' or a concept id → {started, model}
     learnErrors: {},       // concept id → why its lesson couldn't be written
     quiz: {},              // concept key → {answers: {question index: choice}} (persisted per source)
+    pr: null,              // the pull request this review can be posted to (see loadPr)
     frameFailed: {},       // concept id → why its interactive piece was hidden
     reviewScroll: 0,       // where the diff was when Learn opened
     topic: null,           // Decisions: the topic shown
@@ -144,6 +145,7 @@ async function init() {
     setupListeners();
     setupSidebarResize();
     restoreFromUrl(hash.get('at'));
+    if (!S.static) loadPr();
     if (hash.get('area') === 'learn') { S.concept = hash.get('concept'); setArea('learn'); }
     if (hash.get('area') === 'decisions') { S.topic = hash.get('topic'); setArea('decisions'); }
     // Highlight.js loads deferred; re-render visible code once it arrives.
@@ -447,6 +449,7 @@ function renderHeader() {
     btn.classList.toggle('hidden', !!S.static);
     if (!S.running) btn.textContent = hasLlmGroups() ? 'Re-analyze…' : 'Analyze…';
     btn.title = cap.llm ? `Group changes by intent, rate risk and summarize with ${cap.llm}` : 'Group changes by intent, rate risk and summarize with an LLM (needs a one-time setup)';
+    renderPostButton();
     renderProgress();
 }
 
@@ -1933,6 +1936,7 @@ function answerQuiz(qi, choice) {
     if (entry.answers[qi] !== undefined) return;
     entry.answers[qi] = choice;
     store.set('quiz:' + sourceKey(), S.quiz);
+    saveQuizAnswers([{ concept: quizKey(c), question: c.lesson.quiz[qi].question, choice }]);
     const y = window.scrollY;
     renderLearn(); renderSidebar(); renderHeader();
     window.scrollTo(0, y);
@@ -2608,6 +2612,7 @@ function setupListeners() {
     document.getElementById('view-toggle').addEventListener('click', e => { const b = e.target.closest('[data-view]'); if (b) setView(b.dataset.view); });
     document.getElementById('noise-toggle').addEventListener('change', e => setHideNoise(e.target.checked));
     document.getElementById('analyze-btn').addEventListener('click', () => { if (!S.static) startAnalysis(); });
+    document.getElementById('post-btn').addEventListener('click', () => { if (!S.static) startPost(); });
     document.getElementById('wrap-toggle').addEventListener('change', e => setWrap(e.target.checked));
     document.getElementById('theme-toggle').addEventListener('click', () => { toggleTheme(); closeViewMenu(); });
     document.getElementById('help-btn').addEventListener('click', () => document.getElementById('shortcut-modal').classList.toggle('hidden'));
@@ -2850,6 +2855,140 @@ function toast(msg, kind = '', ms = 4500) {
     area.appendChild(el);
     while (area.children.length > 3) area.firstChild.remove();
     setTimeout(() => el.remove(), ms);
+}
+
+
+// --- Posting the review on your pull request ---
+/** The author's quiz answers, kept by the server so a PR comment can carry their first-try score. */
+function saveQuizAnswers(answers) {
+    if (S.static || !answers.length) return;
+    fetch('/api/quiz', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ answers }) }).catch(() => {});
+}
+
+/** Answers given in this browser before the server kept them. The server keeps the first it sees. */
+function localQuizAnswers() {
+    const out = [];
+    for (const c of learnData()?.concepts || []) {
+        const ans = S.quiz[quizKey(c)]?.answers || {};
+        (c.lesson?.quiz || []).forEach((q, i) => { if (ans[i] !== undefined) out.push({ concept: quizKey(c), question: q.question, choice: ans[i] }); });
+    }
+    return out;
+}
+
+async function loadPr(fresh = false) {
+    try {
+        const resp = await fetch('/api/pr', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ fresh }) });
+        S.pr = await resp.json();
+    } catch { S.pr = null; }
+    renderPostButton();
+    return S.pr;
+}
+
+function renderPostButton() {
+    const btn = document.getElementById('post-btn');
+    if (!btn) return;
+    const pr = S.pr?.available && S.pr.pr;
+    btn.classList.toggle('hidden', !pr?.own || !!S.static);
+    if (!pr) return;
+    btn.textContent = pr.comment ? `Update PR #${pr.number}…` : `Post to PR #${pr.number}…`;
+    btn.title = pr.problem || `Post this review as a comment on ${pr.repo}#${pr.number}`;
+}
+
+async function startPost() {
+    saveQuizAnswers(localQuizAnswers());
+    const st = await loadPr(true);
+    const pr = st?.pr;
+    if (!st?.available || !pr) { toast(st?.error || 'No pull request to post to.', 'error'); return; }
+    // Saved answers arrive just before the score is asked for.
+    const score = st.score || { right: 0, answered: 0, total: 0 };
+    const set = st.settings || {};
+    const concerns = S.data.concerns?.length || 0;
+    const lessons = (learnData()?.concepts || []).filter(c => c.lesson).length;
+    const done = score.total > 0 && score.answered === score.total;
+    const opt = (id, on, label, note, disabled = false, sub = false) =>
+        `<label class="check${sub ? ' sub' : ''}${disabled ? ' off' : ''}"><input type="checkbox" id="${id}"${on && !disabled ? ' checked' : ''}${disabled ? ' disabled' : ''}><span>${label}${note ? `<span class="opt-note">${note}</span>` : ''}</span></label>`;
+    showDialog({
+        title: `${pr.comment ? 'Update' : 'Post'} perspica's comment on PR #${pr.number}`,
+        body: `<p class="muted">One comment on <b>${esc(pr.repo)}#${pr.number}</b>, from your GitHub account${pr.me ? ` (${esc(pr.me)})` : ''}. Posting again updates it. Nothing from your agent sessions goes in: no prompts, no Decisions.</p>
+            ${pr.problem ? `<p class="setup-note">${esc(pr.problem)}</p>` : ''}
+            <div class="post-options">
+                ${opt('po-concerns', set.concerns, 'Concerns', concerns ? `${concerns} from Analyze` : 'None yet. Analyze first.', !concerns)}
+                ${opt('po-lessons', set.lessons, 'Lessons and quiz', lessons ? `${lessons} lesson${pl(lessons)}, ${score.total} question${pl(score.total)}` : 'None yet. Open Learn first.', !lessons)}
+                ${opt('po-score', set.quiz_score, 'My quiz score', done ? `${score.right} of ${score.total} right first try` : score.total ? `Answer all ${score.total} questions in Learn first. ${score.answered} so far.` : '', !done, true)}
+                ${opt('po-ask', set.ask_quiz, 'Ask reviewers to take the quiz before approving', pr.action ? 'The perspica check waits until one passes.' : 'Needs the perspica check in this repo: run <code>perspica github init</code>', !pr.action || !lessons, true)}
+            </div>
+            <div id="po-notes" class="post-notes"></div>
+            <div class="field-label">Preview <span class="muted" id="po-size"></span></div>
+            <div class="post-preview" id="po-preview"><span class="muted">Loading…</span></div>`,
+        actions: [
+            { label: 'Cancel' },
+            { label: pr.comment ? 'Update comment' : 'Post comment', primary: true, busy: 'Posting…', onClick: () => postComment(pr) },
+        ],
+    });
+    const box = document.querySelector('#dialog .post-options');
+    const sync = () => {
+        const l = document.getElementById('po-lessons');
+        for (const id of ['po-score', 'po-ask']) {
+            const el = document.getElementById(id);
+            const off = !l.checked || (id === 'po-score' ? !done : !pr.action);
+            el.disabled = off; el.closest('label').classList.toggle('off', off);
+        }
+        updatePostPreview();
+    };
+    box.addEventListener('change', sync);
+    if (pr.problem) document.querySelector('#dialog-actions .primary').disabled = true;
+    updatePostPreview();
+}
+
+function postSettings() {
+    const on = id => { const el = document.getElementById(id); return !!el && el.checked && !el.disabled; };
+    const prev = S.pr?.settings || {};
+    // A choice that can't be made now (no concerns yet, say) keeps what was saved, for next time.
+    const keep = (id, key) => document.getElementById(id)?.disabled ? !!prev[key] : on(id);
+    return { concerns: keep('po-concerns', 'concerns'), lessons: keep('po-lessons', 'lessons'), quiz_score: keep('po-score', 'quiz_score'), ask_quiz: keep('po-ask', 'ask_quiz') };
+}
+
+let previewTimer = 0, previewSeq = 0;
+function updatePostPreview() {
+    clearTimeout(previewTimer);
+    previewTimer = setTimeout(async () => {
+        const seq = ++previewSeq;
+        const box = document.getElementById('po-preview');
+        if (!box) return;
+        try {
+            const settings = postSettings();
+            // What's posted leaves out choices that can't apply now.
+            for (const [id, key] of [['po-concerns', 'concerns'], ['po-lessons', 'lessons'], ['po-score', 'quiz_score'], ['po-ask', 'ask_quiz']]) if (document.getElementById(id)?.disabled) settings[key] = false;
+            const resp = await fetch('/api/pr/preview', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ settings }) });
+            const p = await resp.json();
+            if (seq !== previewSeq) return;
+            if (!resp.ok) throw new Error(p.error || `HTTP ${resp.status}`);
+            box.innerHTML = p.html || `<pre>${esc(p.markdown)}</pre>`;
+            document.getElementById('po-size').textContent = `${p.chars.toLocaleString()} of 65,536 characters`;
+            document.getElementById('po-notes').innerHTML = (p.notes || []).map(n => `<p class="setup-note">${richText(n, false)}</p>`).join('');
+        } catch (e) { if (seq === previewSeq) box.innerHTML = `<p class="setup-note">Couldn't build the preview: ${esc(e.message)}</p>`; }
+    }, 150);
+}
+
+async function postComment(pr) {
+    const settings = postSettings();
+    const sent = { ...settings };
+    for (const [id, key] of [['po-concerns', 'concerns'], ['po-lessons', 'lessons'], ['po-score', 'quiz_score'], ['po-ask', 'ask_quiz']]) if (document.getElementById(id)?.disabled) sent[key] = false;
+    // Saved as chosen; sent as it can apply.
+    try {
+        const resp = await fetch('/api/pr/post', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ settings: sent }) });
+        const r = await resp.json();
+        if (!resp.ok) throw new Error(r.error || `HTTP ${resp.status}`);
+        await loadPr();
+        showDialog({
+            title: r.updated ? 'Comment updated' : 'Comment posted',
+            body: `<p>perspica's comment is on <a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(pr.repo)}#${pr.number}</a>.</p>
+                ${pr.action ? '' : '<p class="muted">Add the perspica check to this repo with <code>perspica github init</code>. It grades the reviewer quiz and gives every pull request a summary.</p>'}`,
+            actions: [{ label: 'Close', primary: true }],
+        });
+    } catch (e) {
+        document.getElementById('po-notes').innerHTML = `<p class="setup-note">Not posted: ${esc(e.message)}</p>`;
+    }
 }
 
 function showDialog({ title, body, actions }) {

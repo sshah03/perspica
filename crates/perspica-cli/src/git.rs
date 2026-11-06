@@ -574,6 +574,20 @@ pub fn no_index_diff(old: &str, new: &str) -> Option<String> {
     }
 }
 
+/// The commit a review describes, for posting it on its pull request, or why it isn't one commit.
+pub fn reviewed_commit(target: &Target) -> Result<String, String> {
+    match target {
+        Target::Range(_, b) => git_cmd(&["rev-parse", b]).map(|s| s.trim().to_string()),
+        Target::Branch { .. } => {
+            if git_cmd(&["status", "--porcelain", "--untracked-files=normal"]).is_ok_and(|s| !s.trim().is_empty()) {
+                return Err("This review includes changes that aren't committed. Commit and push them, then post.".into());
+            }
+            git_cmd(&["rev-parse", "HEAD"]).map(|s| s.trim().to_string())
+        }
+        _ => Err("Only a branch or a pull request can be posted.".into()),
+    }
+}
+
 /// PR metadata from the GitHub CLI.
 pub struct PrInfo {
     pub number: u64,

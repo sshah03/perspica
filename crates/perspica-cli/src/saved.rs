@@ -3,7 +3,7 @@
 //! analysis twice. Stored in the repository's git directory (`.git/perspica/`),
 //! or `~/.cache/perspica/` outside a repository.
 
-use crate::{decisions, intel, learn, MultiFileResult};
+use crate::{decisions, github, intel, learn, MultiFileResult};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -93,6 +93,36 @@ pub fn save_decisions(key: &str, d: &decisions::Decisions) {
     if let Err(e) = write("decisions", key, d) {
         eprintln!("perspica: couldn't save the decisions ({e}); they will be lost on restart");
     }
+}
+
+/// The author's own quiz answers for this diff, first try only.
+pub fn load_quiz(key: &str) -> Vec<github::QuizAnswer> {
+    read("quiz", key).unwrap_or_default()
+}
+
+/// Adds answers to questions not answered before. A later answer to the same question is a retry.
+pub fn add_quiz(key: &str, answers: &[github::QuizAnswer]) {
+    let mut all = load_quiz(key);
+    let before = all.len();
+    for a in answers {
+        if !all.iter().any(|b| b.concept == a.concept && b.question == a.question) {
+            all.push(a.clone());
+        }
+    }
+    if all.len() != before {
+        if let Err(e) = write("quiz", key, &all) {
+            eprintln!("perspica: couldn't save your quiz answers ({e})");
+        }
+    }
+}
+
+/// What the author last chose to put in a PR comment.
+pub fn load_post_settings() -> github::PostSettings {
+    read("post", "settings").unwrap_or_default()
+}
+
+pub fn save_post_settings(s: &github::PostSettings) {
+    let _ = write("post", "settings", s);
 }
 
 fn read<T: serde::de::DeserializeOwned>(kind: &str, key: &str) -> Option<T> {
