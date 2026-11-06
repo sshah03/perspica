@@ -64,6 +64,7 @@ Inside a repository:
 perspica                 # review your current branch: commits, uncommitted and untracked files
 perspica --web           # …in the browser
 perspica --pr 123 --web  # a GitHub pull request (uses the `gh` CLI)
+perspica --pr 123 --post # post the review on your own pull request
 ```
 
 Other targets:
@@ -149,10 +150,31 @@ The **Decisions** tab shows how a change you made with Claude Code or Codex was 
 
 It only works for your own changes, with the sessions on this machine: uncommitted work, or commits you authored. A session counts when it edited the changed files, and perspica reads it up to where it moved on to other work. **Find decisions…** sends the session and the changed code to your LLM in one request, which takes about a minute. The result is saved in `.git/perspica/`. Shared `--format html` pages leave Decisions out, since it quotes your sessions.
 
+## On your pull request
+
+Post the review on your pull request as one comment, so reviewers get it without installing anything. Run `perspica --pr 123 --post`, or click **Post to PR #123…** in the viewer when the review is of your own branch or PR. You see a preview first, and posting again updates the same comment. It uses the `gh` CLI and your GitHub login.
+
+The comment is short: the counts, then folded sections for the reading order, Analyze's concerns, the lessons and the quiz. Tick what goes in. perspica remembers your choices.
+
+- **Your quiz score.** Once you've answered every question in Learn, the comment can say how many you got right first try.
+- **Ask reviewers to take the quiz.** The comment asks reviewers to take the quiz before approving. They answer by replying `/quiz 1a 2c 3b`. The perspica check grades the answers, replies with what they missed, and waits until a reviewer passes. To keep the PR from merging until then, make `perspica` a required check in the repo's branch settings. It's an honor system: the answers are in the comment's data, so the check shows someone took the quiz, not proof they understood.
+
+Nothing from your agent sessions goes in: no prompts, no Decisions, no marks for what you asked for.
+
+### The perspica check
+
+`perspica github init` writes `.github/workflows/perspica.yml`. Once it's on your default branch, every pull request gets a **perspica** check:
+
+- With the author's comment: the summary, reading order, concerns and lessons on the check's page, and the quiz status.
+- Without one: perspica's structural review, which needs no model. That's what's mechanical, what's tests, which files are safe to skim, and references or calls the change may have broken, marked on their lines.
+
+It never runs the pull request's code, so it works on PRs from forks. On private repos it uses a little of your Actions minutes.
+
 ## Privacy
 
 - Everything initially runs locally. Nothing is sent anywhere unless you ask for it: `-s` / **Analyze…**, **Find concepts…** in Learn (after that, opening a concept writes its lesson), or **Find decisions…**.
 - Agent sessions (`~/.claude/projects`, `~/.codex/sessions`) are read only for **your own** changes (uncommitted work, or commits authored with your git identity), never for someone else's PR. perspica says when it uses them; `--no-sessions` turns this off.
+- `--post` and **Post to PR…** send only the analysis, lessons and quiz to GitHub, after a preview. Your sessions stay on your machine.
 - The web viewer listens on `127.0.0.1` and only answers its own page: other hosts (DNS rebinding) and other sites' requests are refused.
 - Learn's interactive pieces are written by the model, so they run in a sandboxed frame that can't reach the network or the rest of the page.
 

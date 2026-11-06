@@ -417,6 +417,28 @@ body.sidebar-collapsed #sidebar { display: none; }
 .sent summary { cursor: pointer; color: var(--text-2); }
 .sent ul { margin-top: 4px; }
 .modal-content:has(.choices) { width: min(520px, 100%); }
+/* Posting on the pull request */
+.modal-content:has(.post-preview) { width: min(760px, 100%); }
+.post-options { display: grid; gap: 6px; }
+.post-options .check { display: flex; gap: 8px; align-items: flex-start; font-size: var(--font-size-sm); color: var(--text-0); cursor: pointer; }
+.post-options .check input { margin-top: 2px; accent-color: var(--accent); }
+.post-options .check.sub { padding-left: 22px; }
+.post-options .check.off { color: var(--text-3); cursor: default; }
+.post-options .check > span { display: grid; gap: 1px; }
+.post-options .opt-note { color: var(--text-2); font-size: var(--font-size-xs); }
+.post-options .check.off .opt-note { color: var(--text-3); }
+.post-notes:empty { display: none; }
+.post-notes { display: grid; gap: 4px; }
+.post-preview { max-height: 42vh; overflow: auto; padding: 12px 16px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-0); font-size: var(--font-size-ui); line-height: 1.5; color: var(--text-1); }
+.post-preview > :first-child { margin-top: 0; }
+.post-preview p, .post-preview details { margin: 0 0 10px; }
+.post-preview summary { cursor: pointer; color: var(--text-0); font-weight: 500; }
+.post-preview details[open] > summary { margin-bottom: 6px; }
+.post-preview ul, .post-preview ol { margin: 0 0 8px; padding-left: 22px; }
+.post-preview code { font-family: var(--font-mono); font-size: 12px; padding: 1px 4px; border-radius: 4px; background: var(--bg-2); }
+.post-preview pre { white-space: pre-wrap; font-family: var(--font-mono); font-size: 12px; margin: 0; }
+.post-preview sub { color: var(--text-2); }
+.post-preview a { color: var(--accent); }
 .ov-llm { font-size: var(--font-size-sm); color: var(--text-2); display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .ov-llm.error { color: var(--diff-del-fg); }
 
