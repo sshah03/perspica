@@ -579,7 +579,7 @@ fn render(s: &Stamp, graded: bool) -> String {
         let title = if s.require_quiz { "Quiz, required" } else { "Quiz, optional" };
         out.push(fold(format!("{title} ({})", plural(s.quiz.len(), "question", "questions")), body.join("\n\n")));
     }
-    out.push(format!("<sub>Posted with [perspica]({HOME}) from the author's machine, for {}.</sub>", short(&s.sha)));
+    out.push(format!("<sub>Posted with [perspica]({HOME}) from the author's machine. It covers the whole pull request, up to {}.</sub>", short(&s.sha)));
     out.push(format!("{DATA}{} -->", encode(s)));
     out.join("\n\n")
 }
@@ -937,7 +937,7 @@ pub fn check_run(stamp: Option<&Stamp>, head: &str, graded: &[Graded], own: Opti
         out.push(format!("{}\n", author_badge(r, t)));
     }
     if fresh.is_none() {
-        out.push(format!("> The author posted this for {}. The pull request has newer commits, so parts of it may be out of date.\n", short(&s.sha)));
+        out.push(format!("> The author posted this when the pull request went up to {}. It has newer commits since, so parts of it may be out of date.\n", short(&s.sha)));
     }
     if let Some(sum) = &s.summary {
         out.push(format!("{}\n", shown.linked(sum)));
@@ -955,7 +955,7 @@ pub fn check_run(stamp: Option<&Stamp>, head: &str, graded: &[Graded], own: Opti
         }
         section(&mut out, ("Quiz".into(), q.join("\n")));
     }
-    out.push(format!("<sub>perspica {}, posted from the author's machine for {}.</sub>", s.version, short(&s.sha)));
+    out.push(format!("<sub>perspica {}, posted from the author's machine. It covers the whole pull request, up to {}.</sub>", s.version, short(&s.sha)));
     Some(CheckRun { status, conclusion, title, summary: fit_summary(out.join("\n")), annotations: cap(&shown.annotations) })
 }
 
@@ -1267,6 +1267,7 @@ mod tests {
         assert_eq!(back.sha, s.sha);
         assert!(c.contains("**perspica** · 2 changes to review, 1 worth a careful look · 218 of 1,326 changed lines are mechanical · 1 place may need updating"));
         assert!(c.contains("**Quiz required.**"));
+        assert!(c.contains("It covers the whole pull request, up to abcdef1."), "the commit marks how far the review goes, not what it's about");
         assert!(c.contains("![The author took the quiz: 2 of 2 right first try](https://img.shields.io/badge/author%27s%20quiz-2%20of%202%20right%20first%20try-2ea44f)"), "{c}");
         assert!(c.contains("/quiz 1a 2b"), "graded quizzes ask for a reply");
         assert!(!c.contains("<summary>Answer</summary>"), "and don't show the answers");
@@ -1417,7 +1418,7 @@ mod tests {
     fn an_older_comment_is_marked_and_its_lines_left_out() {
         let s = sample();
         let c = check_run(Some(&s), "fffffff", &[], None, 7).unwrap();
-        assert!(c.summary.contains("The author posted this for abcdef1."));
+        assert!(c.summary.contains("The author posted this when the pull request went up to abcdef1."));
         assert!(c.annotations.is_empty(), "line numbers from another commit would point at the wrong lines");
         let own = Stamp { sha: "fffffff".into(), files: 5, changed_lines: 10, annotations: vec![Annotation { path: "b.rs".into(), line: 9, ..Default::default() }], ..Default::default() };
         let c = check_run(Some(&s), "fffffff", &[], Some(&own), 7).unwrap();
