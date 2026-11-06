@@ -541,7 +541,7 @@ fn quiz_example(n: usize) -> String {
 /// The author's score as a badge, like a repo's build badge. The image has the same words, for when it doesn't load.
 fn author_badge(right: usize, total: usize) -> String {
     let color = if right * 5 >= total * 4 { "2ea44f" } else { "dbab09" };
-    format!("![The author took the quiz: {right} of {total} right first try](https://img.shields.io/badge/author%27s%20quiz-{right}%20of%20{total}%20right%20first%20try-{color})")
+    format!("![The author took the quiz: {right} of {total} right first try](https://img.shields.io/badge/author%27s%20quiz%20results-{right}%20of%20{total}%20right%20first%20try-{color})")
 }
 
 fn render(s: &Stamp, graded: bool) -> String {
@@ -549,10 +549,10 @@ fn render(s: &Stamp, graded: bool) -> String {
     if let Some(sum) = &s.summary {
         out.push(s.linked(sum));
     }
-    let mut lines = vec![];
     if let Some((right, total)) = s.author_score {
-        lines.push(author_badge(right, total));
+        out.push(author_badge(right, total));
     }
+    let mut lines = vec![];
     let n = plural(s.quiz.len(), "question", "questions");
     let example = quiz_example(s.quiz.len());
     // How to take it, right where it's asked for: the questions are folded away at the bottom.
@@ -941,7 +941,7 @@ pub fn check_run(stamp: Option<&Stamp>, head: &str, graded: &[Graded], own: Opti
             shown.annotations.clear();
         }
     }
-    let author = s.author_score.map(|(r, t)| format!("Author's quiz {r}/{t}")).unwrap_or_default();
+    let author = s.author_score.map(|(r, t)| format!("Author's quiz results {r}/{t}")).unwrap_or_default();
     let title = [lead, author, shown.headline()].into_iter().filter(|t| !t.is_empty()).collect::<Vec<_>>().join(" · ");
     let mut out = vec![];
     if let Some((r, t)) = s.author_score {
@@ -1281,7 +1281,7 @@ mod tests {
         let top = c.lines().find(|l| l.starts_with("**Quiz required.**")).unwrap();
         assert!(top.contains("reply to this pull request with `/quiz` and your answers, like `/quiz 1a 2b`"), "the ask says how: {top}");
         assert!(c.contains("It covers the whole pull request, up to abcdef1."), "the commit marks how far the review goes, not what it's about");
-        assert!(c.contains("![The author took the quiz: 2 of 2 right first try](https://img.shields.io/badge/author%27s%20quiz-2%20of%202%20right%20first%20try-2ea44f)"), "{c}");
+        assert!(c.contains("![The author took the quiz: 2 of 2 right first try](https://img.shields.io/badge/author%27s%20quiz%20results-2%20of%202%20right%20first%20try-2ea44f)"), "{c}");
         assert!(c.contains("/quiz 1a 2b"), "graded quizzes ask for a reply");
         assert!(!c.contains("<summary>Answer</summary>"), "and don't show the answers");
         let p = preview(&s, true);
@@ -1408,7 +1408,7 @@ mod tests {
         let s = sample();
         let waiting = check_run(Some(&s), &s.sha, &[], None, 7).unwrap();
         assert_eq!((waiting.status, waiting.conclusion), ("in_progress", None));
-        assert!(waiting.title.starts_with("Waiting on a reviewer's quiz · Author's quiz 2/2 · 2 changes"), "{}", waiting.title);
+        assert!(waiting.title.starts_with("Waiting on a reviewer's quiz · Author's quiz results 2/2 · 2 changes"), "{}", waiting.title);
         assert_eq!(waiting.annotations.len(), 1);
         let g = grade(None, &s.quiz, &s.quiz_id(), "rev", &[(0, 1), (1, 0)]);
         let done = check_run(Some(&s), &s.sha, &[g], None, 7).unwrap();
@@ -1423,7 +1423,7 @@ mod tests {
         let g = grade(None, &s.quiz, &s.quiz_id(), "rev", &[(0, 1), (1, 0)]);
         let passed = check_run(Some(&optional), &s.sha, &[g], None, 7).unwrap();
         assert_eq!(passed.conclusion, Some("neutral"));
-        assert!(passed.title.starts_with("Quiz passed by rev · Author's quiz 2/2 · "), "{}", passed.title);
+        assert!(passed.title.starts_with("Quiz passed by rev · Author's quiz results 2/2 · "), "{}", passed.title);
         assert!(comment(&optional, true).contains("**Quiz suggested.**"));
     }
 
