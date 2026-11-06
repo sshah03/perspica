@@ -7,7 +7,7 @@ on:
     types: [opened, synchronize, edited]
 permissions:
   contents: read
-  pull-requests: read
+  pull-requests: write
   issues: write
   checks: write
 concurrency:

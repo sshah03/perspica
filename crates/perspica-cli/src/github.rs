@@ -906,7 +906,8 @@ on:
     types: [created, edited]
 permissions:
   contents: read
-  pull-requests: read
+  # Replies to quiz answers. Commenting on a pull request needs this, not just issues: write.
+  pull-requests: write
   issues: write
   checks: write
 concurrency:
@@ -1171,6 +1172,7 @@ mod tests {
         let w = workflow();
         assert!(w.contains(&format!("PERSPICA_VERSION={}", env!("CARGO_PKG_VERSION"))));
         assert!(w.contains("${{ github.token }}") && w.contains("pull_request_target"));
+        assert!(w.contains("pull-requests: write"), "the Action replies to quiz answers on the pull request");
         assert!(!w.contains("ref: ${{ github.event.pull_request.head"), "never checks out the PR's code as the workspace");
     }
 }
