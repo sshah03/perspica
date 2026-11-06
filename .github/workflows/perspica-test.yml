@@ -1,0 +1,42 @@
+# Only on the test branch. It runs this branch's own perspica, since the real workflow installs a release
+# and runs from the default branch. Comment events only reach workflows on the default branch, so a
+# reviewer's /quiz reply is played back from PR description lines that start with "test-reviewer: ".
+name: perspica (branch test)
+on:
+  pull_request:
+    types: [opened, synchronize, edited]
+permissions:
+  contents: read
+  pull-requests: read
+  issues: write
+  checks: write
+concurrency:
+  group: perspica-test-${{ github.event.pull_request.number }}
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked -p perspica
+      - name: Update the perspica check
+        run: target/debug/perspica github action
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+      - name: Play back reviewer replies
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+          BODY: ${{ github.event.pull_request.body }}
+          NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          printf '%s\n' "$BODY" | tr -d '\r' | grep '^test-reviewer: ' | sed 's/^test-reviewer: //' | while IFS= read -r reply; do
+            jq -n --arg body "$reply" --argjson n "$NUMBER" \
+              '{action: "created", issue: {number: $n, pull_request: {}}, comment: {user: {login: "test-reviewer"}, body: $body}}' > "$RUNNER_TEMP/comment.json"
+            GITHUB_EVENT_NAME=issue_comment GITHUB_EVENT_PATH="$RUNNER_TEMP/comment.json" target/debug/perspica github action
+          done
