@@ -533,6 +533,11 @@ pub fn preview(s: &Stamp, graded: bool) -> String {
     c.lines().filter(|l| !l.starts_with(DATA) && *l != MARK).collect::<Vec<_>>().join("\n").trim().to_string()
 }
 
+/// `1a 2b 3c`, for as many questions as there are, up to four.
+fn quiz_example(n: usize) -> String {
+    (1..=n.min(4)).map(|i| format!("{i}{}", LETTERS[(i - 1) % 4] as char)).collect::<Vec<_>>().join(" ")
+}
+
 /// The author's score as a badge, like a repo's build badge. The image has the same words, for when it doesn't load.
 fn author_badge(right: usize, total: usize) -> String {
     let color = if right * 5 >= total * 4 { "2ea44f" } else { "dbab09" };
@@ -549,10 +554,17 @@ fn render(s: &Stamp, graded: bool) -> String {
         lines.push(author_badge(right, total));
     }
     let n = plural(s.quiz.len(), "question", "questions");
+    let example = quiz_example(s.quiz.len());
+    // How to take it, right where it's asked for: the questions are folded away at the bottom.
+    let how = if graded {
+        format!("Open **Quiz** at the bottom, then reply to this pull request with `/quiz` and your answers, like `/quiz {example}`. perspica grades them and replies.")
+    } else {
+        "Open **Quiz** at the bottom. Each question's answer is folded under it.".to_string()
+    };
     if s.require_quiz {
-        lines.push(format!("**Quiz required.** The author asks a reviewer to pass the quiz below ({n}) before this merges. The perspica check waits until one does."));
+        lines.push(format!("**Quiz required.** The author asks a reviewer to pass the quiz ({n}) before this merges. The perspica check waits until one does. {how}"));
     } else if s.ask_quiz {
-        lines.push(format!("**Quiz suggested.** The author suggests reviewers take the quiz below ({n}) before approving. It's optional."));
+        lines.push(format!("**Quiz suggested.** The author suggests reviewers take the quiz ({n}) before approving. It's optional. {how}"));
     }
     if !lines.is_empty() {
         out.push(lines.join("\n"));
@@ -572,9 +584,8 @@ fn render(s: &Stamp, graded: bool) -> String {
             }
             body.push(item);
         }
-        let example = (1..=s.quiz.len().min(3)).map(|n| format!("{n}{}", LETTERS[(n - 1) % 3] as char)).collect::<Vec<_>>().join(" ");
         if graded {
-            body.push(format!("Reply with `/quiz` and your answers, like `/quiz {example}`. The perspica check grades them."));
+            body.push(format!("Reply to this pull request with `/quiz` and your answers, like `/quiz {}`. perspica grades them and replies. You can answer some now and the rest later.", quiz_example(s.quiz.len())));
         }
         let title = if s.require_quiz { "Quiz, required" } else { "Quiz, optional" };
         out.push(fold(format!("{title} ({})", plural(s.quiz.len(), "question", "questions")), body.join("\n\n")));
@@ -1267,6 +1278,8 @@ mod tests {
         assert_eq!(back.sha, s.sha);
         assert!(c.contains("**perspica** · 2 changes to review, 1 worth a careful look · 218 of 1,326 changed lines are mechanical · 1 place may need updating"));
         assert!(c.contains("**Quiz required.**"));
+        let top = c.lines().find(|l| l.starts_with("**Quiz required.**")).unwrap();
+        assert!(top.contains("reply to this pull request with `/quiz` and your answers, like `/quiz 1a 2b`"), "the ask says how: {top}");
         assert!(c.contains("It covers the whole pull request, up to abcdef1."), "the commit marks how far the review goes, not what it's about");
         assert!(c.contains("![The author took the quiz: 2 of 2 right first try](https://img.shields.io/badge/author%27s%20quiz-2%20of%202%20right%20first%20try-2ea44f)"), "{c}");
         assert!(c.contains("/quiz 1a 2b"), "graded quizzes ask for a reply");
