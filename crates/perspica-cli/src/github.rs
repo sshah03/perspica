@@ -286,7 +286,7 @@ pub fn stamp(multi: &MultiFileResult, settings: &PostSettings, score: Score, sha
         path: b.reference_file.clone(),
         line: b.reference_location.line_start.max(1),
         title: format!("`{}` {}", b.symbol_name, if b.renamed_from.is_some() { "was renamed" } else { "was removed" }),
-        message: b.reason.clone(),
+        message: capitalized(&b.reason),
         in_diff: changed.contains(b.reference_file.as_str()),
     }).collect();
     for s in &cf.signature_impacts {
@@ -326,6 +326,11 @@ pub fn stamp(multi: &MultiFileResult, settings: &PostSettings, score: Score, sha
         quiz,
         annotations,
     }
+}
+
+fn capitalized(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
 }
 
 fn plural(n: usize, one: &str, many: &str) -> String {
@@ -461,7 +466,8 @@ impl Stamp {
         if !self.annotations.is_empty() {
             let body = self.annotations.iter().map(|a| {
                 let at = if a.in_diff { self.link(&Span { name: String::new(), path: a.path.clone(), start: a.line, end: a.line, old: false }) } else { self.line_link(&a.path, a.line) };
-                format!("- {at}: {}. {}", a.title, a.message)
+                // A removed name's reason already says what happened. A changed call's says how it changed.
+                if a.message.contains(&a.title[..a.title.rfind('`').map_or(0, |i| i + 1)]) { format!("- {at}: {}.", a.message.trim_end_matches('.')) } else { format!("- {at}: {}: {}.", a.title, a.message.trim_end_matches('.')) }
             }).collect::<Vec<_>>().join("\n");
             out.push((format!("May need updating ({})", self.annotations.len()), body));
         }
