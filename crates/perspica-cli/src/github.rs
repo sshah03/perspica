@@ -797,6 +797,8 @@ pub struct Graded {
     pub first: Vec<Option<usize>>,
     /// Whether they've answered it right yet.
     pub right: Vec<bool>,
+    /// The replies and reviews graded so far (`c<id>`, `r<id>`), so none is graded twice.
+    pub answered: Vec<String>,
 }
 
 impl Graded {
@@ -833,7 +835,7 @@ pub fn parse_answers(body: &str) -> Option<Vec<(usize, usize)>> {
 /// Adds a reply's answers to what the reviewer answered before.
 pub fn grade(prev: Option<Graded>, quiz: &[learn::Question], quiz_id: &str, user: &str, answers: &[(usize, usize)]) -> Graded {
     let mut g = prev.filter(|g| g.quiz == quiz_id && g.first.len() == quiz.len())
-        .unwrap_or_else(|| Graded { quiz: quiz_id.into(), user: user.into(), first: vec![None; quiz.len()], right: vec![false; quiz.len()] });
+        .unwrap_or_else(|| Graded { quiz: quiz_id.into(), user: user.into(), first: vec![None; quiz.len()], right: vec![false; quiz.len()], answered: vec![] });
     for &(i, k) in answers {
         let Some(q) = quiz.get(i) else { continue };
         if k >= q.choices.len() { continue; }
@@ -841,6 +843,11 @@ pub fn grade(prev: Option<Graded>, quiz: &[learn::Question], quiz_id: &str, user
         g.right[i] |= k == q.answer;
     }
     g
+}
+
+/// The Action's note when someone approves before passing a quiz the author required.
+pub fn approved_early(user: &str) -> String {
+    format!("@{user} approved, but hasn't passed the quiz yet, so the perspica check is still waiting. Reply with `/quiz` and your answers to take it.")
 }
 
 /// The Action's reply to a reviewer's answers.
@@ -874,13 +881,32 @@ pub fn reply(g: &Graded, quiz: &[learn::Question], answers: &[(usize, usize)]) -
 
 #[derive(Debug, Clone)]
 pub struct IssueComment {
+    /// `c<id>` for a comment, `r<id>` for a review.
+    pub key: String,
     pub user: String,
     pub body: String,
+    /// When it was posted (ISO 8601, so it sorts as text).
+    pub at: String,
 }
 
 /// The newest comment perspica posted for the PR's author.
 pub fn latest_stamp(comments: &[IssueComment], author: &str) -> Option<Stamp> {
     comments.iter().rev().filter(|c| c.user.eq_ignore_ascii_case(author) && c.body.contains(MARK)).find_map(|c| decode(&c.body, DATA))
+}
+
+/// Quiz answers nobody has graded yet, oldest first: in replies and in reviews, from anyone but the Action,
+/// and from anyone but the author unless `author_too`. Grading them all on every run means an answer whose
+/// event was missed (a review on a fork, say) is still graded on the next one.
+pub fn ungraded<'a>(sources: &'a [IssueComment], comments: &[IssueComment], author: &str, author_too: bool) -> Vec<&'a IssueComment> {
+    let marks: Vec<(Graded, &str)> = comments.iter().filter(|c| c.user == BOT).filter_map(|c| Some((decode::<Graded>(&c.body, GRADED)?, c.at.as_str()))).collect();
+    let done = |src: &IssueComment| marks.iter().any(|(g, at)| g.answered.contains(&src.key)
+        // Gradings from before replies were tracked cover everything that person posted until then.
+        || (g.answered.is_empty() && g.user == src.user && src.at.as_str() <= *at));
+    let mut out: Vec<&IssueComment> = sources.iter()
+        .filter(|c| c.user != BOT && (author_too || !c.user.eq_ignore_ascii_case(author)) && parse_answers(&c.body).is_some() && !done(c))
+        .collect();
+    out.sort_by(|a, b| a.at.cmp(&b.at));
+    out
 }
 
 /// Each reviewer's latest grading for this quiz, from the Action's own replies.
@@ -1026,8 +1052,27 @@ impl Api {
             let v = self.send(reqwest::Method::GET, &format!("issues/{pr}/comments?per_page=100&page={page}"), None).await?;
             let items = v.as_array().cloned().unwrap_or_default();
             out.extend(items.iter().map(|c| IssueComment {
+                key: format!("c{}", c["id"]),
                 user: c["user"]["login"].as_str().unwrap_or_default().to_string(),
                 body: c["body"].as_str().unwrap_or_default().to_string(),
+                at: c["created_at"].as_str().unwrap_or_default().to_string(),
+            }));
+            if items.len() < 100 { break; }
+        }
+        Ok(out)
+    }
+
+    /// Reviews with a message: a reviewer can answer the quiz as they approve.
+    async fn reviews(&self, pr: u64) -> Result<Vec<IssueComment>, String> {
+        let mut out = vec![];
+        for page in 1..=10 {
+            let v = self.send(reqwest::Method::GET, &format!("pulls/{pr}/reviews?per_page=100&page={page}"), None).await?;
+            let items = v.as_array().cloned().unwrap_or_default();
+            out.extend(items.iter().filter(|r| r["body"].as_str().is_some_and(|b| !b.trim().is_empty())).map(|r| IssueComment {
+                key: format!("r{}", r["id"]),
+                user: r["user"]["login"].as_str().unwrap_or_default().to_string(),
+                body: r["body"].as_str().unwrap_or_default().to_string(),
+                at: r["submitted_at"].as_str().unwrap_or_default().to_string(),
             }));
             if items.len() < 100 { break; }
         }
@@ -1052,7 +1097,7 @@ async fn run_action() -> Result<(), String> {
     let event_name = env("GITHUB_EVENT_NAME")?;
     let event: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(env("GITHUB_EVENT_PATH")?).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     let number = match event_name.as_str() {
-        "pull_request" | "pull_request_target" => event["pull_request"]["number"].as_u64(),
+        "pull_request" | "pull_request_target" | "pull_request_review" => event["pull_request"]["number"].as_u64(),
         "issue_comment" if !event["issue"]["pull_request"].is_null() => event["issue"]["number"].as_u64(),
         _ => None,
     };
@@ -1067,24 +1112,45 @@ async fn run_action() -> Result<(), String> {
     let mut comments = api.comments(number).await?;
     let stamp = latest_stamp(&comments, &author);
 
-    // A reviewer's quiz answers.
+    let author_too = std::env::var_os("PERSPICA_DEMO_AUTHOR_ANSWERS").is_some();
+    let say = |text: String| {
+        let api = &api;
+        async move { api.send(reqwest::Method::POST, &format!("issues/{number}/comments"), Some(serde_json::json!({ "body": text }))).await.map(|_| text) }
+    };
+    // Quiz answers this event brings that can't be graded get a short note instead.
     if event_name == "issue_comment" && event["action"] == "created" {
         let c = &event["comment"];
         let user = c["user"]["login"].as_str().unwrap_or_default();
-        if let Some(answers) = parse_answers(c["body"].as_str().unwrap_or_default()).filter(|_| user != BOT) {
-            let text = match &stamp {
-                None => "There's no perspica quiz on this pull request yet.".to_string(),
-                Some(s) if s.quiz.is_empty() => "The perspica comment on this pull request has no quiz.".to_string(),
-                // Demo build only: lets a one-person demo take the reviewer's side.
-                Some(_) if user.eq_ignore_ascii_case(&author) && std::env::var_os("PERSPICA_DEMO_AUTHOR_ANSWERS").is_none() => "The quiz here is for reviewers. Your own score comes from perspica on your machine when you post.".to_string(),
-                Some(s) => {
-                    let id = s.quiz_id();
-                    let prev = gradings(&comments, &id).into_iter().find(|g| g.user == user);
-                    reply(&grade(prev, &s.quiz, &id, user, &answers), &s.quiz, &answers)
-                }
+        if parse_answers(c["body"].as_str().unwrap_or_default()).is_some() && user != BOT {
+            let note = match &stamp {
+                None => Some("There's no perspica quiz on this pull request yet."),
+                Some(s) if s.quiz.is_empty() => Some("The perspica comment on this pull request has no quiz."),
+                Some(_) if user.eq_ignore_ascii_case(&author) && !author_too => Some("The quiz here is for reviewers. Your own score comes from perspica on your machine when you post."),
+                _ => None,
             };
-            api.send(reqwest::Method::POST, &format!("issues/{number}/comments"), Some(serde_json::json!({ "body": text }))).await?;
-            comments.push(IssueComment { user: BOT.into(), body: text });
+            if let Some(n) = note { say(n.to_string()).await?; }
+        }
+    }
+    // Every answer not graded yet, in replies and reviews, oldest first.
+    if let Some(s) = stamp.as_ref().filter(|s| !s.quiz.is_empty()) {
+        let id = s.quiz_id();
+        let mut sources = comments.clone();
+        sources.extend(api.reviews(number).await?);
+        let todo: Vec<IssueComment> = ungraded(&sources, &comments, &author, author_too).into_iter().cloned().collect();
+        for src in todo {
+            let Some(answers) = parse_answers(&src.body) else { continue };
+            let prev = gradings(&comments, &id).into_iter().find(|g| g.user == src.user);
+            let mut g = grade(prev, &s.quiz, &id, &src.user, &answers);
+            g.answered.push(src.key.clone());
+            let text = say(reply(&g, &s.quiz, &answers)).await?;
+            comments.push(IssueComment { key: String::new(), user: BOT.into(), body: text, at: src.at.clone() });
+        }
+        // Approving before passing a required quiz is allowed, but the check keeps waiting. Say so.
+        if event_name == "pull_request_review" && event["review"]["state"] == "approved" && s.require_quiz {
+            let user = event["review"]["user"]["login"].as_str().unwrap_or_default();
+            if !gradings(&comments, &id).iter().any(|g| g.user == user && g.passed()) {
+                say(approved_early(user)).await?;
+            }
         }
     }
 
@@ -1157,6 +1223,10 @@ on:
     types: [opened, synchronize, reopened]
   issue_comment:
     types: [created, edited]
+  # Reviewers can answer the quiz as they approve. On a PR from a fork this event can't write, so those
+  # answers are graded on the next event instead.
+  pull_request_review:
+    types: [submitted]
 permissions:
   contents: read
   # Replies to quiz answers. Commenting on a pull request needs this, not just issues: write.
@@ -1169,11 +1239,16 @@ jobs:
   update:
     # Comments only matter on pull requests: perspica's own, and quiz answers.
     if: >-
-      github.event_name == 'pull_request_target' ||
-      (github.event.issue.pull_request && (contains(github.event.comment.body, 'perspica:data') || startsWith(github.event.comment.body, '/quiz')))
+      github.event_name == 'pull_request_target' || github.event_name == 'pull_request_review' ||
+      (github.event.issue.pull_request && (contains(github.event.comment.body, 'perspica:data') || contains(github.event.comment.body, '/quiz')))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Show the answers were seen
+        if: github.event_name == 'issue_comment' && contains(github.event.comment.body, '/quiz')
+        run: gh api -X POST "repos/${{{{ github.repository }}}}/issues/comments/${{{{ github.event.comment.id }}}}/reactions" -f content=eyes --silent || true
+        env:
+          GH_TOKEN: ${{{{ github.token }}}}
       - uses: actions/checkout@v4
         if: github.event_name == 'pull_request_target'
         with:
@@ -1391,16 +1466,44 @@ mod tests {
         let g = grade(None, &s.quiz, &id, "rev", &[(0, 1), (1, 0)]);
         let forged = reply(&g, &s.quiz, &[]);
         let comments = vec![
-            IssueComment { user: "someone".into(), body: posted.replace("abcdef", "000000") },
-            IssueComment { user: "Author".into(), body: posted.clone() },
-            IssueComment { user: "rev".into(), body: forged.clone() },
-            IssueComment { user: BOT.into(), body: forged },
+            IssueComment { key: String::new(), user: "someone".into(), body: posted.replace("abcdef", "000000"), at: String::new() },
+            IssueComment { key: String::new(), user: "Author".into(), body: posted.clone(), at: String::new() },
+            IssueComment { key: String::new(), user: "rev".into(), body: forged.clone(), at: String::new() },
+            IssueComment { key: String::new(), user: BOT.into(), body: forged, at: String::new() },
         ];
         assert_eq!(latest_stamp(&comments, "author").unwrap().sha, s.sha);
         let found = gradings(&comments, &id);
         assert_eq!(found.len(), 1);
         assert!(found[0].passed());
         assert!(gradings(&comments, "older quiz").is_empty());
+    }
+
+    #[test]
+    fn every_answer_is_graded_once_from_replies_and_reviews() {
+        let s = sample();
+        let id = s.quiz_id();
+        let note = |key: &str, user: &str, body: &str, at: &str| IssueComment { key: key.into(), user: user.into(), body: body.into(), at: at.into() };
+        let mut first = grade(None, &s.quiz, &id, "rev", &[(0, 0)]);
+        // A grading from before replies were tracked: it has no keys.
+        let legacy = note("c2", BOT, &reply(&first, &s.quiz, &[(0, 0)]), "2026-01-01T10:01:00Z");
+        first.answered.push("c9".into());
+        let tracked = note("c3", BOT, &reply(&first, &s.quiz, &[(0, 0)]), "2026-01-01T10:02:00Z");
+        let comments = vec![
+            note("c1", "rev", "/quiz 1a", "2026-01-01T10:00:00Z"),
+            legacy,
+            tracked,
+            note("c4", "rev", "  /quiz 2a  ", "2026-01-01T10:05:00Z"),
+            note("c5", "author", "/quiz 1b", "2026-01-01T10:06:00Z"),
+            note("c6", "other", "looks good", "2026-01-01T10:07:00Z"),
+            note("c9", "rev", "/quiz 1a", "2026-01-01T10:08:00Z"),
+        ];
+        let mut sources = comments.clone();
+        sources.push(note("r1", "rev", "/quiz 1b 2a", "2026-01-01T10:06:30Z"));
+        let todo: Vec<&str> = ungraded(&sources, &comments, "author", false).iter().map(|c| c.key.as_str()).collect();
+        assert_eq!(todo, vec!["c4", "r1"], "leading spaces and reviews count; graded ones and the author's don't");
+        let with_author: Vec<&str> = ungraded(&sources, &comments, "author", true).iter().map(|c| c.key.as_str()).collect();
+        assert_eq!(with_author, vec!["c4", "c5", "r1"]);
+        assert!(approved_early("rev").starts_with("@rev approved, but hasn't passed the quiz yet"));
     }
 
     #[test]
@@ -1472,6 +1575,8 @@ mod tests {
         assert!(w.contains(&format!("PERSPICA_VERSION={}", env!("CARGO_PKG_VERSION"))));
         assert!(w.contains("${{ github.token }}") && w.contains("pull_request_target"));
         assert!(w.contains("pull-requests: write"), "the Action replies to quiz answers on the pull request");
+        assert!(w.contains("contains(github.event.comment.body, '/quiz')") && !w.contains("startsWith"), "a reply with spaces before /quiz still runs it");
+        assert!(w.contains("pull_request_review:") && w.contains("content=eyes"));
         assert!(!w.contains("ref: ${{ github.event.pull_request.head"), "never checks out the PR's code as the workspace");
     }
 }
