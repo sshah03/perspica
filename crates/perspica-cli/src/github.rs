@@ -62,27 +62,43 @@ pub struct QuizAnswer {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
 pub struct Score {
+    /// Right on the first try.
     pub right: usize,
     pub answered: usize,
     pub total: usize,
+    /// Right on the latest try, after any retakes.
+    #[serde(default)]
+    pub latest: usize,
+    /// How many times the most retaken question was answered.
+    #[serde(default)]
+    pub tries: usize,
 }
 
 impl Score {
     pub fn complete(&self) -> bool {
         self.total > 0 && self.answered == self.total
     }
+
+    /// Every question right on the latest try.
+    pub fn passed(&self) -> bool {
+        self.complete() && self.latest == self.total
+    }
 }
 
-/// The author's first-try score on the lessons written so far.
+/// The author's score on the lessons written so far: first tries, and the latest tries after retakes.
+/// `answers` holds every answer in order; a retake (Start over in Learn) answers a question again.
 pub fn author_score(learn: Option<&learn::Learn>, answers: &[QuizAnswer]) -> Score {
     let mut s = Score::default();
     for c in learn.into_iter().flat_map(|l| &l.concepts) {
         let key = format!("{}|{}", c.id, c.title);
         for q in c.lesson.iter().flat_map(|l| &l.quiz) {
             s.total += 1;
-            if let Some(a) = answers.iter().find(|a| a.concept == key && a.question == q.question) {
+            let tries: Vec<usize> = answers.iter().filter(|a| a.concept == key && a.question == q.question).map(|a| a.choice).collect();
+            if let (Some(first), Some(last)) = (tries.first(), tries.last()) {
                 s.answered += 1;
-                s.right += usize::from(a.choice == q.answer);
+                s.right += usize::from(*first == q.answer);
+                s.latest += usize::from(*last == q.answer);
+                s.tries = s.tries.max(tries.len());
             }
         }
     }
@@ -123,6 +139,10 @@ pub struct Stamp {
     pub require_quiz: bool,
     /// Right first try, out of how many.
     pub author_score: Option<(usize, usize)>,
+    /// Right on the latest try, and how many tries that took, when the author retook the quiz.
+    pub author_latest: Option<(usize, usize)>,
+    /// Learn found nothing in this change worth a lesson, so there's no quiz to take.
+    pub learn_nothing: bool,
     /// Places the change may have broken: references to removed names, calls not updated.
     pub annotations: Vec<Annotation>,
 }
@@ -323,6 +343,8 @@ pub fn stamp(multi: &MultiFileResult, settings: &PostSettings, score: Score, sha
         ask_quiz: (settings.ask_quiz || settings.require_quiz) && !quiz.is_empty(),
         require_quiz: settings.require_quiz && !quiz.is_empty(),
         author_score: (settings.quiz_score && score.complete() && !quiz.is_empty()).then_some((score.right, score.total)),
+        author_latest: (settings.quiz_score && score.complete() && !quiz.is_empty() && score.tries > 1).then_some((score.latest, score.tries)),
+        learn_nothing: multi.learn.as_ref().is_some_and(|l| l.nothing.is_some() && l.concepts.is_empty()),
         quiz,
         annotations,
     }
@@ -539,9 +561,31 @@ fn quiz_example(n: usize) -> String {
 }
 
 /// The author's score as a badge, like a repo's build badge. The image has the same words, for when it doesn't load.
-fn author_badge(right: usize, total: usize) -> String {
+/// After a retake it shows the latest try, and the alt text keeps the first.
+fn author_badge(s: &Stamp) -> Option<String> {
+    let (first, total) = s.author_score?;
+    let (words, alt, right) = match s.author_latest {
+        Some((latest, tries)) => (format!("{latest} of {total} right on try {tries}"),
+            format!("The author took the quiz: {latest} of {total} right on try {tries}, {first} of {total} the first time"), latest),
+        None => (format!("{first} of {total} right first try"), format!("The author took the quiz: {first} of {total} right first try"), first),
+    };
     let color = if right * 5 >= total * 4 { "2ea44f" } else { "dbab09" };
-    format!("![The author took the quiz: {right} of {total} right first try](https://img.shields.io/badge/author%27s%20quiz%20results-{right}%20of%20{total}%20right%20first%20try-{color})")
+    Some(format!("![{alt}](https://img.shields.io/badge/author%27s%20quiz%20results-{}-{color})", words.replace(' ', "%20")))
+}
+
+impl Stamp {
+    /// The author answered every question right, on their latest try. A change with nothing to learn counts.
+    pub fn author_passed(&self) -> bool {
+        self.learn_nothing || self.author_score.is_some_and(|(first, total)| total > 0 && self.author_latest.map_or(first, |(l, _)| l) == total)
+    }
+
+    fn author_title(&self) -> String {
+        match (self.author_score, self.author_latest) {
+            (Some((_, t)), Some((l, n))) => format!("Author's quiz results {l}/{t} (try {n})"),
+            (Some((r, t)), None) => format!("Author's quiz results {r}/{t}"),
+            _ => String::new(),
+        }
+    }
 }
 
 fn render(s: &Stamp, graded: bool) -> String {
@@ -549,8 +593,8 @@ fn render(s: &Stamp, graded: bool) -> String {
     if let Some(sum) = &s.summary {
         out.push(s.linked(sum));
     }
-    if let Some((right, total)) = s.author_score {
-        out.push(author_badge(right, total));
+    if let Some(badge) = author_badge(s) {
+        out.push(badge);
     }
     let mut lines = vec![];
     let n = plural(s.quiz.len(), "question", "questions");
@@ -652,6 +696,8 @@ pub struct PrState {
     pub problem: Option<String>,
     /// The repo has the perspica Action, which grades the quiz.
     pub action: bool,
+    /// The repo's workflow needs the author to answer every quiz question right.
+    pub require_author: bool,
     /// perspica's comment there, if there is one.
     pub comment: Option<u64>,
 }
@@ -683,13 +729,35 @@ pub fn pr_state(share: &Share) -> Result<PrState, String> {
             Ok(_) => None,
         }
     };
-    let action = !repo.is_empty() && gh(&["api", &format!("repos/{repo}/contents/.github/workflows/perspica.yml?ref={base}"), "--silent"], None).is_ok();
+    let workflow = if repo.is_empty() { None } else {
+        gh(&["api", "-H", "Accept: application/vnd.github.raw", &format!("repos/{repo}/contents/.github/workflows/perspica.yml?ref={base}")], None).ok()
+    };
+    let action = workflow.is_some();
+    let require_author = workflow.as_deref().is_some_and(requires_author_quiz);
     let comment = if repo.is_empty() { None } else {
         gh(&["api", "--paginate", &format!("repos/{repo}/issues/{number}/comments?per_page=100"),
             "--jq", &format!(".[] | select(.user.login == \"{me}\" and (.body | contains(\"{MARK}\"))) | .id")], None)
             .ok().and_then(|out| out.lines().filter_map(|l| l.trim().parse().ok()).next_back())
     };
-    Ok(PrState { number, title: v["title"].as_str().unwrap_or_default().to_string(), url, repo, base, author, me, own, head, problem, action, comment })
+    Ok(PrState { number, title: v["title"].as_str().unwrap_or_default().to_string(), url, repo, base, author, me, own, head, problem, action, require_author, comment })
+}
+
+/// Whether a perspica workflow turns on the author quiz rule.
+fn requires_author_quiz(workflow: &str) -> bool {
+    workflow.lines().map(str::trim).filter(|l| !l.starts_with('#')).any(|l| {
+        l.strip_prefix("PERSPICA_REQUIRE_AUTHOR_QUIZ:").is_some_and(|v| v.trim().trim_matches(['"', '\'']).eq_ignore_ascii_case("true"))
+    })
+}
+
+/// The settings as they apply on this pull request: a rule the repo sets wins over the author's choice.
+pub fn effective(settings: &PostSettings, pr: &PrState) -> PostSettings {
+    let mut used = settings.clone();
+    used.require_quiz &= pr.action;
+    if pr.require_author {
+        used.lessons = true;
+        used.quiz_score = true;
+    }
+    used
 }
 
 /// Posts the comment, or updates perspica's comment if there is one. Returns its URL.
@@ -726,6 +794,13 @@ pub fn notes(pr: &PrState, settings: &PostSettings, multi: &MultiFileResult, sco
             format!("You've answered {} of {} quiz questions. Your score is added once you've answered them all.", score.answered, score.total)
         });
     }
+    if pr.require_author {
+        if lessons == 0 && multi.learn.as_ref().is_none_or(|l| l.nothing.is_none()) {
+            notes.push(format!("{AUTHOR_RULE} Open Learn to write the lessons, then take the quiz."));
+        } else if score.total > 0 && !score.passed() {
+            notes.push(format!("{AUTHOR_RULE} You have {} of {} right. In Learn, Start over on a concept to retake it.", score.latest, score.total));
+        }
+    }
     if settings.require_quiz && !pr.action {
         notes.push(format!("Waiting for a reviewer to pass needs the perspica check in {}, which grades the quiz. Add it with `perspica github init`.", pr.repo));
     }
@@ -755,8 +830,7 @@ pub fn post_cli(multi: &MultiFileResult, share: &Share, settings: PostSettings, 
         return Err(p.clone());
     }
     let score = author_score(multi.learn.as_ref(), &crate::saved::load_quiz(key));
-    let mut used = settings.clone();
-    used.require_quiz &= pr.action;
+    let used = effective(&settings, &pr);
     let s = stamp(multi, &used, score, &pr.head, &format!("{}/files", pr.url));
     println!("{}\n", preview(&s, pr.action));
     for n in notes(&pr, &settings, multi, score) {
@@ -937,9 +1011,24 @@ pub struct CheckRun {
     pub annotations: Vec<Annotation>,
 }
 
+/// What the repo's workflow asks of every pull request.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RepoRules {
+    /// The author must answer every question in perspica's quiz right before the check passes.
+    pub author_quiz: bool,
+}
+
+impl RepoRules {
+    fn from_env() -> RepoRules {
+        RepoRules { author_quiz: std::env::var("PERSPICA_REQUIRE_AUTHOR_QUIZ").is_ok_and(|v| v.trim().eq_ignore_ascii_case("true")) }
+    }
+}
+
+const AUTHOR_RULE: &str = "This repo needs a pull request's author to answer every question in perspica's quiz right before it merges.";
+
 /// The check for the PR's latest commit. `own`: perspica's structural review of that commit, made by the
 /// Action, for when the author's comment is missing or describes an older commit.
-pub fn check_run(stamp: Option<&Stamp>, head: &str, graded: &[Graded], own: Option<&Stamp>, pr: u64) -> Option<CheckRun> {
+pub fn check_run(stamp: Option<&Stamp>, head: &str, graded: &[Graded], own: Option<&Stamp>, pr: u64, rules: RepoRules) -> Option<CheckRun> {
     let fresh = stamp.filter(|s| s.sha == head);
     let section = |out: &mut Vec<String>, (title, body): (String, String)| {
         out.push(format!("### {title}\n\n{body}\n"));
@@ -950,15 +1039,28 @@ pub fn check_run(stamp: Option<&Stamp>, head: &str, graded: &[Graded], own: Opti
         out.push(glance(own));
         for sec in own.sections(true) { section(&mut out, sec); }
         out.push(format!("The author can add what each change is for, risks, lessons and a quiz by running `perspica --pr {pr} --post` on their machine. [About perspica]({HOME})"));
+        if rules.author_quiz {
+            out.insert(0, format!("> {AUTHOR_RULE} To take it, run `perspica --pr {pr} --web`, take the quiz in Learn, then Post to the pull request.\n"));
+            return Some(CheckRun { status: "in_progress", conclusion: None, title: format!("Waiting on the author's quiz · {}", own.headline()), summary: fit_summary(out.join("\n")), annotations: cap(&own.annotations) });
+        }
         return Some(CheckRun { status: "completed", conclusion: Some("neutral"), title: own.headline(), summary: fit_summary(out.join("\n")), annotations: cap(&own.annotations) });
     };
     let passed: Vec<&Graded> = graded.iter().filter(|g| g.passed()).collect();
-    let by = format!("Quiz passed by {}", passed.iter().map(|g| g.user.clone()).collect::<Vec<_>>().join(", "));
-    let (status, conclusion, lead) = match (s.require_quiz, passed.is_empty()) {
-        (true, true) => ("in_progress", None, "Waiting on a reviewer's quiz".to_string()),
-        (true, false) => ("completed", Some("success"), by),
-        (false, false) => ("completed", Some("neutral"), by),
-        (false, true) => ("completed", Some("neutral"), String::new()),
+    let by = if passed.is_empty() { String::new() } else { format!("Quiz passed by {}", passed.iter().map(|g| g.user.clone()).collect::<Vec<_>>().join(", ")) };
+    let author_wait = rules.author_quiz && !s.author_passed();
+    let reviewer_wait = s.require_quiz && passed.is_empty();
+    let lead = match (author_wait, reviewer_wait) {
+        (true, true) => "Waiting on the author's quiz and a reviewer's".to_string(),
+        (true, false) => ["Waiting on the author's quiz".to_string(), by].into_iter().filter(|t| !t.is_empty()).collect::<Vec<_>>().join(" · "),
+        (false, true) => "Waiting on a reviewer's quiz".to_string(),
+        (false, false) => by,
+    };
+    let (status, conclusion) = if author_wait || reviewer_wait {
+        ("in_progress", None)
+    } else if rules.author_quiz || s.require_quiz {
+        ("completed", Some("success"))
+    } else {
+        ("completed", Some("neutral"))
     };
     // Counts and lines describe the latest commit when the comment is older.
     let mut shown = s.clone();
@@ -975,11 +1077,17 @@ pub fn check_run(stamp: Option<&Stamp>, head: &str, graded: &[Graded], own: Opti
             shown.annotations.clear();
         }
     }
-    let author = s.author_score.map(|(r, t)| format!("Author's quiz results {r}/{t}")).unwrap_or_default();
-    let title = [lead, author, shown.headline()].into_iter().filter(|t| !t.is_empty()).collect::<Vec<_>>().join(" · ");
+    let title = [lead, s.author_title(), shown.headline()].into_iter().filter(|t| !t.is_empty()).collect::<Vec<_>>().join(" · ");
     let mut out = vec![];
-    if let Some((r, t)) = s.author_score {
-        out.push(format!("{}\n", author_badge(r, t)));
+    if author_wait {
+        out.push(match (s.author_score, s.author_latest) {
+            (None, _) => format!("> {AUTHOR_RULE} The author's comment has no quiz score yet. In perspica, take the quiz in Learn, then post again.\n"),
+            (Some((first, total)), latest) => format!("> {AUTHOR_RULE} The author has {} of {total} right. In perspica's Learn tab, Start over on a concept to retake it, then post again.\n",
+                latest.map_or(first, |(l, _)| l)),
+        });
+    }
+    if let Some(badge) = author_badge(s) {
+        out.push(format!("{badge}\n"));
     }
     if fresh.is_none() {
         out.push(format!("> The author posted this when the pull request went up to {}. It has newer commits since, so parts of it may be out of date.\n", short(&s.sha)));
@@ -1182,7 +1290,7 @@ async fn run_action() -> Result<(), String> {
     } else {
         None
     };
-    let Some(check) = check_run(stamp.as_ref(), &head, &graded, own.as_ref(), number) else {
+    let Some(check) = check_run(stamp.as_ref(), &head, &graded, own.as_ref(), number, RepoRules::from_env()) else {
         println!("perspica: no comment and no review of our own, so no check to update.");
         return Ok(());
     };
@@ -1230,7 +1338,7 @@ async fn update_check(api: &Api, head: &str, check: &CheckRun) -> Result<(), Str
 
 // --- Setting up the Action ---
 
-pub fn workflow() -> String {
+pub fn workflow(author_quiz: bool) -> String {
     let v = env!("CARGO_PKG_VERSION");
     format!(r#"# perspica: a summary check on every pull request, and the reviewer quiz when an author asks for one.
 # Written by `perspica github init`. It reads the pull request's code but never runs it.
@@ -1277,6 +1385,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{{{ github.token }}}}
           GH_TOKEN: ${{{{ github.token }}}}
+          # "true": the check waits until the pull request's author has answered every question in
+          # perspica's quiz right. They can retake it. Make the check required to block merging until then.
+          PERSPICA_REQUIRE_AUTHOR_QUIZ: "{author_quiz}"
 "#)
 }
 
@@ -1289,22 +1400,23 @@ pub fn cli(args: &[String]) {
                 std::process::exit(1);
             }
         }
-        Some("init") => init(),
+        Some("init") => init(args[1..].iter().any(|a| a == "--require-author-quiz")),
         _ => {
             eprintln!("Usage: perspica github init     add the perspica check to this repository");
+            eprintln!("         --require-author-quiz  and have it wait until a PR's author has the whole quiz right");
             eprintln!("       perspica github action   what that check runs (in GitHub Actions only)");
             std::process::exit(if args.is_empty() { 0 } else { 1 });
         }
     }
 }
 
-fn init() {
+fn init(author_quiz: bool) {
     let Some(root) = crate::git::repo_root() else {
         eprintln!("perspica: run this inside the repository");
         std::process::exit(1);
     };
     let path = root.join(".github/workflows/perspica.yml");
-    let text = workflow();
+    let text = workflow(author_quiz);
     let before = std::fs::read_to_string(&path).ok();
     if before.as_deref() == Some(text.as_str()) {
         println!(".github/workflows/perspica.yml is already up to date.");
@@ -1352,6 +1464,8 @@ mod tests {
             ask_quiz: true,
             require_quiz: true,
             author_score: Some((2, 2)),
+            author_latest: None,
+            learn_nothing: false,
             annotations: vec![Annotation { path: "src/c.rs".into(), line: 3, title: "`foo` was removed".into(), message: "still called here".into(), in_diff: false }],
         }
     }
@@ -1432,7 +1546,7 @@ mod tests {
         big.large = vec!["src/a.rs".into()];
         assert!(comment(&big, true).contains("[`detect`](https://github.com/o/r/blob/abcdef1234567890/src/a.rs#L10-L20 \"src/a.rs\")"), "a folded diff links to the file");
         assert!(!preview(&s, true).contains("`fit` drops events"), "the comment keeps lessons to one line");
-        let check = check_run(Some(&s), &s.sha, &[], None, 7).unwrap();
+        let check = check_run(Some(&s), &s.sha, &[], None, 7, RepoRules::default()).unwrap();
         assert!(check.summary.contains("### What this changes (2)") && check.summary.contains("`fit` drops events"));
     }
 
@@ -1532,22 +1646,22 @@ mod tests {
     #[test]
     fn the_check_waits_on_a_requested_quiz() {
         let s = sample();
-        let waiting = check_run(Some(&s), &s.sha, &[], None, 7).unwrap();
+        let waiting = check_run(Some(&s), &s.sha, &[], None, 7, RepoRules::default()).unwrap();
         assert_eq!((waiting.status, waiting.conclusion), ("in_progress", None));
         assert!(waiting.title.starts_with("Waiting on a reviewer's quiz · Author's quiz results 2/2 · 2 changes"), "{}", waiting.title);
         assert_eq!(waiting.annotations.len(), 1);
         let g = grade(None, &s.quiz, &s.quiz_id(), "rev", &[(0, 1), (1, 0)]);
-        let done = check_run(Some(&s), &s.sha, &[g], None, 7).unwrap();
+        let done = check_run(Some(&s), &s.sha, &[g], None, 7, RepoRules::default()).unwrap();
         assert_eq!((done.status, done.conclusion), ("completed", Some("success")));
         assert!(done.title.starts_with("Quiz passed by rev"));
         assert!(done.summary.contains("- rev: passed, all on the first try"), "{}", done.summary);
 
         let mut optional = s.clone();
         optional.require_quiz = false;
-        let plain = check_run(Some(&optional), &s.sha, &[], None, 7).unwrap();
+        let plain = check_run(Some(&optional), &s.sha, &[], None, 7, RepoRules::default()).unwrap();
         assert_eq!((plain.status, plain.conclusion), ("completed", Some("neutral")), "a suggested quiz never holds the check");
         let g = grade(None, &s.quiz, &s.quiz_id(), "rev", &[(0, 1), (1, 0)]);
-        let passed = check_run(Some(&optional), &s.sha, &[g], None, 7).unwrap();
+        let passed = check_run(Some(&optional), &s.sha, &[g], None, 7, RepoRules::default()).unwrap();
         assert_eq!(passed.conclusion, Some("neutral"));
         assert!(passed.title.starts_with("Quiz passed by rev · Author's quiz results 2/2 · "), "{}", passed.title);
         assert!(comment(&optional, true).contains("**Quiz suggested.**"));
@@ -1556,19 +1670,19 @@ mod tests {
     #[test]
     fn an_older_comment_is_marked_and_its_lines_left_out() {
         let s = sample();
-        let c = check_run(Some(&s), "fffffff", &[], None, 7).unwrap();
+        let c = check_run(Some(&s), "fffffff", &[], None, 7, RepoRules::default()).unwrap();
         assert!(c.summary.contains("The author posted this when the pull request went up to abcdef1."));
         assert!(c.annotations.is_empty(), "line numbers from another commit would point at the wrong lines");
         let own = Stamp { sha: "fffffff".into(), files: 5, changed_lines: 10, annotations: vec![Annotation { path: "b.rs".into(), line: 9, ..Default::default() }], ..Default::default() };
-        let c = check_run(Some(&s), "fffffff", &[], Some(&own), 7).unwrap();
+        let c = check_run(Some(&s), "fffffff", &[], Some(&own), 7, RepoRules::default()).unwrap();
         assert_eq!(c.annotations[0].path, "b.rs");
     }
 
     #[test]
     fn without_a_comment_the_check_is_perspicas_own_review() {
-        assert!(check_run(None, "h", &[], None, 7).is_none());
+        assert!(check_run(None, "h", &[], None, 7, RepoRules::default()).is_none());
         let own = Stamp { sha: "h".into(), files: 3, changed_lines: 40, mechanical_lines: 12, ..Default::default() };
-        let c = check_run(None, "h", &[], Some(&own), 7).unwrap();
+        let c = check_run(None, "h", &[], Some(&own), 7, RepoRules::default()).unwrap();
         assert_eq!(c.conclusion, Some("neutral"));
         assert_eq!(c.title, "3 files changed · 12 of 40 changed lines are mechanical");
         assert!(c.summary.contains("perspica --pr 7 --post"));
@@ -1586,20 +1700,74 @@ mod tests {
             ],
         })).unwrap();
         let a = |q: &str, choice| QuizAnswer { concept: "c1|A".into(), question: q.into(), choice };
-        assert_eq!(author_score(Some(&learn), &[a("q1", 1)]), Score { right: 1, answered: 1, total: 2 });
+        assert_eq!(author_score(Some(&learn), &[a("q1", 1)]), Score { right: 1, answered: 1, total: 2, latest: 1, tries: 1 });
         let done = author_score(Some(&learn), &[a("q1", 1), a("q2", 1), a("old question", 0)]);
-        assert_eq!(done, Score { right: 1, answered: 2, total: 2 });
+        assert_eq!(done, Score { right: 1, answered: 2, total: 2, latest: 1, tries: 1 });
         assert!(done.complete());
     }
 
     #[test]
+    fn retakes_count_toward_the_author_rule_and_show_on_the_badge() {
+        let learn: learn::Learn = serde_json::from_value(serde_json::json!({
+            "provider": "p", "model": "m", "saved_at": 0,
+            "concepts": [{ "id": "c1", "title": "A", "kind": "k", "why_here": "", "lesson": { "model": "m", "saved_at": 0, "explanation": "", "quiz": [
+                { "question": "q1", "choices": ["x", "y"], "answer": 1 }, { "question": "q2", "choices": ["x", "y"], "answer": 0 } ] } }],
+        })).unwrap();
+        let a = |q: &str, choice| QuizAnswer { concept: "c1|A".into(), question: q.into(), choice };
+        // q2 wrong, then retaken right.
+        let score = author_score(Some(&learn), &[a("q1", 1), a("q2", 1), a("q1", 1), a("q2", 0)]);
+        assert_eq!(score, Score { right: 1, answered: 2, total: 2, latest: 2, tries: 2 });
+        assert!(score.passed());
+
+        let mut s = sample();
+        s.author_score = Some((1, 2));
+        s.author_latest = Some((2, 2));
+        let c = comment(&s, true);
+        assert!(c.contains("![The author took the quiz: 2 of 2 right on try 2, 1 of 2 the first time](https://img.shields.io/badge/author%27s%20quiz%20results-2%20of%202%20right%20on%20try%202-2ea44f)"), "{c}");
+
+        let rule = RepoRules { author_quiz: true };
+        s.require_quiz = false;
+        let ok = check_run(Some(&s), &s.sha, &[], None, 7, rule).unwrap();
+        assert_eq!((ok.status, ok.conclusion), ("completed", Some("success")), "a retake that gets them all right passes");
+        assert!(ok.title.starts_with("Author's quiz results 2/2 (try 2) · "), "{}", ok.title);
+
+        s.author_latest = Some((1, 3));
+        let waiting = check_run(Some(&s), &s.sha, &[], None, 7, rule).unwrap();
+        assert_eq!((waiting.status, waiting.conclusion), ("in_progress", None));
+        assert!(waiting.title.starts_with("Waiting on the author's quiz · "));
+        assert!(waiting.summary.contains("The author has 1 of 2 right. In perspica's Learn tab, Start over"), "{}", waiting.summary);
+
+        s.require_quiz = true;
+        let both = check_run(Some(&s), &s.sha, &[], None, 7, rule).unwrap();
+        assert!(both.title.starts_with("Waiting on the author's quiz and a reviewer's"));
+
+        let off = check_run(Some(&s), &s.sha, &[grade(None, &s.quiz, &s.quiz_id(), "rev", &[(0, 1), (1, 0)])], None, 7, RepoRules::default()).unwrap();
+        assert_eq!(off.conclusion, Some("success"), "with the rule off, the author's score never holds the check");
+
+        let mut nothing = sample();
+        nothing.author_score = None;
+        nothing.require_quiz = false;
+        assert_eq!(check_run(Some(&nothing), &nothing.sha, &[], None, 7, rule).unwrap().status, "in_progress", "no score yet: waiting");
+        nothing.learn_nothing = true;
+        assert_eq!(check_run(Some(&nothing), &nothing.sha, &[], None, 7, rule).unwrap().conclusion, Some("success"), "nothing to learn: nothing to wait for");
+
+        let own = Stamp { sha: "h".into(), files: 1, ..Default::default() };
+        let none = check_run(None, "h", &[], Some(&own), 7, rule).unwrap();
+        assert_eq!(none.status, "in_progress", "without the author's comment there's no quiz to pass");
+        assert!(none.summary.contains("perspica --pr 7 --web"));
+    }
+
+    #[test]
     fn the_workflow_pins_this_version() {
-        let w = workflow();
+        let w = workflow(false);
         assert!(w.contains(&format!("PERSPICA_VERSION={}", env!("CARGO_PKG_VERSION"))));
         assert!(w.contains("${{ github.token }}") && w.contains("pull_request_target"));
         assert!(w.contains("pull-requests: write"), "the Action replies to quiz answers on the pull request");
         assert!(w.contains("contains(github.event.comment.body, '/quiz')") && !w.contains("startsWith"), "a reply with spaces before /quiz still runs it");
         assert!(w.contains("pull_request_review:") && w.contains("content=eyes"));
+        assert!(w.contains("PERSPICA_REQUIRE_AUTHOR_QUIZ: \"false\""), "the rule is there to find, and off");
+        assert!(!requires_author_quiz(&w) && requires_author_quiz(&workflow(true)));
+        assert!(!requires_author_quiz("# PERSPICA_REQUIRE_AUTHOR_QUIZ: \"true\""), "a commented-out line doesn't count");
         assert!(!w.contains("ref: ${{ github.event.pull_request.head"), "never checks out the PR's code as the workspace");
     }
 }

@@ -171,6 +171,8 @@ Nothing from your agent sessions goes in: no prompts, no Decisions, no marks for
 
 It never runs the pull request's code, so it works on PRs from forks. On private repos it uses a little of your Actions minutes.
 
+**Requiring the author's quiz.** Off by default. Run `perspica github init --require-author-quiz`, or set `PERSPICA_REQUIRE_AUTHOR_QUIZ: "true"` in the workflow, and the check waits until each pull request's author has answered every question in perspica's quiz right. Authors can retake it: in Learn, **Start over** on a concept, then post again. The badge then says which try it took. A change that Learn finds nothing to teach in passes as it is. To block merging until then, make `perspica` a required check.
+
 ## Privacy
 
 - Everything initially runs locally. Nothing is sent anywhere unless you ask for it: `-s` / **Analyze…**, **Find concepts…** in Learn (after that, opening a concept writes its lesson), or **Find decisions…**.

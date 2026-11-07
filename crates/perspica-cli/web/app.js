@@ -1922,6 +1922,7 @@ function quizHtml(c) {
     const more = cs.length > 1 ? '<button class="plain-btn" data-action="learn-next">Next concept</button>' : '';
     const result = sc.answered < sc.total ? '' : `<div class="quiz-result${sc.passed ? ' passed' : ''}">
         <b>${sc.right} of ${sc.total} right.</b> ${sc.passed ? 'Counted as understood.' : `You need ${Math.ceil(sc.total * LEARN_PASS)} to count it as understood. Re-read the explanation, then start over.`}
+        ${S.pr?.pr?.require_author && sc.right < sc.total ? '<span class="setup-note">This repo needs every question right before your pull request merges. Start over to retake it.</span>' : ''}
         <span class="quiz-actions"><button class="plain-btn" data-quiz-reset>Start over</button>${more}</span></div>`;
     // A weak quiz is a reason to rewrite too, so the footer is here as well.
     const foot = `<div class="learn-foot"><span class="muted">Written by ${esc(modelLabel(c.lesson.model))} ${ago(c.lesson.saved_at)}.</span>
@@ -2905,16 +2906,17 @@ async function startPost() {
     const concerns = S.data.concerns?.length || 0;
     const lessons = (learnData()?.concepts || []).filter(c => c.lesson).length;
     const done = score.total > 0 && score.answered === score.total;
-    const opt = (id, on, label, note, disabled = false, sub = false) =>
-        `<label class="check${sub === 'sub2' ? ' sub sub2' : sub ? ' sub' : ''}${disabled ? ' off' : ''}"><input type="checkbox" id="${id}"${on && !disabled ? ' checked' : ''}${disabled ? ' disabled' : ''}><span>${label}${note ? `<span class="opt-note">${note}</span>` : ''}</span></label>`;
+    // `forced`: the repo requires it, so it's ticked and can't be unticked.
+    const opt = (id, on, label, note, disabled = false, sub = false, forced = false) =>
+        `<label class="check${sub === 'sub2' ? ' sub sub2' : sub ? ' sub' : ''}${disabled && !forced ? ' off' : ''}"><input type="checkbox" id="${id}"${(on && !disabled) || forced ? ' checked' : ''}${disabled ? ' disabled' : ''}><span>${label}${note ? `<span class="opt-note">${note}</span>` : ''}</span></label>`;
     showDialog({
         title: `${pr.comment ? 'Update' : 'Post'} perspica's comment on PR #${pr.number}`,
         body: `<p class="muted">One comment on <b>${esc(pr.repo)}#${pr.number}</b>, from your GitHub account${pr.me ? ` (${esc(pr.me)})` : ''}. Posting again updates it. Nothing from your agent sessions goes in: no prompts, no Decisions.</p>
             ${pr.problem ? `<p class="setup-note">${esc(pr.problem)}</p>` : ''}
             <div class="post-options">
                 ${opt('po-concerns', set.concerns, 'Concerns', concerns ? `${concerns} from Analyze` : 'None yet. Analyze first.', !concerns)}
-                ${opt('po-lessons', set.lessons, 'Lessons and quiz', lessons ? `${lessons} lesson${pl(lessons)}, ${score.total} question${pl(score.total)}` : 'None yet. Open Learn first.', !lessons)}
-                ${opt('po-score', set.quiz_score, 'My quiz score, as a badge', done ? `${score.right} of ${score.total} right first try` : score.total ? `Answer all ${score.total} questions in Learn first. ${score.answered} so far.` : '', !done, true)}
+                ${opt('po-lessons', set.lessons || pr.require_author, 'Lessons and quiz', (lessons ? `${lessons} lesson${pl(lessons)}, ${score.total} question${pl(score.total)}` : 'None yet. Open Learn first.') + (pr.require_author ? ' Always included in this repo.' : ''), !lessons || pr.require_author, false, pr.require_author && !!lessons)}
+                ${opt('po-score', set.quiz_score || pr.require_author, 'My quiz score, as a badge', (done ? (score.tries > 1 ? `${score.latest} of ${score.total} right on try ${score.tries}, ${score.right} the first time` : `${score.right} of ${score.total} right first try`) : score.total ? `Answer all ${score.total} questions in Learn first. ${score.answered} so far.` : '') + (pr.require_author ? ' Always included in this repo, which needs every question right before merging.' : ''), !done || pr.require_author, true, pr.require_author && done)}
                 ${opt('po-ask', set.ask_quiz || set.require_quiz, 'Ask reviewers to take the quiz', 'Suggested in the comment. It\'s optional for them.', !lessons, true)}
                 ${opt('po-require', set.require_quiz, 'Wait for a reviewer to pass before merging', pr.action ? 'The perspica check waits until one passes. Make it a required check to block merging.' : 'Needs the perspica check in this repo: run <code>perspica github init</code>', !pr.action || !lessons || !(set.ask_quiz || set.require_quiz), 'sub2')}
             </div>
@@ -2932,8 +2934,10 @@ async function startPost() {
         const ask = document.getElementById('po-ask');
         for (const id of ['po-score', 'po-ask', 'po-require']) {
             const el = document.getElementById(id);
-            const off = !l.checked || (id === 'po-score' ? !done : id === 'po-require' ? !pr.action || !ask.checked : false);
-            el.disabled = off; el.closest('label').classList.toggle('off', off);
+            const off = !l.checked || (id === 'po-score' ? !done || pr.require_author : id === 'po-require' ? !pr.action || !ask.checked : false);
+            const forced = id === 'po-score' && pr.require_author && done && l.checked;
+            el.disabled = off; if (forced) el.checked = true;
+            el.closest('label').classList.toggle('off', off && !forced);
         }
         updatePostPreview();
     };

@@ -95,17 +95,19 @@ pub fn save_decisions(key: &str, d: &decisions::Decisions) {
     }
 }
 
-/// The author's own quiz answers for this diff, first try only.
+/// The author's own quiz answers for this diff, every try in order.
 pub fn load_quiz(key: &str) -> Vec<github::QuizAnswer> {
     read("quiz", key).unwrap_or_default()
 }
 
-/// Adds answers to questions not answered before. A later answer to the same question is a retry.
+/// Adds answers. A new answer to a question already answered is a retake (Start over in Learn). The same
+/// answer again is the viewer sending what it has, not a new try, so it's skipped.
 pub fn add_quiz(key: &str, answers: &[github::QuizAnswer]) {
     let mut all = load_quiz(key);
     let before = all.len();
     for a in answers {
-        if !all.iter().any(|b| b.concept == a.concept && b.question == a.question) {
+        let last = all.iter().rev().find(|b| b.concept == a.concept && b.question == a.question);
+        if last.is_none_or(|b| b.choice != a.choice) {
             all.push(a.clone());
         }
     }

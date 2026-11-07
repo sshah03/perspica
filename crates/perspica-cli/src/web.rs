@@ -707,8 +707,7 @@ struct PostRequest {
 async fn build_comment(state: &AppState, settings: &github::PostSettings) -> Result<(github::PrState, github::Stamp, Vec<String>), String> {
     let pr = pr_state(state, false).await?;
     let score = score(state).await;
-    let mut used = settings.clone();
-    used.require_quiz &= pr.action;
+    let used = github::effective(settings, &pr);
     let result = state.result.read().await;
     let stamp = github::stamp(&result, &used, score, &pr.head, &format!("{}/files", pr.url));
     let notes = github::notes(&pr, settings, &result, score);
