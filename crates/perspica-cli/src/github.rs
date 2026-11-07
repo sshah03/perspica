@@ -16,8 +16,12 @@ use std::process::Command;
 const MARK: &str = "<!-- perspica:comment -->";
 const DATA: &str = "<!-- perspica:data ";
 const GRADED: &str = "<!-- perspica:graded ";
-/// The check's name. Branch protection can require it.
+/// The commit status that gates merging. Branch protection can require it. It's a status, not a check run:
+/// GitHub shows a PR only the newest run of each workflow, so a check run made by an earlier run drops out
+/// of the merge box, and a required one then counts as missing.
 pub const CHECK: &str = "perspica";
+/// The check run with the summary and the line notes. Informational; the status links to it.
+const REVIEW_CHECK: &str = "perspica review";
 /// Who the Action's own comments come from. Nobody else can post as it.
 const BOT: &str = "github-actions[bot]";
 /// GitHub allows 65,536 characters in a comment.
@@ -1306,30 +1310,30 @@ fn review_pr(number: u64, head: &str, files_url: &str) -> Result<Stamp, String> 
     Ok(stamp(&multi, &PostSettings { concerns: false, lessons: false, quiz_score: false, ask_quiz: false, require_quiz: false }, Score::default(), head, files_url))
 }
 
+/// The summary as a check run, then the gate as a commit status that links to it.
 async fn update_check(api: &Api, head: &str, check: &CheckRun) -> Result<(), String> {
-    let existing = api.send(reqwest::Method::GET, &format!("commits/{head}/check-runs?check_name={CHECK}&filter=latest"), None).await?;
-    let current = existing["check_runs"].as_array().and_then(|a| a.first()).cloned();
     let annotations: Vec<serde_json::Value> = check.annotations.iter().map(|a| serde_json::json!({
         "path": a.path, "start_line": a.line, "end_line": a.line, "annotation_level": "warning", "title": a.title, "message": a.message,
     })).collect();
-    let mut body = serde_json::json!({ "name": CHECK, "status": check.status, "output": { "title": check.title, "summary": check.summary } });
+    // A new run each time: it lands with this run's checks, and its line notes don't pile up on an old one.
+    let mut body = serde_json::json!({ "name": REVIEW_CHECK, "head_sha": head, "status": check.status, "output": { "title": check.title, "summary": check.summary } });
     if let Some(c) = check.conclusion { body["conclusion"] = c.into(); }
-    match current {
-        // A completed check can't go back to waiting, so that takes a new one.
-        Some(run) if !(run["status"] == "completed" && check.status != "completed") => {
-            // Annotations add up on each update, so they're only sent while there are none.
-            if run["output"]["annotations_count"].as_u64().unwrap_or(0) == 0 && !annotations.is_empty() {
-                body["output"]["annotations"] = annotations.into();
-            }
-            api.send(reqwest::Method::PATCH, &format!("check-runs/{}", run["id"]), Some(body)).await?;
-        }
-        _ => {
-            body["head_sha"] = head.into();
-            if !annotations.is_empty() { body["output"]["annotations"] = annotations.into(); }
-            api.send(reqwest::Method::POST, "check-runs", Some(body)).await?;
-        }
-    }
+    if !annotations.is_empty() { body["output"]["annotations"] = annotations.into(); }
+    let run = api.send(reqwest::Method::POST, "check-runs", Some(body)).await?;
+    let status = serde_json::json!({
+        "state": if check.status == "completed" { "success" } else { "pending" },
+        "context": CHECK,
+        "description": status_description(&check.title),
+        "target_url": run["html_url"],
+    });
+    api.send(reqwest::Method::POST, &format!("statuses/{head}"), Some(status)).await?;
     Ok(())
+}
+
+/// A commit status's description holds 140 characters.
+fn status_description(title: &str) -> String {
+    if title.chars().count() <= 140 { return title.to_string(); }
+    format!("{}…", title.chars().take(139).collect::<String>().trim_end())
 }
 
 // --- Setting up the Action ---
@@ -1354,6 +1358,8 @@ permissions:
   pull-requests: write
   issues: write
   checks: write
+  # The perspica status, which a branch rule can require.
+  statuses: write
 concurrency:
   group: perspica-${{{{ github.event.pull_request.number || github.event.issue.number }}}}
 jobs:
@@ -1759,6 +1765,8 @@ mod tests {
         assert!(w.contains(&format!("PERSPICA_VERSION={}", env!("CARGO_PKG_VERSION"))));
         assert!(w.contains("${{ github.token }}") && w.contains("pull_request_target"));
         assert!(w.contains("pull-requests: write"), "the Action replies to quiz answers on the pull request");
+        assert!(w.contains("statuses: write"), "the gate is a commit status");
+        assert_eq!(status_description(&"x".repeat(200)).chars().count(), 140);
         assert!(w.contains("contains(github.event.comment.body, '/quiz')") && !w.contains("startsWith"), "a reply with spaces before /quiz still runs it");
         assert!(w.contains("pull_request_review:") && w.contains("content=eyes"));
         assert!(w.contains("PERSPICA_REQUIRE_AUTHOR_QUIZ: \"false\""), "the rule is there to find, and off");
