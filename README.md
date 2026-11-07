@@ -10,20 +10,20 @@
   <img alt="Status: beta" src="https://img.shields.io/badge/status-beta-orange.svg">
 </p>
 
-<p align="center"><b>Review code changes by what they do, and learn the concepts behind them.</b></p>
+<p align="center"><b>Review code changes by intent, learn the concepts behind them, and optionally gate PR merges until the change is provably understood.</b></p>
 
 > [!NOTE]
 > perspica is in beta. Expect rough edges, and behavior that may change between 0.x releases. If something looks wrong, please [open an issue](https://github.com/sshah03/perspica/issues).
 
-perspica reads a diff by working out what actually changed (a rename, a new parameter, a moved function, a real logic change), setting aside the mechanical noise (reformatting, comments, rename-only lines, unchanged moves, generated files), and pointing at what a plain diff hides: references to names that no longer exist, calls that weren't updated for a new signature, code left unused.
+perspica reads a diff by working out what actually changed (a rename, a new parameter, a moved function, a real logic change), setting aside the mechanical noise (reformatting, comments, rename-only lines, unchanged moves, generated files), and pointing at what a plain diff hides (references to names that no longer exist, calls that weren't updated for a new signature, code left unused).
 
-None of that needs a model. perspica parses both versions with tree-sitter and follows the calls between them, so it's one local binary that answers in a few hundred milliseconds on a typical PR, gives the same answer every time, and needs no API key. An LLM is an optional, but useful, extra: it groups the changes by intent, rates the risk of each group and writes a summary, and nothing leaves your machine unless you ask for it.
+Some of this can be done without an LLM. Perspica parses both versions with tree-sitter and follows the calls between them, so it's one local binary that answers in a few hundred milliseconds on a typical PR, gives the same answer every time, and needs no API key. An LLM is an optional, but useful, extra. What the LLM provides is grouping the changes by intent, rating the risk of each group, writing a summary, and generating lessons + quizzes on the more significant changes in the PR (if needed).
 
-It understands **TypeScript and JavaScript** (including TSX and JSX), **Python**, **Rust**, **Go**, **Java**, **Kotlin**, **Scala**, **C#**, **C**, **PHP** and **Ruby** (Rails included). Files in other languages still show up, as ordinary line diffs.
+It understands **TypeScript and JavaScript** (including TSX and JSX), **Python**, **Rust**, **Go**, **Java**, **Kotlin**, **Scala**, **C#**, **C**, **PHP** and **Ruby** (Rails included). Files in other languages still show up, but as ordinary line diffs.
 
-It's built for reviewing work done with coding agents. When the change came from your Claude Code or Codex session, perspica shows what you asked for in your own words and, with an LLM, marks which parts you asked for and which the agent decided on its own.
+If you're reviewing your own work done with coding agents (Claude Code or Codex session) perspica shows what you asked for in your own words and, with an LLM, marks which parts you asked for and which the agent decided on its own by looking through your sessions. Only you will ever be able to see this section.
 
-And when a change relies on something you haven't worked with, the **Learn** tab explains it. Focus is on the few concepts or architecture changes that matter for the change. It will provide a short lesson, a diagram or animation when one helps, and a quiz to check you've got it. When there's nothing new to learn, it says so. **[See the demo video for Learn](#learn)**.
+As alluded to above, for more significant changes the **Learn** tab explains it. Focus is on the few concepts or architecture changes that matter for the change. It will provide a short lesson, a diagram or animation when one helps, and a quiz to check you've got it. When there's nothing new to learn, it says so. **[See the demo video for Learn](#learn)**.
 
 <a href="docs/media/perspica-demo.mp4"><img alt="perspica demo: an LLM analysis grouping the changes by intent, the summary, what to check before merging, the reading order with test reach, unified and split views, the agent-session view, and terminal output" src="docs/media/perspica-demo.gif"></a>
 
@@ -64,6 +64,7 @@ Inside a repository:
 perspica                 # review your current branch: commits, uncommitted and untracked files
 perspica --web           # …in the browser
 perspica --pr 123 --web  # a GitHub pull request (uses the `gh` CLI)
+perspica --pr 123 --post # post the review on your own pull request
 ```
 
 Other targets:
@@ -149,10 +150,50 @@ The **Decisions** tab shows how a change you made with Claude Code or Codex was 
 
 It only works for your own changes, with the sessions on this machine: uncommitted work, or commits you authored. A session counts when it edited the changed files, and perspica reads it up to where it moved on to other work. **Find decisions…** sends the session and the changed code to your LLM in one request, which takes about a minute. The result is saved in `.git/perspica/`. Shared `--format html` pages leave Decisions out, since it quotes your sessions.
 
+## On your pull request
+
+Post the review on your pull request as one comment, so reviewers get it without installing anything. Run `perspica --pr 123 --post`, or click **Post to PR #123…** in the viewer when the review is of your own branch or PR. You can see a preview of what you'll be posting before pushing it. It uses the `gh` CLI and your GitHub login.
+
+The comment is a relatively short summary of everything you see (intent, key learnings, etc...), here are the key optional things you can include: 
+
+- **Your quiz score.** Once you've answered every question in Learn, the comment shows a badge with how many you got right first try, and so does the perspica check's title. The badge image comes from shields.io.
+- **Ask reviewers to take the quiz.** The comment suggests it, and it stays optional. With the perspica check in the repo, reviewers answer by replying `/quiz 1a 2c 3b`, or in their approval, and the check grades them and replies with what they missed.
+- **Wait for a reviewer to pass.** The perspica check waits until a reviewer passes the quiz. To keep the PR from merging until then, make `perspica` a required check in the repo's branch settings. It's an honor system: the answers are in the comment's data, so the check shows someone took the quiz, not proof they understood.
+
+Nothing from your agent sessions goes in, so no prompts, no Decisions, etc...
+
+## The GitHub Action
+
+The Action turns the comment into a check on the pull request, grades reviewers' quiz answers, and gives every pull request a summary, even when its author never ran perspica.
+
+### Set it up
+
+1. In your repository, run `perspica github init`. It writes `.github/workflows/perspica.yml`.
+2. Commit that file and merge it into your default branch. The workflow only runs from there, so nothing happens on pull requests until then.
+3. Optional, to let quizzes block merging, in the repository's **Settings → Branches**, add or edit the rule for your default branch, turn on **Require status checks to pass before merging**, and add `perspica`. It shows up in that list once the workflow has run on a pull request. We assumed most people wouldn't want to make passing the quiz mandatory, but if you do, the setting is there.
+
+That's all for the repository. Authors post with `perspica --pr 123 --post` or **Post to PR…** in the viewer, which needs perspica and the `gh` CLI logged in. Reviewers don't install anything, they just read the comment and reply with `/quiz` + the answers (e.g. /quiz 1a 2d 3b 4c).
+
+### What it does
+
+On every pull request it keeps a **perspica** status up to date, which is the one to make required, and a **perspica review** check with the details and line notes:
+
+- With the author's comment: the summary, what each change is for, concerns and lessons on the check's page, and where the quiz stands.
+- Without one: perspica's structural review, which needs no model. That's what's mechanical, what's tests, which files are safe to skim, and references or calls the change may have broken, marked on their lines.
+
+It runs when a pull request is opened or updated, and on comments and reviews. It installs the perspica release it was written for, and it reads the pull request's code but never runs it, so it's safe on pull requests from forks. It needs permission to write comments, checks and statuses, and only reads the code. On private repos, GitHub counts each run as about a minute of your Actions minutes.
+
+After upgrading perspica, run `perspica github init` again to move the workflow to the new version.
+
+### Requiring the author's quiz
+
+Off by default. Run `perspica github init --require-author-quiz`, or set `PERSPICA_REQUIRE_AUTHOR_QUIZ: "true"` in the workflow, and the check waits until each pull request's author has answered every question in perspica's quiz right. If they haven't, the Action replies to tell them their score and how to retake it: in Learn, **Start over** on a concept, then post again. The badge then says which try it took. A change that Learn finds nothing to teach in passes as it is. To block merging until then, make `perspica` a required check.
+
 ## Privacy
 
 - Everything initially runs locally. Nothing is sent anywhere unless you ask for it: `-s` / **Analyze…**, **Find concepts…** in Learn (after that, opening a concept writes its lesson), or **Find decisions…**.
 - Agent sessions (`~/.claude/projects`, `~/.codex/sessions`) are read only for **your own** changes (uncommitted work, or commits authored with your git identity), never for someone else's PR. perspica says when it uses them; `--no-sessions` turns this off.
+- `--post` and **Post to PR…** send only the analysis, lessons and quiz to GitHub, after a preview. Your sessions stay on your machine.
 - The web viewer listens on `127.0.0.1` and only answers its own page: other hosts (DNS rebinding) and other sites' requests are refused.
 - Learn's interactive pieces are written by the model, so they run in a sandboxed frame that can't reach the network or the rest of the page.
 

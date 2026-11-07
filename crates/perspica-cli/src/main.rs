@@ -9,6 +9,7 @@ mod sessions;
 mod saved;
 mod decisions;
 mod learn;
+mod github;
 
 use clap::Parser;
 use perspica_core::cross_file::{BrokenReferenceEntry, CallSite, CrossFileManifest, FileChange};
@@ -22,7 +23,7 @@ use std::path::PathBuf;
     name = "perspica",
     about = "Review code changes by what they do",
     version,
-    after_help = "Examples:\n  perspica                      review the current branch (run inside a repo)\n  perspica old.ts new.ts\n  perspica --staged --web\n  perspica --git main...feature -s\n  perspica --pr 123 --web"
+    after_help = "Examples:\n  perspica                      review the current branch (run inside a repo)\n  perspica old.ts new.ts\n  perspica --staged --web\n  perspica --git main...feature -s\n  perspica --pr 123 --web\n  perspica --pr 123 --post        post the review on your pull request\n  perspica github init           add the perspica check to a repository"
 )]
 struct Cli {
     /// Old file path
@@ -121,6 +122,38 @@ struct Cli {
     /// 100,000 characters (16,000 for local models)
     #[arg(long)]
     full_context: bool,
+
+    // -- Posting on your pull request --
+    /// Post the review as one comment on your pull request, after a preview (uses the `gh` CLI). Posting
+    /// again updates it. Nothing from your agent sessions goes in
+    #[arg(long)]
+    post: bool,
+
+    /// With --post: don't ask before posting
+    #[arg(long)]
+    yes: bool,
+
+    /// With --post: include Analyze's concerns (=false to leave them out). Remembered for next time
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
+    concerns: Option<bool>,
+
+    /// With --post: include the lessons and their quiz. Remembered
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
+    lessons: Option<bool>,
+
+    /// With --post: include your quiz score, once you've answered every question in Learn. Remembered
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
+    quiz_score: Option<bool>,
+
+    /// With --post: suggest reviewers take the quiz. It's optional for them. Remembered
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
+    ask_quiz: Option<bool>,
+
+    /// With --post: have the perspica check wait until a reviewer passes the quiz. Make the check
+    /// required to keep the PR from merging until then. Needs the check in the repo (`perspica github
+    /// init`). Remembered
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
+    require_quiz: Option<bool>,
 }
 
 /// Multi-file analysis output.
@@ -240,6 +273,11 @@ fn main() {
     #[cfg(unix)]
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("github") {
+        github::cli(&args[2..]);
+        return;
     }
     let cli = Cli::parse();
     let format = if cli.json { "json" } else if cli.web { "web" } else { cli.format.as_str() };
@@ -389,12 +427,12 @@ fn main() {
             eprintln!("Using the saved analysis of this diff by {} from {}; --fresh to run it again.", s.model, ago(s.saved_at));
             saved::apply(&mut multi, s);
             reused = true;
-        } else if !wants_llm && (format == "web" || format == "html") {
+        } else if !wants_llm && (format == "web" || format == "html" || cli.post) {
             saved::apply(&mut multi, s);
         }
     }
     let wants_llm = wants_llm && !reused;
-    if (format == "web" || format == "html") && !cli.fresh {
+    if (format == "web" || format == "html" || cli.post) && !cli.fresh {
         multi.learn = saved::load_learn(&key);
         multi.decisions = saved::load_decisions(&key);
     }
@@ -423,6 +461,21 @@ fn main() {
         }
     }
 
+    // A pull request's own review, or the current branch's, can be posted on it.
+    let share = target.as_ref().filter(|t| cli.pr.is_some() || matches!(t, git::Target::Branch { .. }))
+        .map(|t| github::Share { pr: cli.pr, head: git::reviewed_commit(t) });
+    if cli.post {
+        let Some(share) = share else { fail("--post shares the review of a pull request. Run it on your PR's branch, or with --pr N.") };
+        let mut settings = saved::load_post_settings();
+        for (flag, value) in [(cli.concerns, &mut settings.concerns), (cli.lessons, &mut settings.lessons), (cli.quiz_score, &mut settings.quiz_score), (cli.ask_quiz, &mut settings.ask_quiz), (cli.require_quiz, &mut settings.require_quiz)] {
+            if let Some(v) = flag { *value = v; }
+        }
+        if let Err(e) = github::post_cli(&multi, &share, settings, &key, cli.yes) {
+            fail(e);
+        }
+        return;
+    }
+
     match format {
         "json" => render_json::render_multi(&multi),
         "html" => {
@@ -432,7 +485,7 @@ fn main() {
             }
             eprintln!("Wrote {}", cli.out.display());
         }
-        "web" => rt.block_on(web::serve(multi, cli.port, provider, detect, !cli.no_open, key)),
+        "web" => rt.block_on(web::serve(multi, cli.port, provider, detect, !cli.no_open, key, share)),
         _ => render_tty::render_multi(&multi, !cli.no_color, cli.show_noise),
     }
 }

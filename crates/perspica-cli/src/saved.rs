@@ -3,7 +3,7 @@
 //! analysis twice. Stored in the repository's git directory (`.git/perspica/`),
 //! or `~/.cache/perspica/` outside a repository.
 
-use crate::{decisions, intel, learn, MultiFileResult};
+use crate::{decisions, github, intel, learn, MultiFileResult};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -93,6 +93,38 @@ pub fn save_decisions(key: &str, d: &decisions::Decisions) {
     if let Err(e) = write("decisions", key, d) {
         eprintln!("perspica: couldn't save the decisions ({e}); they will be lost on restart");
     }
+}
+
+/// The author's own quiz answers for this diff, every try in order.
+pub fn load_quiz(key: &str) -> Vec<github::QuizAnswer> {
+    read("quiz", key).unwrap_or_default()
+}
+
+/// Adds answers. A new answer to a question already answered is a retake (Start over in Learn). The same
+/// answer again is the viewer sending what it has, not a new try, so it's skipped.
+pub fn add_quiz(key: &str, answers: &[github::QuizAnswer]) {
+    let mut all = load_quiz(key);
+    let before = all.len();
+    for a in answers {
+        let last = all.iter().rev().find(|b| b.concept == a.concept && b.question == a.question);
+        if last.is_none_or(|b| b.choice != a.choice) {
+            all.push(a.clone());
+        }
+    }
+    if all.len() != before {
+        if let Err(e) = write("quiz", key, &all) {
+            eprintln!("perspica: couldn't save your quiz answers ({e})");
+        }
+    }
+}
+
+/// What the author last chose to put in a PR comment.
+pub fn load_post_settings() -> github::PostSettings {
+    read("post", "settings").unwrap_or_default()
+}
+
+pub fn save_post_settings(s: &github::PostSettings) {
+    let _ = write("post", "settings", s);
 }
 
 fn read<T: serde::de::DeserializeOwned>(kind: &str, key: &str) -> Option<T> {
