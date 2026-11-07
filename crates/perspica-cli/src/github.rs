@@ -930,7 +930,7 @@ pub fn after_passing(g: &Graded) -> String {
 
 /// The Action's note when someone approves before passing a quiz the author required.
 pub fn approved_early(user: &str) -> String {
-    format!("@{user} approved, but hasn't passed the quiz yet, so the perspica check is still waiting. Reply with `/quiz` and your answers to take it.")
+    format!("@{user} approved, but hasn't passed the quiz yet, so the perspica check is still waiting. Reply with `/quiz` and your answers to approve it.")
 }
 
 /// The Action's reply to a reviewer's answers.
