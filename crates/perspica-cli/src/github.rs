@@ -791,7 +791,8 @@ pub fn notes(pr: &PrState, settings: &PostSettings, multi: &MultiFileResult, sco
     if settings.lessons && lessons == 0 {
         notes.push("No lessons are written yet. Open Learn first to add lessons and a quiz.".into());
     }
-    if settings.lessons && settings.quiz_score && score.total > 0 && !score.complete() {
+    // With the repo's rule on, its own note says this.
+    if settings.lessons && settings.quiz_score && score.total > 0 && !score.complete() && !pr.require_author {
         notes.push(if score.answered == 0 {
             "Take the quiz in Learn to add your score.".to_string()
         } else {
@@ -801,6 +802,8 @@ pub fn notes(pr: &PrState, settings: &PostSettings, multi: &MultiFileResult, sco
     if pr.require_author {
         if lessons == 0 && multi.learn.as_ref().is_none_or(|l| l.nothing.is_none()) {
             notes.push(format!("{AUTHOR_RULE} Open Learn to write the lessons, then take the quiz."));
+        } else if score.total > 0 && !score.complete() {
+            notes.push(format!("{AUTHOR_RULE} Take the quiz in Learn: you've answered {} of {}.", score.answered, score.total));
         } else if score.total > 0 && !score.passed() {
             notes.push(format!("{AUTHOR_RULE} You have {} of {} right. In Learn, Start over on a concept to retake it.", score.latest, score.total));
         }
@@ -1029,6 +1032,41 @@ impl RepoRules {
 }
 
 const AUTHOR_RULE: &str = "This repo needs a pull request's author to answer every question in perspica's quiz right before it merges.";
+const AUTHOR_NOTE: &str = "<!-- perspica:author ";
+
+/// What the Action last told the author about the repo's quiz rule, so it says each thing once.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct AuthorNote {
+    pub quiz: String,
+    pub right: Option<usize>,
+    pub passed: bool,
+}
+
+/// A reply telling the author where they stand with the repo's quiz rule, when that has changed since the last
+/// one: no perspica comment yet, no score, a score short of all right, or all right after being told it wasn't.
+pub fn author_note(stamp: Option<&Stamp>, comments: &[IssueComment], author: &str, pr: u64) -> Option<String> {
+    let last: Option<AuthorNote> = comments.iter().rev().filter(|c| c.user == BOT).find_map(|c| decode(&c.body, AUTHOR_NOTE));
+    let (note, text) = match stamp {
+        None => (AuthorNote::default(), format!("@{author} {AUTHOR_RULE} To take it, run `perspica --pr {pr} --web`, take the quiz in Learn, then Post to this pull request.")),
+        Some(s) if s.author_passed() => {
+            // Worth saying only to someone who was told it wasn't enough.
+            if last.as_ref().is_none_or(|l| l.passed) { return None; }
+            (AuthorNote { quiz: s.quiz_id(), right: Some(s.quiz.len()), passed: true }, format!("@{author} All {} right now, so the perspica check passes.", s.quiz.len()))
+        }
+        Some(s) => match s.author_score {
+            None => (AuthorNote { quiz: s.quiz_id(), right: None, passed: false },
+                format!("@{author} {AUTHOR_RULE} perspica's comment here has no quiz score yet, so the perspica check is waiting. In perspica, take the quiz in Learn, then update the comment.")),
+            Some((first, total)) => {
+                let right = s.author_latest.map_or(first, |(l, _)| l);
+                (AuthorNote { quiz: s.quiz_id(), right: Some(right), passed: false },
+                    format!("@{author} {AUTHOR_RULE} You have {right} of {total} right, so the perspica check is waiting. In perspica's Learn tab, Start over on the concepts you missed, then update this pull request's perspica comment."))
+            }
+        },
+    };
+    if last.as_ref() == Some(&note) { return None; }
+    Some(format!("{text}\n\n{AUTHOR_NOTE}{} -->", encode(&note)))
+}
 
 /// The check for the PR's latest commit. `own`: perspica's structural review of that commit, made by the
 /// Action, for when the author's comment is missing or describes an older commit.
@@ -1279,6 +1317,13 @@ async fn run_action() -> Result<(), String> {
         }
     }
 
+    let rules = RepoRules::from_env();
+    if rules.author_quiz {
+        if let Some(text) = author_note(stamp.as_ref(), &comments, &author, number) {
+            let text = say(text).await?;
+            comments.push(IssueComment { key: String::new(), user: BOT.into(), body: text, at: String::new() });
+        }
+    }
     let graded = stamp.as_ref().map(|s| gradings(&comments, &s.quiz_id())).unwrap_or_default();
     // Our own look at the latest commit, when the author's comment doesn't describe it. Only when the
     // workflow checked out the repository (pull request events).
@@ -1290,7 +1335,7 @@ async fn run_action() -> Result<(), String> {
     } else {
         None
     };
-    let Some(check) = check_run(stamp.as_ref(), &head, &graded, own.as_ref(), number, RepoRules::from_env()) else {
+    let Some(check) = check_run(stamp.as_ref(), &head, &graded, own.as_ref(), number, rules) else {
         println!("perspica: no comment and no review of our own, so no check to update.");
         return Ok(());
     };
@@ -1371,8 +1416,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      # A new answer from a person gets 👀 right away. Not edits, and not the bot's own replies, which mention /quiz.
       - name: Show the answers were seen
-        if: github.event_name == 'issue_comment' && contains(github.event.comment.body, '/quiz')
+        if: github.event_name == 'issue_comment' && github.event.action == 'created' && github.event.comment.user.type != 'Bot' && contains(github.event.comment.body, '/quiz')
         run: gh api -X POST "repos/${{{{ github.repository }}}}/issues/comments/${{{{ github.event.comment.id }}}}/reactions" -f content=eyes --silent || true
         env:
           GH_TOKEN: ${{{{ github.token }}}}
@@ -1760,6 +1806,25 @@ mod tests {
     }
 
     #[test]
+    fn the_author_hears_where_they_stand_once_per_change() {
+        let mut s = sample();
+        s.author_score = Some((1, 2));
+        let bot = |body: String| IssueComment { key: String::new(), user: BOT.into(), body, at: String::new() };
+        let short = author_note(Some(&s), &[], "ana", 6).unwrap();
+        assert!(short.starts_with("@ana This repo needs a pull request's author to answer every question in perspica's quiz right before it merges. You have 1 of 2 right, so the perspica check is waiting."), "{short}");
+        assert!(author_note(Some(&s), &[bot(short.clone())], "ana", 6).is_none(), "the same thing isn't said twice");
+        s.author_latest = Some((2, 2));
+        let passed = author_note(Some(&s), &[bot(short)], "ana", 6).unwrap();
+        assert!(passed.starts_with("@ana All 2 right now, so the perspica check passes."));
+        assert!(author_note(Some(&s), &[], "ana", 6).is_none(), "passing on the first post needs no reply");
+        let none = author_note(None, &[], "ana", 6).unwrap();
+        assert!(none.contains("run `perspica --pr 6 --web`"));
+        s.author_score = None;
+        s.author_latest = None;
+        assert!(author_note(Some(&s), &[], "ana", 6).unwrap().contains("has no quiz score yet"));
+    }
+
+    #[test]
     fn the_workflow_pins_this_version() {
         let w = workflow(false);
         assert!(w.contains(&format!("PERSPICA_VERSION={}", env!("CARGO_PKG_VERSION"))));
@@ -1769,6 +1834,7 @@ mod tests {
         assert_eq!(status_description(&"x".repeat(200)).chars().count(), 140);
         assert!(w.contains("contains(github.event.comment.body, '/quiz')") && !w.contains("startsWith"), "a reply with spaces before /quiz still runs it");
         assert!(w.contains("pull_request_review:") && w.contains("content=eyes"));
+        assert!(w.contains("github.event.action == 'created' && github.event.comment.user.type != 'Bot'"), "edits and the bot's own replies get no 👀");
         assert!(w.contains("PERSPICA_REQUIRE_AUTHOR_QUIZ: \"false\""), "the rule is there to find, and off");
         assert!(!requires_author_quiz(&w) && requires_author_quiz(&workflow(true)));
         assert!(!requires_author_quiz("# PERSPICA_REQUIRE_AUTHOR_QUIZ: \"true\""), "a commented-out line doesn't count");
