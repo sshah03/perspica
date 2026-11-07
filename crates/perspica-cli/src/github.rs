@@ -1003,7 +1003,7 @@ pub fn gradings(comments: &[IssueComment], quiz_id: &str) -> Vec<Graded> {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CheckRun {
-    /// "completed", or "in_progress" while it waits on a reviewer's quiz.
+    /// "completed" (always with "success"), or "in_progress" while it waits on a quiz.
     pub status: &'static str,
     pub conclusion: Option<&'static str>,
     pub title: String,
@@ -1043,7 +1043,7 @@ pub fn check_run(stamp: Option<&Stamp>, head: &str, graded: &[Graded], own: Opti
             out.insert(0, format!("> {AUTHOR_RULE} To take it, run `perspica --pr {pr} --web`, take the quiz in Learn, then Post to the pull request.\n"));
             return Some(CheckRun { status: "in_progress", conclusion: None, title: format!("Waiting on the author's quiz · {}", own.headline()), summary: fit_summary(out.join("\n")), annotations: cap(&own.annotations) });
         }
-        return Some(CheckRun { status: "completed", conclusion: Some("neutral"), title: own.headline(), summary: fit_summary(out.join("\n")), annotations: cap(&own.annotations) });
+        return Some(CheckRun { status: "completed", conclusion: Some("success"), title: own.headline(), summary: fit_summary(out.join("\n")), annotations: cap(&own.annotations) });
     };
     let passed: Vec<&Graded> = graded.iter().filter(|g| g.passed()).collect();
     let by = if passed.is_empty() { String::new() } else { format!("Quiz passed by {}", passed.iter().map(|g| g.user.clone()).collect::<Vec<_>>().join(", ")) };
@@ -1055,13 +1055,9 @@ pub fn check_run(stamp: Option<&Stamp>, head: &str, graded: &[Graded], own: Opti
         (false, true) => "Waiting on a reviewer's quiz".to_string(),
         (false, false) => by,
     };
-    let (status, conclusion) = if author_wait || reviewer_wait {
-        ("in_progress", None)
-    } else if rules.author_quiz || s.require_quiz {
-        ("completed", Some("success"))
-    } else {
-        ("completed", Some("neutral"))
-    };
+    // Done means success. Branch protection doesn't count "neutral" as passing, so a required check that
+    // finished neutral would block every pull request.
+    let (status, conclusion) = if author_wait || reviewer_wait { ("in_progress", None) } else { ("completed", Some("success")) };
     // Counts and lines describe the latest commit when the comment is older.
     let mut shown = s.clone();
     if fresh.is_none() {
@@ -1659,10 +1655,10 @@ mod tests {
         let mut optional = s.clone();
         optional.require_quiz = false;
         let plain = check_run(Some(&optional), &s.sha, &[], None, 7, RepoRules::default()).unwrap();
-        assert_eq!((plain.status, plain.conclusion), ("completed", Some("neutral")), "a suggested quiz never holds the check");
+        assert_eq!((plain.status, plain.conclusion), ("completed", Some("success")), "a suggested quiz never holds the check");
         let g = grade(None, &s.quiz, &s.quiz_id(), "rev", &[(0, 1), (1, 0)]);
         let passed = check_run(Some(&optional), &s.sha, &[g], None, 7, RepoRules::default()).unwrap();
-        assert_eq!(passed.conclusion, Some("neutral"));
+        assert_eq!(passed.conclusion, Some("success"));
         assert!(passed.title.starts_with("Quiz passed by rev · Author's quiz results 2/2 · "), "{}", passed.title);
         assert!(comment(&optional, true).contains("**Quiz suggested.**"));
     }
@@ -1683,7 +1679,7 @@ mod tests {
         assert!(check_run(None, "h", &[], None, 7, RepoRules::default()).is_none());
         let own = Stamp { sha: "h".into(), files: 3, changed_lines: 40, mechanical_lines: 12, ..Default::default() };
         let c = check_run(None, "h", &[], Some(&own), 7, RepoRules::default()).unwrap();
-        assert_eq!(c.conclusion, Some("neutral"));
+        assert_eq!(c.conclusion, Some("success"), "a required check that only informs mustn't block");
         assert_eq!(c.title, "3 files changed · 12 of 40 changed lines are mechanical");
         assert!(c.summary.contains("perspica --pr 7 --post"));
         assert!(c.summary.contains("3 files changed. 12 of 40 changed lines are mechanical (formatting, renames, moved code), and 0 are tests."), "{}", c.summary);
