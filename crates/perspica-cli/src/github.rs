@@ -2,7 +2,7 @@
 //!
 //! The author posts one comment from their own machine, with `perspica --pr N --post` or Post in the
 //! viewer. It's short, with the details folded away, and it ends with the data the Action reads: the
-//! reading order, the concerns, the lessons and the quiz. Nothing from the author's agent sessions goes in.
+//! changes and what each is for, the concerns, the lessons and the quiz. Nothing from the author's agent sessions goes in.
 //!
 //! The Action (`perspica github action`) never runs code from the pull request. It reads the comments
 //! through the API, grades quiz answers that reviewers reply with, and keeps one check up to date. A pull
@@ -785,7 +785,7 @@ pub fn render_html(repo: &str, markdown: &str) -> Option<String> {
 pub fn notes(pr: &PrState, settings: &PostSettings, multi: &MultiFileResult, score: Score) -> Vec<String> {
     let mut notes = vec![];
     if multi.intent_groups.as_ref().is_none_or(|g| g.iter().all(|g| g.mechanical)) {
-        notes.push("There's no Analyze result for this diff, so the comment has only the basic summary. Analyze first for a reading order and concerns.".into());
+        notes.push("There's no Analyze result for this diff, so the comment has only the basic summary. Analyze first to add what each change is for, and concerns.".into());
     }
     let lessons = multi.learn.iter().flat_map(|l| &l.concepts).filter(|c| c.lesson.is_some()).count();
     if settings.lessons && lessons == 0 {
