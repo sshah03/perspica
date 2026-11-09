@@ -174,6 +174,38 @@ The Action turns the comment into a check on the pull request, grades reviewers'
 
 That's all for the repository. Authors post with `perspica --pr 123 --post` or **Post to PR…** in the viewer, which needs perspica and the `gh` CLI logged in. Reviewers don't install anything, they just read the comment and reply with `/quiz` + the answers (e.g. /quiz 1a 2d 3b 4c).
 
+If you'd rather not install perspica to set it up, save this as `.github/workflows/perspica.yml`. It's the same file `perspica github init` writes:
+
+```yaml
+name: perspica
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created, edited]
+  pull_request_review:
+    types: [submitted]
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  checks: write
+  statuses: write
+concurrency:
+  group: perspica-${{ github.event.pull_request.number || github.event.issue.number }}
+jobs:
+  update:
+    if: >-
+      github.event_name == 'pull_request_target' || github.event_name == 'pull_request_review' ||
+      (github.event.issue.pull_request && (contains(github.event.comment.body, 'perspica:data') || contains(github.event.comment.body, '/quiz')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: sshah03/perspica@v0.5.1
+        with:
+          require-author-quiz: "false"
+```
+
 ### What it does
 
 On every pull request it keeps a **perspica** status up to date, which is the one to make required, and a **perspica review** check with the details and line notes:
@@ -183,11 +215,11 @@ On every pull request it keeps a **perspica** status up to date, which is the on
 
 It runs when a pull request is opened or updated, and on comments and reviews. It installs the perspica release it was written for, and it reads the pull request's code but never runs it, so it's safe on pull requests from forks. It needs permission to write comments, checks and statuses, and only reads the code. On private repos, GitHub counts each run as about a minute of your Actions minutes.
 
-After upgrading perspica, run `perspica github init` again to move the workflow to the new version.
+After upgrading perspica, run `perspica github init` again to move the workflow to the new version, or let Dependabot update the `uses` line.
 
 ### Requiring the author's quiz
 
-Off by default. Run `perspica github init --require-author-quiz`, or set `PERSPICA_REQUIRE_AUTHOR_QUIZ: "true"` in the workflow, and the check waits until each pull request's author has answered every question in perspica's quiz right. If they haven't, the Action replies to tell them their score and how to retake it: in Learn, **Start over** on a concept, then post again. The badge then says which try it took. A change that Learn finds nothing to teach in passes as it is. To block merging until then, make `perspica` a required check.
+Off by default. Run `perspica github init --require-author-quiz`, or set `require-author-quiz: "true"` in the workflow, and the check waits until each pull request's author has answered every question in perspica's quiz right. If they haven't, the Action replies to tell them their score and how to retake it: in Learn, **Start over** on a concept, then post again. The badge then says which try it took. A change that Learn finds nothing to teach in passes as it is. To block merging until then, make `perspica` a required check.
 
 ## Privacy
 
