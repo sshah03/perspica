@@ -749,7 +749,9 @@ pub fn pr_state(share: &Share) -> Result<PrState, String> {
 /// Whether a perspica workflow turns on the author quiz rule.
 fn requires_author_quiz(workflow: &str) -> bool {
     workflow.lines().map(str::trim).filter(|l| !l.starts_with('#')).any(|l| {
-        l.strip_prefix("PERSPICA_REQUIRE_AUTHOR_QUIZ:").is_some_and(|v| v.trim().trim_matches(['"', '\'']).eq_ignore_ascii_case("true"))
+        // The action's input, or the variable that workflows written by 0.5.0 set.
+        l.strip_prefix("require-author-quiz:").or_else(|| l.strip_prefix("PERSPICA_REQUIRE_AUTHOR_QUIZ:"))
+            .is_some_and(|v| v.trim().trim_matches(['"', '\'']).eq_ignore_ascii_case("true"))
     })
 }
 
@@ -1384,7 +1386,7 @@ fn status_description(title: &str) -> String {
 pub fn workflow(author_quiz: bool) -> String {
     let v = env!("CARGO_PKG_VERSION");
     format!(r#"# perspica: a summary check on every pull request, and the reviewer quiz when an author asks for one.
-# Written by `perspica github init`. It reads the pull request's code but never runs it.
+# Written by `perspica github init`.
 name: perspica
 on:
   pull_request_target:
@@ -1414,26 +1416,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      # A new answer from a person gets 👀 right away. Not edits, and not the bot's own replies, which mention /quiz.
-      - name: Show the answers were seen
-        if: github.event_name == 'issue_comment' && github.event.action == 'created' && github.event.comment.user.type != 'Bot' && contains(github.event.comment.body, '/quiz')
-        run: gh api -X POST "repos/${{{{ github.repository }}}}/issues/comments/${{{{ github.event.comment.id }}}}/reactions" -f content=eyes --silent || true
-        env:
-          GH_TOKEN: ${{{{ github.token }}}}
-      - uses: actions/checkout@v4
-        if: github.event_name == 'pull_request_target'
+      # Installs perspica {v} and updates the check. It reads the pull request's code but never runs it.
+      - uses: sshah03/perspica@v{v}
         with:
-          fetch-depth: 0
-      - name: Install perspica
-        run: curl -fsSL https://raw.githubusercontent.com/sshah03/perspica/v{v}/install.sh | PERSPICA_VERSION={v} sh
-      - name: Update the perspica check
-        run: ~/.local/bin/perspica github action
-        env:
-          GITHUB_TOKEN: ${{{{ github.token }}}}
-          GH_TOKEN: ${{{{ github.token }}}}
           # "true": the check waits until the pull request's author has answered every question in
           # perspica's quiz right. They can retake it. Make the check required to block merging until then.
-          PERSPICA_REQUIRE_AUTHOR_QUIZ: "{author_quiz}"
+          require-author-quiz: "{author_quiz}"
 "#)
 }
 
@@ -1446,7 +1434,7 @@ pub fn cli(args: &[String]) {
                 std::process::exit(1);
             }
         }
-        Some("init") => init(args[1..].iter().any(|a| a == "--require-author-quiz")),
+        Some("init") if args[1..].iter().all(|a| a == "--require-author-quiz") => init(args.len() > 1),
         _ => {
             eprintln!("Usage: perspica github init     add the perspica check to this repository");
             eprintln!("         --require-author-quiz  and have it wait until a PR's author has the whole quiz right");
@@ -1824,18 +1812,25 @@ mod tests {
 
     #[test]
     fn the_workflow_pins_this_version() {
+        let v = env!("CARGO_PKG_VERSION");
         let w = workflow(false);
-        assert!(w.contains(&format!("PERSPICA_VERSION={}", env!("CARGO_PKG_VERSION"))));
-        assert!(w.contains("${{ github.token }}") && w.contains("pull_request_target"));
+        assert!(w.contains(&format!("uses: sshah03/perspica@v{v}")));
+        assert!(w.contains("pull_request_target") && w.contains("pull_request_review:"));
         assert!(w.contains("pull-requests: write"), "the Action replies to quiz answers on the pull request");
         assert!(w.contains("statuses: write"), "the gate is a commit status");
         assert_eq!(status_description(&"x".repeat(200)).chars().count(), 140);
         assert!(w.contains("contains(github.event.comment.body, '/quiz')") && !w.contains("startsWith"), "a reply with spaces before /quiz still runs it");
-        assert!(w.contains("pull_request_review:") && w.contains("content=eyes"));
-        assert!(w.contains("github.event.action == 'created' && github.event.comment.user.type != 'Bot'"), "edits and the bot's own replies get no 👀");
-        assert!(w.contains("PERSPICA_REQUIRE_AUTHOR_QUIZ: \"false\""), "the rule is there to find, and off");
+        assert!(w.contains("require-author-quiz: \"false\""), "the rule is there to find, and off");
         assert!(!requires_author_quiz(&w) && requires_author_quiz(&workflow(true)));
-        assert!(!requires_author_quiz("# PERSPICA_REQUIRE_AUTHOR_QUIZ: \"true\""), "a commented-out line doesn't count");
-        assert!(!w.contains("ref: ${{ github.event.pull_request.head"), "never checks out the PR's code as the workspace");
+        assert!(requires_author_quiz("          PERSPICA_REQUIRE_AUTHOR_QUIZ: \"true\""), "workflows written by 0.5.0 still count");
+        assert!(!requires_author_quiz("# require-author-quiz: \"true\""), "a commented-out line doesn't count");
+
+        // The action at the repository root is what that workflow runs.
+        let a = include_str!("../../../action.yml");
+        assert!(a.contains(&format!("PERSPICA_VERSION: \"{v}\"")), "action.yml installs the release it ships with");
+        assert!(a.contains("${{ github.token }}") && a.contains("content=eyes"));
+        assert!(a.contains("github.event.action == 'created' && github.event.comment.user.type != 'Bot'"), "edits and the bot's own replies get no 👀");
+        assert!(a.contains("PERSPICA_REQUIRE_AUTHOR_QUIZ: ${{ inputs.require-author-quiz }}"));
+        assert!(!a.contains("ref: ${{ github.event.pull_request.head"), "never checks out the PR's code as the workspace");
     }
 }

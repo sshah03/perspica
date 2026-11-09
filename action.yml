@@ -1,0 +1,43 @@
+name: perspica review
+description: A summary check on every pull request, with an optional quiz reviewers answer in a comment before merging.
+author: sshah03
+branding:
+  icon: check-circle
+  color: purple
+inputs:
+  require-author-quiz:
+    description: >-
+      "true" makes the check wait until the pull request's author has answered every question in
+      perspica's quiz right. They can retake it.
+    default: "false"
+  token:
+    description: Token for comments, checks and statuses on the pull request.
+    default: ${{ github.token }}
+runs:
+  using: composite
+  steps:
+    # A new answer from a person gets 👀 right away. Not edits, and not the bot's own replies, which mention /quiz.
+    - name: Show the answers were seen
+      if: github.event_name == 'issue_comment' && github.event.action == 'created' && github.event.comment.user.type != 'Bot' && contains(github.event.comment.body, '/quiz')
+      shell: bash
+      run: gh api -X POST "repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" -f content=eyes --silent || true
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+    # The base branch, for the review of a pull request with no perspica comment. Never the pull request's code.
+    - uses: actions/checkout@v4
+      if: github.event_name == 'pull_request_target'
+      with:
+        fetch-depth: 0
+    - name: Install perspica
+      shell: bash
+      run: sh "$GITHUB_ACTION_PATH/install.sh"
+      env:
+        # The release this copy of the action goes with. A test keeps it equal to the crate's version.
+        PERSPICA_VERSION: "0.5.0"
+    - name: Update the perspica check
+      shell: bash
+      run: ~/.local/bin/perspica github action
+      env:
+        GITHUB_TOKEN: ${{ inputs.token }}
+        GH_TOKEN: ${{ inputs.token }}
+        PERSPICA_REQUIRE_AUTHOR_QUIZ: ${{ inputs.require-author-quiz }}
