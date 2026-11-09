@@ -33,7 +33,7 @@ runs:
       run: sh "$GITHUB_ACTION_PATH/install.sh"
       env:
         # The release this copy of the action goes with. A test keeps it equal to the crate's version.
-        PERSPICA_VERSION: "0.5.0"
+        PERSPICA_VERSION: "0.5.1"
     - name: Update the perspica check
       shell: bash
       run: ~/.local/bin/perspica github action
