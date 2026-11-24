@@ -88,6 +88,11 @@ pub fn classify(
             description: "added".to_string(),
             location: location_of(item),
         });
+        // An added class also adds its methods; each needs its own location for
+        // reading order and test reach, just like a method added to an existing class.
+        if let SemanticItem::Class { name, methods, .. } = item {
+            classify_members(name, &[], methods, &mut manifest, &mut id);
+        }
     }
 
     classify_imports(old_tree, new_tree, &mut manifest, &mut id);
